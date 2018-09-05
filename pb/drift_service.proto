@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package kronos;
+option go_package = "kronospb";
+
+message DriftTimeConfig {
+    // DriftFactor controls the rate of flow of drifting clock. eg. DriftFactor
+    // of 1.1 means 1 second duration of system time will translate to 1.1
+    // second with drifting clock.
+    double DriftFactor = 1;
+    // Offset is used to jump the clock by offset nanoseconds
+    int64 Offset = 2;
+}
+
+message DriftTimeResponse {
+}
+
+service UpdateDriftTimeService {
+    rpc UpdateDriftConfig (DriftTimeConfig) returns (DriftTimeResponse) {}
+}
