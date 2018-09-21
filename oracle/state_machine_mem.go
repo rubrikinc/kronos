@@ -6,8 +6,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 
-	"github.com/scaledata/kronos/kronosutil/log"
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 // inMemStateMachine is an in-memory implementation of StateMachine

@@ -4,7 +4,7 @@ import (
 	"context"
 	"net"
 
-	"github.com/scaledata/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/kronosutil"
 )
 
 // GetFreePorts asks the kernel for free open ports that are ready to use.

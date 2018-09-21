@@ -14,9 +14,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/scaledata/etcd/pkg/fileutil"
 
-	"github.com/scaledata/kronos/checksumfile"
-	"github.com/scaledata/kronos/kronosutil"
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/checksumfile"
+	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 const (

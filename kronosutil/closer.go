@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 
-	"github.com/scaledata/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/kronosutil/log"
 )
 
 // CloseWithErrorLog closes the given closer and logs the error.

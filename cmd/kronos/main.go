@@ -5,8 +5,8 @@ import (
 	"flag"
 	"os"
 
-	"github.com/scaledata/kronos/cli"
-	"github.com/scaledata/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/cli"
+	"github.com/rubrikinc/kronos/kronosutil/log"
 )
 
 func main() {

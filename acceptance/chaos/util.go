@@ -4,9 +4,9 @@ import (
 	"context"
 	"math/rand"
 
-	"github.com/scaledata/kronos/acceptance/cluster"
-	"github.com/scaledata/kronos/kronosutil/log"
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/acceptance/cluster"
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 func randomSubset(numNodes, numNodesToSelect int) []int {

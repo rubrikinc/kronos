@@ -6,7 +6,7 @@ import (
 
 	"github.com/scaledata/etcd/raft"
 
-	"github.com/scaledata/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/kronosutil/log"
 )
 
 // init sets the raft logger for kronos/etcd/raft. This is different from

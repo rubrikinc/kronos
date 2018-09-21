@@ -15,8 +15,8 @@ import (
 	"github.com/scaledata/etcd/raft/sdraftpb"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/scaledata/kronos/metadata"
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/metadata"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 func TestClusterHandlerServeHTTP(t *testing.T) {

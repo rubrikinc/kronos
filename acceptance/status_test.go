@@ -13,11 +13,11 @@ import (
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/scaledata/kronos/acceptance/chaos"
-	"github.com/scaledata/kronos/acceptance/cluster"
-	"github.com/scaledata/kronos/cli"
-	"github.com/scaledata/kronos/kronosutil"
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/acceptance/chaos"
+	"github.com/rubrikinc/kronos/acceptance/cluster"
+	"github.com/rubrikinc/kronos/cli"
+	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 func TestKronosStatus(t *testing.T) {

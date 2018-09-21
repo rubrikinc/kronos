@@ -6,9 +6,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaledata/kronos/kronoshttp"
-	"github.com/scaledata/kronos/kronosutil"
-	"github.com/scaledata/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/kronoshttp"
+	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/kronosutil/log"
 )
 
 var removeCtx struct {

@@ -11,8 +11,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/scaledata/kronos/kronosutil"
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 type addNodeHandlerTestCase struct {

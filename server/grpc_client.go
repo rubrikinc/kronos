@@ -9,9 +9,9 @@ import (
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 
-	"github.com/scaledata/kronos/kronosutil"
-	"github.com/scaledata/kronos/kronosutil/log"
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 const rpcTimeout = 30 * time.Second

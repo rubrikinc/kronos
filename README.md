@@ -146,8 +146,8 @@ Kronos requires Go version 1.9+ for immunity against large clock jumps.
 
 **Install**
 - Install Go version 1.9
-- Run `go get github.com/scaledata/kronos`
-  This will clone kronos in `$GOPATH/src/github.com/scaledata/kronos`
+- Run `go get github.com/rubrikinc/kronos`
+  This will clone kronos in `$GOPATH/src/github.com/rubrikinc/kronos`
 
 **Build/Test**
 - Build kronos: `make build` creates a kronos binary.
@@ -220,10 +220,10 @@ A node can be removed using
 A kronos server can be started in a go application by using
 ```
 import(
-	"github.com/scaledata/kronos"
-	"github.com/scaledata/kronos/oracle"
-	"github.com/scaledata/kronos/pb"
-	kronosserver "github.com/scaledata/kronos/server"
+	"github.com/rubrikinc/kronos"
+	"github.com/rubrikinc/kronos/oracle"
+	"github.com/rubrikinc/kronos/pb"
+	kronosserver "github.com/rubrikinc/kronos/server"
 )
 
   if err := kronos.Initialize(ctx, kronosserver.Config{

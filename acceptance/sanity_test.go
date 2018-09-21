@@ -13,12 +13,12 @@ import (
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/scaledata/kronos/acceptance/cluster"
-	"github.com/scaledata/kronos/checksumfile"
-	"github.com/scaledata/kronos/kronosutil"
-	"github.com/scaledata/kronos/kronosutil/log"
-	"github.com/scaledata/kronos/metadata"
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/acceptance/cluster"
+	"github.com/rubrikinc/kronos/checksumfile"
+	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/metadata"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 const (

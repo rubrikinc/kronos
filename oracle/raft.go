@@ -26,11 +26,11 @@ import (
 	"github.com/scaledata/etcd/wal"
 	"github.com/scaledata/etcd/wal/sdwalpb"
 
-	"github.com/scaledata/kronos/kronoshttp"
-	"github.com/scaledata/kronos/kronosutil"
-	"github.com/scaledata/kronos/kronosutil/log"
-	"github.com/scaledata/kronos/metadata"
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/kronoshttp"
+	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/metadata"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 // This code in this file is based on

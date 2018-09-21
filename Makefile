@@ -3,7 +3,7 @@ export GOPATH := $(realpath ../../../..)
 #                           ^  ^  ^  ^~ GOPATH
 #                           |  |  |~ GOPATH/src
 #                           |  |~ GOPATH/src/github.com
-#                           |~ GOPATH/src/github.com/scaledata
+#                           |~ GOPATH/src/github.com/rubrikinc
 
 GO      ?= go
 # We install our vendored tools to a directory within this repository to avoid
@@ -22,7 +22,7 @@ goreman:
 	@$(GO_BUILD) -v ./vendor/github.com/mattn/goreman
 
 acceptance: build goreman
-	$(GO) test -v ./acceptance/... --tags=acceptance
+	$(GO) test -v ./acceptance/... --tags=acceptance --timeout 20m
 
 test:
 	$(GO) test -v ./...

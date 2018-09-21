@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 // Client is used by KronosServer to query KronosTime of nodes in the

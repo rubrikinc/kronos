@@ -3,7 +3,7 @@ package oracle
 import (
 	"context"
 
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 // StateMachine is used for managing current oracle and time cap

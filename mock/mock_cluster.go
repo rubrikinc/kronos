@@ -10,12 +10,12 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/scaledata/kronos/kronosstats"
-	"github.com/scaledata/kronos/kronosutil/log"
-	"github.com/scaledata/kronos/oracle"
-	"github.com/scaledata/kronos/pb"
-	"github.com/scaledata/kronos/server"
-	"github.com/scaledata/kronos/tm"
+	"github.com/rubrikinc/kronos/kronosstats"
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/oracle"
+	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/server"
+	"github.com/rubrikinc/kronos/tm"
 )
 
 // Node is used by Cluster in tests

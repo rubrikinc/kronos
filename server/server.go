@@ -12,14 +12,14 @@ import (
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 
-	"github.com/scaledata/kronos/kronoshttp"
-	"github.com/scaledata/kronos/kronosstats"
-	"github.com/scaledata/kronos/kronosutil"
-	"github.com/scaledata/kronos/kronosutil/log"
-	"github.com/scaledata/kronos/metadata"
-	"github.com/scaledata/kronos/oracle"
-	"github.com/scaledata/kronos/pb"
-	"github.com/scaledata/kronos/tm"
+	"github.com/rubrikinc/kronos/kronoshttp"
+	"github.com/rubrikinc/kronos/kronosstats"
+	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/metadata"
+	"github.com/rubrikinc/kronos/oracle"
+	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/tm"
 )
 
 const (

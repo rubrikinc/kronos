@@ -6,8 +6,8 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/scaledata/kronos/pb"
-	"github.com/scaledata/kronos/server"
+	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/server"
 )
 
 // Client is an in memory implementation of Client used in tests

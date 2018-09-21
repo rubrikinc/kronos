@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/scaledata/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/kronosutil/log"
 )
 
 // StoppableListener sets TCP keep-alive timeouts on accepted

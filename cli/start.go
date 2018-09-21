@@ -14,11 +14,11 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 
-	"github.com/scaledata/kronos/kronosutil/log"
-	"github.com/scaledata/kronos/oracle"
-	"github.com/scaledata/kronos/pb"
-	"github.com/scaledata/kronos/server"
-	"github.com/scaledata/kronos/tm"
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/oracle"
+	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/server"
+	"github.com/rubrikinc/kronos/tm"
 )
 
 const (

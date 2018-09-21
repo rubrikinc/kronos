@@ -6,8 +6,8 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/scaledata/kronos/acceptance/cluster"
-	"github.com/scaledata/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/acceptance/cluster"
+	"github.com/rubrikinc/kronos/kronosutil/log"
 )
 
 const (

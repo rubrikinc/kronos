@@ -8,8 +8,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/scaledata/etcd/pkg/types"
 
-	"github.com/scaledata/kronos/checksumfile"
-	"github.com/scaledata/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/checksumfile"
+	"github.com/rubrikinc/kronos/kronosutil/log"
 )
 
 // nodeIDFileName is used to store the nodeID of the raft instance being created.

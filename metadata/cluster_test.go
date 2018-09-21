@@ -9,7 +9,7 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 func createNode(host, port string) *kronospb.Node {

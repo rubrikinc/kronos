@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"path/filepath"
 
-	"github.com/scaledata/kronos/pb"
+	"github.com/rubrikinc/kronos/pb"
 )
 
 // NodeAddr converts address in host:port format to NodeAddr.

@@ -25,12 +25,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 
-	"github.com/scaledata/kronos/acceptance/testutil"
-	"github.com/scaledata/kronos/kronosutil"
-	"github.com/scaledata/kronos/kronosutil/log"
-	"github.com/scaledata/kronos/metadata"
-	"github.com/scaledata/kronos/pb"
-	"github.com/scaledata/kronos/server"
+	"github.com/rubrikinc/kronos/acceptance/testutil"
+	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/metadata"
+	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/server"
 )
 
 // We are using goreman to control the different kronos processes. goreman uses
