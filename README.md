@@ -30,8 +30,48 @@ Kronos solves above problems and has the following properties:
 - It has the same rate of flow as real time.
 - It returns nearly the same time on all the nodes (within a few ms).
 - It is fault tolerant and works in the presence of node failures
-   - It requires only a quorum of nodes to be up.
+- It requires only a quorum of nodes to be up.
 - It supports addition / removal of nodes from the cluster.
+
+## Comparison with NTPD
+The ntpd program is an operating system daemon which sets and maintains the 
+system time of day in synchronism with Internet standard time server 
+(http://doc.ntp.org/4.1.0/ntpd.htm)
+
+Kronos and NTPD solve different problems. The objective of kronos is to
+provide access to monotonic time which is guaranteed to be nearly the same
+on all nodes in the cluster at all times (irrespective of changes to system 
+time). The key differences are
+
+* Kronos provides an API to access time. It does not modify system time like 
+  NTPD.
+* Kronos time is monotonic. NTPD is not resilient to backward system time jumps.
+* Kronos time will not have large forward jumps (Go v1.9 onwards) since it 
+  uses CLOCK_REALTIME only for a reference point, and continues to use 
+  CLOCK_MONOTONIC to measure progress of time.  
+  NTPD does not prevent large system time jumps (forward / backward), but
+  corrects those jumps after they happen. This correction can take a while.
+* If a kronos node finds itself partitioned away from the cluster, it will stop 
+  serving time requests. Hence if kronos time is served by a node, it can be 
+  assumed to be accurate.  
+  The same cannot be said for system time. It is (almost) always accessible and 
+  there is no guarantee that it would be nearly the same as other nodes of the 
+  cluster.
+* The time provided by kronos may not be same as system time / UTC time of
+  any time server. It provides a guarantee of monotonicity and that it would
+  always be nearly the same on all nodes of the cluster. Hence it should be
+  used when the order of events is important, and not when the events 
+  actually happened.  
+  Hence this should be used in conjunction with NTPD which keeps system time
+  in sync with an Internet standard time server (but can be prone to time 
+  jumps).
+* Kronos does not attempt to measure RTT variance. It is not optimized for
+  cross data-center deployments yet.  
+  NTPD can synchronize time cross data-center.
+  
+Kronos is not a replacement for NTPD. It's recommended to use NTPD in 
+conjunction with Kronos so that applications can choose which timestamp they 
+want to use (system time vs kronos time).
 
 ## Design
 - **Time is always monotonic**  
