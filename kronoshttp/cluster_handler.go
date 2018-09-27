@@ -349,14 +349,12 @@ func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), status)
 				return
 			}
-			w.WriteHeader(http.StatusOK)
 		case requestTypeRemove:
 			status, err := h.handleRemove(ctx, w, r)
 			if err != nil {
 				http.Error(w, err.Error(), status)
 				return
 			}
-			w.WriteHeader(http.StatusOK)
 		default:
 			w.Header().Add("AllowURI", requestTypeAdd)
 			w.Header().Add("AllowURI", requestTypeRemove)
@@ -371,7 +369,6 @@ func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), status)
 				return
 			}
-			w.WriteHeader(http.StatusOK)
 		case requestTypeGRPCAddr:
 			status, err := h.handleGRPCAddr(ctx, w, r)
 			if err != nil {
@@ -379,7 +376,6 @@ func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), status)
 				return
 			}
-			w.WriteHeader(http.StatusOK)
 		default:
 			w.Header().Add("AllowURI", requestTypeNodes)
 			http.Error(w, "URI not allowed", http.StatusNotFound)

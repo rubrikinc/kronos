@@ -63,7 +63,7 @@ func init() {
 	validateCmd.Flags().DurationVar(
 		&validateCtx.timeout,
 		timeoutFlag,
-		50*time.Millisecond,
+		100*time.Millisecond,
 		"timeout for query to fetch kronos time run during periodic validation",
 	)
 	validateCmd.Flags().DurationVar(
