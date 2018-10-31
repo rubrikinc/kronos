@@ -19,6 +19,7 @@ import (
 	"regexp"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -80,6 +81,11 @@ func (n *CreateUserNode) startExec(params runParams) error {
 		return errors.New("cluster in insecure mode; user cannot use password authentication")
 	}
 
+	// Reject the "public" role. It does not have an entry in the users table but is reserved.
+	if normalizedUsername == sqlbase.PublicRole {
+		return pgerror.NewErrorf(pgerror.CodeReservedNameError, "role name %q is reserved", sqlbase.PublicRole)
+	}
+
 	var opName string
 	if n.isRole {
 		opName = "create-role"
@@ -87,48 +93,47 @@ func (n *CreateUserNode) startExec(params runParams) error {
 		opName = "create-user"
 	}
 
-	internalExecutor := InternalExecutor{ExecCfg: params.extendedEvalCtx.ExecCfg}
-	n.run.rowsAffected, err = internalExecutor.ExecuteStatementInTransaction(
+	// Check if the user/role exists.
+	row, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRow(
 		params.ctx,
 		opName,
 		params.p.txn,
-		"INSERT INTO system.users VALUES ($1, $2, $3);",
+		`select "isRole" from system.users where username = $1`,
+		normalizedUsername,
+	)
+	if err != nil {
+		return errors.Wrapf(err, "error looking up user")
+	}
+	if row != nil {
+		isRole := bool(*row[0].(*tree.DBool))
+		if isRole == n.isRole && n.ifNotExists {
+			// The username exists with the same role setting, and we asked to skip
+			// if it exists: no error.
+			return nil
+		}
+		msg := "a user"
+		if isRole {
+			msg = "a role"
+		}
+		return pgerror.NewErrorf(pgerror.CodeDuplicateObjectError,
+			"%s named %s already exists",
+			msg, normalizedUsername)
+	}
+
+	n.run.rowsAffected, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		params.ctx,
+		opName,
+		params.p.txn,
+		"insert into system.users values ($1, $2, $3)",
 		normalizedUsername,
 		hashedPassword,
 		n.isRole,
 	)
 	if err != nil {
-		if sqlbase.IsUniquenessConstraintViolationError(err) {
-			// Entry exists. We need to know if it's a user or role.
-			isRole, roleErr := existingUserIsRole(params.ctx, internalExecutor, opName, params.p.txn, normalizedUsername)
-			if roleErr != nil {
-				return roleErr
-			}
-			if isRole == n.isRole && n.ifNotExists {
-				// The username exists with the same role setting, and we asked to skip
-				// if it exists: no error.
-				//
-				// INSERT only detects error at the end of each batch.  This
-				// means perhaps the count by ExecuteStatementInTransactions
-				// will have reported updated rows even though an error was
-				// encountered.  If the error was due to a duplicate entry, we
-				// are not actually inserting anything but are canceling the
-				// error, so clear the row count so that the client can learn
-				// what's going on.
-				n.run.rowsAffected = 0
-				return nil
-			}
-
-			if isRole {
-				err = errors.Errorf("a role named %s already exists", normalizedUsername)
-			} else {
-				err = errors.Errorf("a user named %s already exists", normalizedUsername)
-			}
-		}
 		return err
 	} else if n.run.rowsAffected != 1 {
-		return errors.Errorf(
-			"%d rows affected by user creation; expected exactly one row affected", n.run.rowsAffected,
+		return pgerror.NewAssertionErrorf("%d rows affected by user creation; expected exactly one row affected",
+			n.run.rowsAffected,
 		)
 	}
 
@@ -162,13 +167,24 @@ var blacklistedUsernames = map[string]struct{}{
 
 // NormalizeAndValidateUsername case folds the specified username and verifies
 // it validates according to the usernameRE regular expression.
+// It rejects reserved user names.
 func NormalizeAndValidateUsername(username string) (string, error) {
-	username = tree.Name(username).Normalize()
-	if !usernameRE.MatchString(username) {
-		return "", errors.Errorf("username %q invalid; %s", username, usernameHelp)
+	username, err := NormalizeAndValidateUsernameNoBlacklist(username)
+	if err != nil {
+		return "", err
 	}
 	if _, ok := blacklistedUsernames[username]; ok {
 		return "", errors.Errorf("username %q reserved", username)
+	}
+	return username, nil
+}
+
+// NormalizeAndValidateUsernameNoBlacklist case folds the specified username and verifies
+// it validates according to the usernameRE regular expression.
+func NormalizeAndValidateUsernameNoBlacklist(username string) (string, error) {
+	username = tree.Name(username).Normalize()
+	if !usernameRE.MatchString(username) {
+		return "", errors.Errorf("username %q invalid; %s", username, usernameHelp)
 	}
 	return username, nil
 }

@@ -33,8 +33,82 @@ const (
 	pgCatalogName         = sessiondata.PgCatalogName
 )
 
+// informationSchema lists all the table definitions for
+// information_schema.
 var informationSchema = virtualSchema{
 	name: informationSchemaName,
+	allTableNames: buildStringSet(
+		// Generated with:
+		// select distinct '"'||table_name||'",' from information_schema.tables
+		//    where table_schema='information_schema' order by table_name;
+		"_pg_foreign_data_wrappers",
+		"_pg_foreign_servers",
+		"_pg_foreign_table_columns",
+		"_pg_foreign_tables",
+		"_pg_user_mappings",
+		"administrable_role_authorizations",
+		"applicable_roles",
+		"attributes",
+		"character_sets",
+		"check_constraint_routine_usage",
+		"check_constraints",
+		"collation_character_set_applicability",
+		"collations",
+		"column_domain_usage",
+		"column_options",
+		"column_privileges",
+		"column_udt_usage",
+		"columns",
+		"constraint_column_usage",
+		"constraint_table_usage",
+		"data_type_privileges",
+		"domain_constraints",
+		"domain_udt_usage",
+		"domains",
+		"element_types",
+		"enabled_roles",
+		"foreign_data_wrapper_options",
+		"foreign_data_wrappers",
+		"foreign_server_options",
+		"foreign_servers",
+		"foreign_table_options",
+		"foreign_tables",
+		"information_schema_catalog_name",
+		"key_column_usage",
+		"parameters",
+		"referential_constraints",
+		"role_column_grants",
+		"role_routine_grants",
+		"role_table_grants",
+		"role_udt_grants",
+		"role_usage_grants",
+		"routine_privileges",
+		"routines",
+		"schemata",
+		"sequences",
+		"sql_features",
+		"sql_implementation_info",
+		"sql_languages",
+		"sql_packages",
+		"sql_parts",
+		"sql_sizing",
+		"sql_sizing_profiles",
+		"table_constraints",
+		"table_privileges",
+		"tables",
+		"transforms",
+		"triggered_update_columns",
+		"triggers",
+		"udt_privileges",
+		"usage_privileges",
+		"user_defined_types",
+		"user_mapping_options",
+		"user_mappings",
+		"view_column_usage",
+		"view_routine_usage",
+		"view_table_usage",
+		"views",
+	),
 	tables: []virtualSchemaTable{
 		informationSchemaAdministrableRoleAuthorizations,
 		informationSchemaApplicableRoles,
@@ -43,8 +117,10 @@ var informationSchema = virtualSchema{
 		informationSchemaConstraintColumnUsageTable,
 		informationSchemaEnabledRoles,
 		informationSchemaKeyColumnUsageTable,
+		informationSchemaParametersTable,
 		informationSchemaReferentialConstraintsTable,
 		informationSchemaRoleTableGrants,
+		informationSchemaRoutineTable,
 		informationSchemaSchemataTable,
 		informationSchemaSchemataTablePrivileges,
 		informationSchemaSequences,
@@ -57,6 +133,14 @@ var informationSchema = virtualSchema{
 	},
 	tableValidator:             validateInformationSchemaTable,
 	validWithNoDatabaseContext: true,
+}
+
+func buildStringSet(ss ...string) map[string]struct{} {
+	m := map[string]struct{}{}
+	for _, s := range ss {
+		m[s] = struct{}{}
+	}
+	return m
 }
 
 var (
@@ -125,7 +209,7 @@ CREATE TABLE information_schema.administrable_role_authorizations (
 	IS_GRANTABLE STRING NOT NULL
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		currentUser := p.SessionData().User
 		memberMap, err := p.MemberOfWithAdminOption(ctx, currentUser)
 		if err != nil {
@@ -162,7 +246,7 @@ CREATE TABLE information_schema.applicable_roles (
 	IS_GRANTABLE STRING NOT NULL
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		currentUser := p.SessionData().User
 		memberMap, err := p.MemberOfWithAdminOption(ctx, currentUser)
 		if err != nil {
@@ -200,8 +284,8 @@ CREATE TABLE information_schema.column_privileges (
 	IS_GRANTABLE   STRING
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, prefix, virtualMany, func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 			dbNameStr := tree.NewDString(db.Name)
 			scNameStr := tree.NewDString(scName)
 			columndata := privilege.List{privilege.SELECT, privilege.INSERT, privilege.UPDATE} // privileges for column level granularity
@@ -246,16 +330,19 @@ CREATE TABLE information_schema.columns (
 	CHARACTER_MAXIMUM_LENGTH INT,
 	CHARACTER_OCTET_LENGTH   INT,
 	NUMERIC_PRECISION        INT,
+	NUMERIC_PRECISION_RADIX  INT,
 	NUMERIC_SCALE            INT,
 	DATETIME_PRECISION       INT,
 	CHARACTER_SET_CATALOG    STRING,
 	CHARACTER_SET_SCHEMA     STRING,
 	CHARACTER_SET_NAME       STRING,
-	GENERATION_EXPRESSION    STRING
+	GENERATION_EXPRESSION    STRING,          -- MySQL/CockroachDB extension.
+	IS_HIDDEN                STRING NOT NULL, -- CockroachDB extension for SHOW COLUMNS / dump.
+	CRDB_SQL_TYPE            STRING NOT NULL  -- CockroachDB extension for SHOW COLUMNS / dump.
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, prefix, virtualMany, func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 			dbNameStr := tree.NewDString(db.Name)
 			scNameStr := tree.NewDString(scName)
 			// Table descriptors already holds columns in-order.
@@ -263,23 +350,26 @@ CREATE TABLE information_schema.columns (
 			return forEachColumnInTable(table, func(column *sqlbase.ColumnDescriptor) error {
 				visible++
 				return addRow(
-					dbNameStr,                                // table_catalog
-					scNameStr,                                // table_schema
-					tree.NewDString(table.Name),              // table_name
-					tree.NewDString(column.Name),             // column_name
-					tree.NewDInt(tree.DInt(visible)),         // ordinal_position, 1-indexed
-					dStringPtrOrNull(column.DefaultExpr),     // column_default
-					yesOrNoDatum(column.Nullable),            // is_nullable
-					tree.NewDString(column.Type.SQLString()), // data_type
-					characterMaximumLength(column.Type),      // character_maximum_length
-					characterOctetLength(column.Type),        // character_octet_length
-					numericPrecision(column.Type),            // numeric_precision
-					numericScale(column.Type),                // numeric_scale
-					datetimePrecision(column.Type),           // datetime_precision
-					tree.DNull,                               // character_set_catalog
-					tree.DNull,                               // character_set_schema
-					tree.DNull,                               // character_set_name
-					dStringPtrOrEmpty(column.ComputeExpr),    // generation_expression
+					dbNameStr,                                                   // table_catalog
+					scNameStr,                                                   // table_schema
+					tree.NewDString(table.Name),                                 // table_name
+					tree.NewDString(column.Name),                                // column_name
+					tree.NewDInt(tree.DInt(visible)),                            // ordinal_position, 1-indexed
+					dStringPtrOrNull(column.DefaultExpr),                        // column_default
+					yesOrNoDatum(column.Nullable),                               // is_nullable
+					tree.NewDString(column.Type.InformationSchemaVisibleType()), // data_type
+					characterMaximumLength(column.Type),                         // character_maximum_length
+					characterOctetLength(column.Type),                           // character_octet_length
+					numericPrecision(column.Type),                               // numeric_precision
+					numericPrecisionRadix(column.Type),                          // numeric_precision_radix
+					numericScale(column.Type),                                   // numeric_scale
+					datetimePrecision(column.Type),                              // datetime_precision
+					tree.DNull,                                                  // character_set_catalog
+					tree.DNull,                                                  // character_set_schema
+					tree.DNull,                                                  // character_set_name
+					dStringPtrOrEmpty(column.ComputeExpr),                       // generation_expression
+					yesOrNoDatum(column.Hidden),                                 // is_hidden
+					tree.NewDString(column.Type.SQLString()),                    // crdb_sql_type
 				)
 			})
 		})
@@ -294,7 +384,7 @@ CREATE TABLE information_schema.enabled_roles (
 	ROLE_NAME STRING NOT NULL
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		currentUser := p.SessionData().User
 		memberMap, err := p.MemberOfWithAdminOption(ctx, currentUser)
 		if err != nil {
@@ -332,6 +422,10 @@ func numericPrecision(colType sqlbase.ColumnType) tree.Datum {
 	return dIntFnOrNull(colType.NumericPrecision)
 }
 
+func numericPrecisionRadix(colType sqlbase.ColumnType) tree.Datum {
+	return dIntFnOrNull(colType.NumericPrecisionRadix)
+}
+
 func numericScale(colType sqlbase.ColumnType) tree.Datum {
 	return dIntFnOrNull(colType.NumericScale)
 }
@@ -354,8 +448,8 @@ CREATE TABLE information_schema.constraint_column_usage (
 	CONSTRAINT_SCHEMA  STRING NOT NULL,
 	CONSTRAINT_NAME    STRING NOT NULL
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDescWithTableLookup(ctx, p, prefix, hideVirtual /*no constraints in virtual tables*/, func(
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual /*no constraints in virtual tables*/, func(
 			db *sqlbase.DatabaseDescriptor,
 			scName string,
 			table *sqlbase.TableDescriptor,
@@ -414,8 +508,8 @@ CREATE TABLE information_schema.key_column_usage (
 	ORDINAL_POSITION   INT NOT NULL,
 	POSITION_IN_UNIQUE_CONSTRAINT INT
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDescWithTableLookup(ctx, p, prefix, hideVirtual /*no constraints in virtual tables*/, func(
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual /*no constraints in virtual tables*/, func(
 			db *sqlbase.DatabaseDescriptor,
 			scName string,
 			table *sqlbase.TableDescriptor,
@@ -463,6 +557,53 @@ CREATE TABLE information_schema.key_column_usage (
 			}
 			return nil
 		})
+	},
+}
+
+// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-parameters.html
+// MySQL:    https://dev.mysql.com/doc/refman/5.7/en/parameters-table.html
+var informationSchemaParametersTable = virtualSchemaTable{
+	schema: `
+CREATE TABLE information_schema.parameters (
+	SPECIFIC_CATALOG STRING,
+	SPECIFIC_SCHEMA STRING,
+	SPECIFIC_NAME STRING,
+	ORDINAL_POSITION INT,
+	PARAMETER_MODE STRING,
+	IS_RESULT STRING,
+	AS_LOCATOR STRING,
+	PARAMETER_NAME STRING,
+	DATA_TYPE STRING,
+	CHARACTER_MAXIMUM_LENGTH INT,
+	CHARACTER_OCTET_LENGTH INT,
+	CHARACTER_SET_CATALOG STRING,
+	CHARACTER_SET_SCHEMA STRING,
+	CHARACTER_SET_NAME STRING,
+	COLLATION_CATALOG STRING,
+	COLLATION_SCHEMA STRING,
+	COLLATION_NAME STRING,
+	NUMERIC_PRECISION INT,
+	NUMERIC_PRECISION_RADIX INT,
+	NUMERIC_SCALE INT,
+	DATETIME_PRECISION INT,
+	INTERVAL_TYPE STRING,
+	INTERVAL_PRECISION INT,
+	UDT_CATALOG STRING,
+	UDT_SCHEMA STRING,
+	UDT_NAME STRING,
+	SCOPE_CATALOG STRING,
+	SCOPE_SCHEMA STRING,
+	SCOPE_NAME STRING,
+	MAXIMUM_CARDINALITY INT,
+	DTD_IDENTIFIER STRING,
+	PARAMETER_DEFAULT STRING
+);
+`,
+	// This is the same as information_schema.table_privileges. In postgres, this virtual table does
+	// not show tables with grants provided through PUBLIC, but table_privileges does.
+	// Since we don't have the PUBLIC concept, the two virtual tables are identical.
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
 	},
 }
 
@@ -515,8 +656,8 @@ CREATE TABLE information_schema.referential_constraints (
 	TABLE_NAME                STRING NOT NULL,
 	REFERENCED_TABLE_NAME     STRING NOT NULL
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDescWithTableLookup(ctx, p, prefix, hideVirtual /*no constraints in virtual tables*/, func(
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual /*no constraints in virtual tables*/, func(
 			db *sqlbase.DatabaseDescriptor,
 			scName string,
 			table *sqlbase.TableDescriptor,
@@ -579,6 +720,98 @@ CREATE TABLE information_schema.role_table_grants (
 	populate: populateTablePrivileges,
 }
 
+// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-routines.html
+// MySQL:    https://dev.mysql.com/doc/mysql-infoschema-excerpt/5.7/en/routines-table.html
+var informationSchemaRoutineTable = virtualSchemaTable{
+	schema: `
+CREATE TABLE information_schema.routines (
+	SPECIFIC_CATALOG STRING,
+	SPECIFIC_SCHEMA STRING,
+	SPECIFIC_NAME STRING,
+	ROUTINE_CATALOG STRING,
+	ROUTINE_SCHEMA STRING,
+	ROUTINE_NAME STRING,
+	ROUTINE_TYPE STRING,
+	MODULE_CATALOG STRING,
+	MODULE_SCHEMA STRING,
+	MODULE_NAME STRING,
+	UDT_CATALOG STRING,
+	UDT_SCHEMA STRING,
+	UDT_NAME STRING,
+	DATA_TYPE STRING,
+	CHARACTER_MAXIMUM_LENGTH INT,
+	CHARACTER_OCTET_LENGTH INT,
+	CHARACTER_SET_CATALOG STRING,
+	CHARACTER_SET_SCHEMA STRING,
+	CHARACTER_SET_NAME STRING,
+	COLLATION_CATALOG STRING,
+	COLLATION_SCHEMA STRING,
+	COLLATION_NAME STRING,
+	NUMERIC_PRECISION INT,
+	NUMERIC_PRECISION_RADIX INT,
+	NUMERIC_SCALE INT,
+	DATETIME_PRECISION INT,
+	INTERVAL_TYPE STRING,
+	INTERVAL_PRECISION STRING,
+	TYPE_UDT_CATALOG STRING,
+	TYPE_UDT_SCHEMA STRING,
+	TYPE_UDT_NAME STRING,
+	SCOPE_CATALOG STRING,
+	SCOPE_NAME STRING,
+	MAXIMUM_CARDINALITY INT,
+	DTD_IDENTIFIER STRING,
+	ROUTINE_BODY STRING,
+	ROUTINE_DEFINITION STRING,
+	EXTERNAL_NAME STRING,
+	EXTERNAL_LANGUAGE STRING,
+	PARAMETER_STYLE STRING,
+	IS_DETERMINISTIC STRING,
+	SQL_DATA_ACCESS STRING,
+	IS_NULL_CALL STRING,
+	SQL_PATH STRING,
+	SCHEMA_LEVEL_ROUTINE STRING,
+	MAX_DYNAMIC_RESULT_SETS INT,
+	IS_USER_DEFINED_CAST STRING,
+	IS_IMPLICITLY_INVOCABLE STRING,
+	SECURITY_TYPE STRING,
+	TO_SQL_SPECIFIC_CATALOG STRING,
+	TO_SQL_SPECIFIC_SCHEMA STRING,
+	TO_SQL_SPECIFIC_NAME STRING,
+	AS_LOCATOR STRING,
+	CREATED  TIMESTAMPTZ,
+	LAST_ALTERED TIMESTAMPTZ,
+	NEW_SAVEPOINT_LEVEL  STRING,
+	IS_UDT_DEPENDENT STRING,
+	RESULT_CAST_FROM_DATA_TYPE STRING,
+	RESULT_CAST_AS_LOCATOR STRING,
+	RESULT_CAST_CHAR_MAX_LENGTH  INT,
+	RESULT_CAST_CHAR_OCTET_LENGTH STRING,
+	RESULT_CAST_CHAR_SET_CATALOG STRING,
+	RESULT_CAST_CHAR_SET_SCHEMA  STRING,
+	RESULT_CAST_CHAR_SET_NAME STRING,
+	RESULT_CAST_COLLATION_CATALOG STRING,
+	RESULT_CAST_COLLATION_SCHEMA STRING,
+	RESULT_CAST_COLLATION_NAME STRING,
+	RESULT_CAST_NUMERIC_PRECISION INT,
+	RESULT_CAST_NUMERIC_PRECISION_RADIX INT,
+	RESULT_CAST_NUMERIC_SCALE INT,
+	RESULT_CAST_DATETIME_PRECISION STRING,
+	RESULT_CAST_INTERVAL_TYPE STRING,
+	RESULT_CAST_INTERVAL_PRECISION INT,
+	RESULT_CAST_TYPE_UDT_CATALOG STRING,
+	RESULT_CAST_TYPE_UDT_SCHEMA  STRING,
+	RESULT_CAST_TYPE_UDT_NAME STRING,
+	RESULT_CAST_SCOPE_CATALOG STRING,
+	RESULT_CAST_SCOPE_SCHEMA STRING,
+	RESULT_CAST_SCOPE_NAME STRING,
+	RESULT_CAST_MAXIMUM_CARDINALITY INT,
+	RESULT_CAST_DTD_IDENTIFIER STRING
+); `,
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+}
+
 // Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-schemata.html
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/schemata-table.html
 var informationSchemaSchemataTable = virtualSchemaTable{
@@ -589,8 +822,8 @@ CREATE TABLE information_schema.schemata (
 	DEFAULT_CHARACTER_SET_NAME STRING,
 	SQL_PATH                   STRING
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachDatabaseDesc(ctx, p, prefix, func(db *sqlbase.DatabaseDescriptor) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachDatabaseDesc(ctx, p, dbContext, func(db *sqlbase.DatabaseDescriptor) error {
 			return forEachSchemaName(ctx, p, db, func(sc string) error {
 				return addRow(
 					tree.NewDString(db.Name), // catalog_name
@@ -615,8 +848,8 @@ CREATE TABLE information_schema.schema_privileges (
 	IS_GRANTABLE    STRING
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachDatabaseDesc(ctx, p, prefix, func(db *sqlbase.DatabaseDescriptor) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachDatabaseDesc(ctx, p, dbContext, func(db *sqlbase.DatabaseDescriptor) error {
 			return forEachSchemaName(ctx, p, db, func(scName string) error {
 				privs := db.Privileges.Show()
 				dbNameStr := tree.NewDString(db.Name)
@@ -675,8 +908,8 @@ CREATE TABLE information_schema.sequences (
     INCREMENT                STRING NOT NULL,
     CYCLE_OPTION             STRING NOT NULL
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, prefix, hideVirtual, /*no sequences in virtual schemas*/
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /*no sequences in virtual schemas*/
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 				if !table.IsSequence() {
 					return nil
@@ -685,7 +918,7 @@ CREATE TABLE information_schema.sequences (
 					tree.NewDString(db.GetName()),    // catalog
 					tree.NewDString(scName),          // schema
 					tree.NewDString(table.GetName()), // name
-					tree.NewDString("INT"),           // type
+					tree.NewDString("integer"),       // type
 					tree.NewDInt(64),                 // numeric precision
 					tree.NewDInt(2),                  // numeric precision radix
 					tree.NewDInt(0),                  // numeric scale
@@ -718,8 +951,8 @@ CREATE TABLE information_schema.statistics (
 	STORING       STRING NOT NULL,
 	IMPLICIT      STRING NOT NULL
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, prefix, hideVirtual, /* virtual tables have no indexes*/
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /* virtual tables have no indexes*/
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 				dbNameStr := tree.NewDString(db.GetName())
 				scNameStr := tree.NewDString(scName)
@@ -813,8 +1046,8 @@ CREATE TABLE information_schema.table_constraints (
 	IS_DEFERRABLE      STRING NOT NULL,
 	INITIALLY_DEFERRED STRING NOT NULL
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDescWithTableLookup(ctx, p, prefix, hideVirtual, /* virtual tables have no constraints */
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual, /* virtual tables have no constraints */
 			func(
 				db *sqlbase.DatabaseDescriptor,
 				scName string,
@@ -860,8 +1093,8 @@ CREATE TABLE information_schema.user_privileges (
 	PRIVILEGE_TYPE STRING NOT NULL,
 	IS_GRANTABLE   STRING
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachDatabaseDesc(ctx, p, prefix, func(dbDesc *DatabaseDescriptor) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachDatabaseDesc(ctx, p, dbContext, func(dbDesc *DatabaseDescriptor) error {
 			dbNameStr := tree.NewDString(dbDesc.Name)
 			for _, u := range []string{security.RootUser, sqlbase.AdminRole} {
 				grantee := tree.NewDString(u)
@@ -901,9 +1134,9 @@ CREATE TABLE information_schema.table_privileges (
 
 // populateTablePrivileges is used to populate both table_privileges and role_table_grants.
 func populateTablePrivileges(
-	ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error,
+	ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error,
 ) error {
-	return forEachTableDesc(ctx, p, prefix, virtualMany,
+	return forEachTableDesc(ctx, p, dbContext, virtualMany,
 		func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 			dbNameStr := tree.NewDString(db.Name)
 			scNameStr := tree.NewDString(scName)
@@ -946,8 +1179,8 @@ CREATE TABLE information_schema.tables (
 	IS_INSERTABLE_INTO STRING NOT NULL,
 	VERSION            INT
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, prefix, virtualMany,
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDesc(ctx, p, dbContext, virtualMany,
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 				if table.IsSequence() {
 					return nil
@@ -992,8 +1225,8 @@ CREATE TABLE information_schema.views (
     IS_TRIGGER_DELETABLE       STRING,
     IS_TRIGGER_INSERTABLE_INTO STRING
 );`,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, prefix, hideVirtual, /* virtual schemas have no views */
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /* virtual schemas have no views */
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 				if !table.IsView() {
 					return nil
@@ -1046,7 +1279,7 @@ func forEachSchemaName(
 func forEachDatabaseDesc(
 	ctx context.Context,
 	p *planner,
-	prefix *DatabaseDescriptor,
+	dbContext *DatabaseDescriptor,
 	fn func(*sqlbase.DatabaseDescriptor) error,
 ) error {
 	descs, err := p.Tables().getAllDescriptors(ctx, p.txn)
@@ -1058,7 +1291,7 @@ func forEachDatabaseDesc(
 	var dbDescs []*sqlbase.DatabaseDescriptor
 	for _, desc := range descs {
 		if dbDesc, ok := desc.(*sqlbase.DatabaseDescriptor); ok &&
-			(prefix == nil || prefix.ID == dbDesc.ID) &&
+			(dbContext == nil || dbContext.ID == dbDesc.ID) &&
 			userCanSeeDatabase(ctx, p, dbDesc) {
 			dbDescs = append(dbDescs, dbDesc)
 		}
@@ -1077,7 +1310,7 @@ func forEachDatabaseDesc(
 // each table, the function will call fn with its respective database
 // and table descriptor.
 //
-// The prefix argument specifies in which database context we are
+// The dbContext argument specifies in which database context we are
 // requesting the descriptors. In context nil all descriptors are
 // visible, in non-empty contexts only the descriptors of that
 // database are visible.
@@ -1087,11 +1320,11 @@ func forEachDatabaseDesc(
 func forEachTableDesc(
 	ctx context.Context,
 	p *planner,
-	prefix *DatabaseDescriptor,
+	dbContext *DatabaseDescriptor,
 	virtualOpts virtualOpts,
 	fn func(*sqlbase.DatabaseDescriptor, string, *sqlbase.TableDescriptor) error,
 ) error {
-	return forEachTableDescWithTableLookup(ctx, p, prefix, virtualOpts, func(
+	return forEachTableDescWithTableLookup(ctx, p, dbContext, virtualOpts, func(
 		db *sqlbase.DatabaseDescriptor,
 		scName string,
 		table *sqlbase.TableDescriptor,
@@ -1117,18 +1350,20 @@ const (
 func forEachTableDescAll(
 	ctx context.Context,
 	p *planner,
-	db *DatabaseDescriptor,
+	dbContext *DatabaseDescriptor,
 	virtualOpts virtualOpts,
 	fn func(*sqlbase.DatabaseDescriptor, string, *sqlbase.TableDescriptor) error,
 ) error {
-	return forEachTableDescWithTableLookupInternal(ctx, p, db, virtualOpts, true /* allowAdding */, func(
-		db *sqlbase.DatabaseDescriptor,
-		scName string,
-		table *sqlbase.TableDescriptor,
-		_ tableLookupFn,
-	) error {
-		return fn(db, scName, table)
-	})
+	return forEachTableDescWithTableLookupInternal(ctx,
+		p, dbContext, virtualOpts, true, /* allowAdding */
+		func(
+			db *sqlbase.DatabaseDescriptor,
+			scName string,
+			table *sqlbase.TableDescriptor,
+			_ tableLookupFn,
+		) error {
+			return fn(db, scName, table)
+		})
 }
 
 // forEachTableDescWithTableLookup acts like forEachTableDesc, except it also provides a
@@ -1136,18 +1371,18 @@ func forEachTableDescAll(
 // on demand. This is important for callers dealing with objects like foreign keys, where
 // the metadata for each object must be augmented by looking at the referenced table.
 //
-// The prefix argument specifies in which database context we are
+// The dbContext argument specifies in which database context we are
 // requesting the descriptors.  In context "" all descriptors are
 // visible, in non-empty contexts only the descriptors of that
 // database are visible.
 func forEachTableDescWithTableLookup(
 	ctx context.Context,
 	p *planner,
-	prefix *DatabaseDescriptor,
+	dbContext *DatabaseDescriptor,
 	virtualOpts virtualOpts,
 	fn func(*sqlbase.DatabaseDescriptor, string, *sqlbase.TableDescriptor, tableLookupFn) error,
 ) error {
-	return forEachTableDescWithTableLookupInternal(ctx, p, prefix, virtualOpts, false /* allowAdding */, fn)
+	return forEachTableDescWithTableLookupInternal(ctx, p, dbContext, virtualOpts, false /* allowAdding */, fn)
 }
 
 // forEachTableDescWithTableLookupInternal is the logic that supports
@@ -1158,7 +1393,7 @@ func forEachTableDescWithTableLookup(
 func forEachTableDescWithTableLookupInternal(
 	ctx context.Context,
 	p *planner,
-	prefix *DatabaseDescriptor,
+	dbContext *DatabaseDescriptor,
 	virtualOpts virtualOpts,
 	allowAdding bool,
 	fn func(*DatabaseDescriptor, string, *TableDescriptor, tableLookupFn) error,
@@ -1167,7 +1402,7 @@ func forEachTableDescWithTableLookupInternal(
 	if err != nil {
 		return err
 	}
-	lCtx := newInternalLookupCtx(descs, prefix)
+	lCtx := newInternalLookupCtx(descs, dbContext)
 
 	if virtualOpts == virtualMany || virtualOpts == virtualOnce {
 		// Virtual descriptors first.
@@ -1237,10 +1472,8 @@ func forEachColumnInTable(
 ) error {
 	// Table descriptors already hold columns in-order.
 	for i := range table.Columns {
-		if !table.Columns[i].Hidden {
-			if err := fn(&table.Columns[i]); err != nil {
-				return err
-			}
+		if err := fn(&table.Columns[i]); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1256,25 +1489,21 @@ func forEachColumnInIndex(
 		colMap[column.ID] = &table.Columns[i]
 	}
 	for _, columnID := range index.ColumnIDs {
-		if column := colMap[columnID]; !column.Hidden {
-			if err := fn(column); err != nil {
-				return err
-			}
+		column := colMap[columnID]
+		if err := fn(column); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 func forEachRole(
-	ctx context.Context, origPlanner *planner, fn func(username string, isRole bool) error,
+	ctx context.Context, p *planner, fn func(username string, isRole bool) error,
 ) error {
 	query := `SELECT username, "isRole" FROM system.users`
-	p, cleanup := newInternalPlanner(
-		"for-each-role", origPlanner.txn, security.RootUser,
-		origPlanner.extendedEvalCtx.MemMetrics, origPlanner.ExecCfg(),
+	rows, _ /* cols */, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+		ctx, "read-roles", p.txn, query,
 	)
-	defer cleanup()
-	rows, _ /* cols */, err := p.queryRows(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -1294,15 +1523,12 @@ func forEachRole(
 }
 
 func forEachRoleMembership(
-	ctx context.Context, origPlanner *planner, fn func(role, member string, isAdmin bool) error,
+	ctx context.Context, p *planner, fn func(role, member string, isAdmin bool) error,
 ) error {
 	query := `SELECT "role", "member", "isAdmin" FROM system.role_members`
-	p, cleanup := newInternalPlanner(
-		"for-each-role-member", origPlanner.txn, security.RootUser,
-		origPlanner.extendedEvalCtx.MemMetrics, origPlanner.ExecCfg(),
+	rows, _ /* cols */, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+		ctx, "read-members", p.txn, query,
 	)
-	defer cleanup()
-	rows, _ /* cols */, err := p.queryRows(ctx, query)
 	if err != nil {
 		return err
 	}

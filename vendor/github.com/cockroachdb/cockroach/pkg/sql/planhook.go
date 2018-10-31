@@ -18,19 +18,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
-
-// hookFnNode is a planNode implemented in terms of a function. It begins the
-// provided function during Start and serves the results it returns over the
-// channel.
-type hookFnNode struct {
-	f      func(context.Context, chan<- tree.Datums) error
-	header sqlbase.ResultColumns
-
-	run hookFnRun
-}
 
 // planHookFn is a function that can intercept a statement being planned and
 // provide an alternate implementation. It's primarily intended to allow
@@ -38,15 +30,22 @@ type hookFnNode struct {
 //
 // To intercept a statement the function should return a non-nil function for
 // `fn` as well as the appropriate sqlbase.ResultColumns describing the results
-// it will return (if any). `fn` will be called in a goroutine during the
-// `Start` phase of plan execution.
-//
-// The channel argument to `fn` is used to return results with the client. It's
-// a blocking channel, so implementors should be careful to only use blocking
-// sends on it when necessary.
+// it will return (if any). If the hook plan requires sub-plans to be planned
+// and started by the usual machinery (e.g. to run a subquery), it must return
+// then as well. `fn` will be called in a goroutine during the `Start` phase of
+// plan execution.
 type planHookFn func(
 	context.Context, tree.Statement, PlanHookState,
-) (fn func(context.Context, chan<- tree.Datums) error, header sqlbase.ResultColumns, err error)
+) (fn PlanHookRowFn, header sqlbase.ResultColumns, subplans []planNode, err error)
+
+// PlanHookRowFn describes the row-production for hook-created plans. The
+// channel argument is used to return results to the plan's runner. It's
+// a blocking channel, so implementors should be careful to only use blocking
+// sends on it when necessary. Any subplans returned by the hook when initially
+// called are passed back, planned and started, for the the RowFn's use.
+//
+//TODO(dt): should this take runParams like a normal planNode.Next?
+type PlanHookRowFn func(context.Context, []planNode, chan<- tree.Datums) error
 
 var planHooks []planHookFn
 
@@ -58,21 +57,26 @@ type wrappedPlanHookFn func(
 
 var wrappedPlanHooks []wrappedPlanHookFn
 
+func (p *planner) RunParams(ctx context.Context) runParams {
+	return runParams{ctx, p.ExtendedEvalContext(), p}
+}
+
 // PlanHookState exposes the subset of planner needed by plan hooks.
 // We pass this as one interface, rather than individually passing each field or
 // interface as we find we need them, to avoid churn in the planHookFn sig and
 // the hooks that implement it.
 type PlanHookState interface {
 	SchemaResolver
+	RunParams(ctx context.Context) runParams
 	ExtendedEvalContext() *extendedEvalContext
 	SessionData() *sessiondata.SessionData
 	ExecCfg() *ExecutorConfig
-	DistLoader() *DistLoader
+	DistSQLPlanner() *DistSQLPlanner
 	LeaseMgr() *LeaseManager
 	TypeAsString(e tree.Expr, op string) (func() (string, error), error)
 	TypeAsStringArray(e tree.Exprs, op string) (func() ([]string, error), error)
 	TypeAsStringOpts(
-		opts tree.KVOptions, valuelessOpts map[string]bool,
+		opts tree.KVOptions, optsValidate map[string]KVStringOptValidate,
 	) (func() (map[string]string, error), error)
 	User() string
 	AuthorizationAccessor
@@ -86,6 +90,10 @@ type PlanHookState interface {
 	) (*DropUserNode, error)
 	GetAllUsersAndRoles(ctx context.Context) (map[string]bool, error)
 	BumpRoleMembershipTableVersion(ctx context.Context) error
+	Select(ctx context.Context, n *tree.Select, desiredTypes []types.T) (planNode, error)
+	EvalAsOfTimestamp(asOf tree.AsOfClause, max hlc.Timestamp) (hlc.Timestamp, error)
+	ResolveUncachedDatabaseByName(
+		ctx context.Context, dbName string, required bool) (*UncachedDatabaseDescriptor, error)
 }
 
 // AddPlanHook adds a hook used to short-circuit creating a planNode from a
@@ -101,6 +109,17 @@ func AddWrappedPlanHook(f wrappedPlanHookFn) {
 	wrappedPlanHooks = append(wrappedPlanHooks, f)
 }
 
+// hookFnNode is a planNode implemented in terms of a function. It begins the
+// provided function during Start and serves the results it returns over the
+// channel.
+type hookFnNode struct {
+	f        PlanHookRowFn
+	header   sqlbase.ResultColumns
+	subplans []planNode
+
+	run hookFnRun
+}
+
 // hookFnRun contains the run-time state of hookFnNode during local execution.
 type hookFnRun struct {
 	resultsCh chan tree.Datums
@@ -114,7 +133,11 @@ func (f *hookFnNode) startExec(params runParams) error {
 	f.run.resultsCh = make(chan tree.Datums)
 	f.run.errCh = make(chan error)
 	go func() {
-		f.run.errCh <- f.f(params.ctx, f.run.resultsCh)
+		err := f.f(params.ctx, f.subplans, f.run.resultsCh)
+		select {
+		case <-params.ctx.Done():
+		case f.run.errCh <- err:
+		}
 		close(f.run.errCh)
 		close(f.run.resultsCh)
 	}()
@@ -131,5 +154,11 @@ func (f *hookFnNode) Next(params runParams) (bool, error) {
 		return true, nil
 	}
 }
+
 func (f *hookFnNode) Values() tree.Datums { return f.run.row }
-func (*hookFnNode) Close(context.Context) {}
+
+func (f *hookFnNode) Close(ctx context.Context) {
+	for _, sub := range f.subplans {
+		sub.Close(ctx)
+	}
+}

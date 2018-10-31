@@ -15,23 +15,29 @@
 package sql
 
 import (
-	"bytes"
 	"context"
+	encjson "encoding/json"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/pkg/errors"
 )
 
 var showTableStatsColumns = sqlbase.ResultColumns{
-	{Name: "name", Typ: types.String},
-	{Name: "columns", Typ: types.String},
-	{Name: "created_at", Typ: types.Timestamp},
+	{Name: "statistics_name", Typ: types.String},
+	{Name: "column_names", Typ: types.TArray{Typ: types.String}},
+	{Name: "created", Typ: types.Timestamp},
 	{Name: "row_count", Typ: types.Int},
 	{Name: "distinct_count", Typ: types.Int},
 	{Name: "null_count", Typ: types.Int},
 	{Name: "histogram_id", Typ: types.Int},
+}
+
+var showTableStatsJSONColumns = sqlbase.ResultColumns{
+	{Name: "statistics", Typ: types.JSON},
 }
 
 // ShowTableStats returns a SHOW STATISTICS statement for the specified table.
@@ -42,33 +48,32 @@ func (p *planner) ShowTableStats(ctx context.Context, n *tree.ShowTableStats) (p
 		return nil, err
 	}
 
-	var desc *TableDescriptor
 	// We avoid the cache so that we can observe the stats without
-	// taking a lease, like other SHOW commands. We also use
-	// allowAdding=true so we can look at the stats of a table
-	// added in the same transaction.
-	//
-	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
-		desc, err = ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
-	})
+	// taking a lease, like other SHOW commands.
+	desc, err := p.ResolveUncachedTableDescriptor(ctx, tn, true /*required*/, requireTableDesc)
 	if err != nil {
 		return nil, err
 	}
 	if err := p.CheckAnyPrivilege(ctx, desc); err != nil {
 		return nil, err
 	}
+	columns := showTableStatsColumns
+	if n.UsingJSON {
+		columns = showTableStatsJSONColumns
+	}
 
 	return &delayedNode{
-		name:    "SHOW STATISTICS FOR TABLE " + n.Table.String(),
-		columns: showTableStatsColumns,
+		name:    n.String(),
+		columns: columns,
 		constructor: func(ctx context.Context, p *planner) (planNode, error) {
 			// We need to query the table_statistics and then do some post-processing:
-			//  - convert column IDs to a list of column names
+			//  - convert column IDs to column names
 			//  - if the statistic has a histogram, we return the statistic ID as a
 			//    "handle" which can be used with SHOW HISTOGRAM.
-			rows, _ /* cols */, err := p.queryRows(
+			rows, _ /* cols */, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
 				ctx,
+				"read-table-stats",
+				p.txn,
 				`SELECT "statisticID",
 					      name,
 					      "columnIDs",
@@ -76,7 +81,7 @@ func (p *planner) ShowTableStats(ctx context.Context, n *tree.ShowTableStats) (p
 					      "rowCount",
 					      "distinctCount",
 					      "nullCount",
-					      histogram IS NOT NULL
+					      histogram
 				 FROM system.table_statistics
 				 WHERE "tableID" = $1
 				 ORDER BY "createdAt"`,
@@ -94,34 +99,63 @@ func (p *planner) ShowTableStats(ctx context.Context, n *tree.ShowTableStats) (p
 				rowCountIdx
 				distinctCountIdx
 				nullCountIdx
-				hasHistogramIdx
+				histogramIdx
 				numCols
 			)
-			v := p.newContainerValuesNode(showTableStatsColumns, 0)
+
+			v := p.newContainerValuesNode(columns, 0)
+			if n.UsingJSON {
+				result := make([]stats.JSONStatistic, len(rows))
+				for i, r := range rows {
+					result[i].CreatedAt = tree.AsStringWithFlags(r[createdAtIdx], tree.FmtBareStrings)
+					result[i].RowCount = (uint64)(*r[rowCountIdx].(*tree.DInt))
+					result[i].DistinctCount = (uint64)(*r[distinctCountIdx].(*tree.DInt))
+					result[i].NullCount = (uint64)(*r[nullCountIdx].(*tree.DInt))
+					if r[nameIdx] != tree.DNull {
+						result[i].Name = string(*r[nameIdx].(*tree.DString))
+					}
+					colIDs := r[columnIDsIdx].(*tree.DArray).Array
+					result[i].Columns = make([]string, len(colIDs))
+					for j, d := range colIDs {
+						result[i].Columns[j] = statColumnString(desc, d)
+					}
+					if err := result[i].DecodeAndSetHistogram(r[histogramIdx]); err != nil {
+						v.Close(ctx)
+						return nil, err
+					}
+				}
+				encoded, err := encjson.Marshal(result)
+				if err != nil {
+					v.Close(ctx)
+					return nil, err
+				}
+				jsonResult, err := json.ParseJSON(string(encoded))
+				if err != nil {
+					v.Close(ctx)
+					return nil, err
+				}
+				if _, err := v.rows.AddRow(ctx, tree.Datums{tree.NewDJSON(jsonResult)}); err != nil {
+					v.Close(ctx)
+					return nil, err
+				}
+				return v, nil
+			}
+
 			for _, r := range rows {
 				if len(r) != numCols {
 					v.Close(ctx)
 					return nil, errors.Errorf("incorrect columns from internal query")
 				}
 
-				// List columns by name.
-				var buf bytes.Buffer
-				for i, d := range r[columnIDsIdx].(*tree.DArray).Array {
-					if i > 0 {
-						buf.WriteString(",")
-					}
-					id := sqlbase.ColumnID(*d.(*tree.DInt))
-					colDesc, err := desc.FindColumnByID(id)
-					if err != nil {
-						buf.WriteString("<unknown>") // This can happen if a column was removed.
-					} else {
-						buf.WriteString(colDesc.Name)
-					}
+				colIDs := r[columnIDsIdx].(*tree.DArray).Array
+				colNames := tree.NewDArray(types.String)
+				colNames.Array = make(tree.Datums, len(colIDs))
+				for i, d := range colIDs {
+					colNames.Array[i] = tree.NewDString(statColumnString(desc, d))
 				}
-				colNames := tree.NewDString(buf.String())
 
 				histogramID := tree.DNull
-				if r[hasHistogramIdx] == tree.DBoolTrue {
+				if r[histogramIdx] != tree.DNull {
 					histogramID = r[statIDIdx]
 				}
 
@@ -142,4 +176,14 @@ func (p *planner) ShowTableStats(ctx context.Context, n *tree.ShowTableStats) (p
 			return v, nil
 		},
 	}, nil
+}
+
+func statColumnString(desc *TableDescriptor, colID tree.Datum) string {
+	id := sqlbase.ColumnID(*colID.(*tree.DInt))
+	colDesc, err := desc.FindColumnByID(id)
+	if err != nil {
+		// This can happen if a column was removed.
+		return "<unknown>"
+	}
+	return colDesc.Name
 }

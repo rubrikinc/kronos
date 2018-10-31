@@ -142,34 +142,43 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 			p.applyLimit(n.plan, numRows, soft)
 		}
 
+	case *projectSetNode:
+		p.applyLimit(n.source, numRows, true)
+
+	case *rowCountNode:
+		p.setUnlimited(n.source)
+	case *serializeNode:
+		p.setUnlimited(n.source)
 	case *deleteNode:
 		// A limit does not propagate into a mutation. When there is a
 		// surrounding query, the mutation must run to completion even if
 		// the surrounding query only uses parts of its results.
-		p.setUnlimited(n.run.rows)
+		p.setUnlimited(n.source)
 	case *updateNode:
 		// A limit does not propagate into a mutation. When there is a
 		// surrounding query, the mutation must run to completion even if
 		// the surrounding query only uses parts of its results.
-		p.setUnlimited(n.run.rows)
+		p.setUnlimited(n.source)
 	case *insertNode:
 		// A limit does not propagate into a mutation. When there is a
 		// surrounding query, the mutation must run to completion even if
 		// the surrounding query only uses parts of its results.
-		p.setUnlimited(n.run.rows)
+		p.setUnlimited(n.source)
 	case *upsertNode:
 		// A limit does not propagate into a mutation. When there is a
 		// surrounding query, the mutation must run to completion even if
 		// the surrounding query only uses parts of its results.
-		p.setUnlimited(n.run.rows)
+		p.setUnlimited(n.source)
 	case *createTableNode:
 		if n.sourcePlan != nil {
 			p.applyLimit(n.sourcePlan, numRows, soft)
 		}
 	case *explainDistSQLNode:
-		p.setUnlimited(n.plan)
-	case *showTraceNode:
-		p.setUnlimited(n.plan)
+		// EXPLAIN ANALYZE is special: it handles its own limit propagation, since
+		// it fully executes during startExec.
+		if !n.analyze {
+			p.setUnlimited(n.plan)
+		}
 	case *showTraceReplicaNode:
 		p.setUnlimited(n.plan)
 	case *explainPlanNode:
@@ -180,7 +189,16 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *splitNode:
 		p.setUnlimited(n.rows)
 
-	case *testingRelocateNode:
+	case *relocateNode:
+		p.setUnlimited(n.rows)
+
+	case *cancelQueriesNode:
+		p.setUnlimited(n.rows)
+
+	case *cancelSessionsNode:
+		p.setUnlimited(n.rows)
+
+	case *controlJobsNode:
 		p.setUnlimited(n.rows)
 
 	case *valuesNode:
@@ -188,9 +206,12 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
+	case *renameColumnNode:
+	case *renameDatabaseNode:
+	case *renameIndexNode:
+	case *renameTableNode:
 	case *scrubNode:
-	case *controlJobNode:
+	case *truncateNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:
@@ -206,7 +227,6 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *zeroNode:
 	case *unaryNode:
 	case *hookFnNode:
-	case *valueGenerator:
 	case *sequenceSelectNode:
 	case *setVarNode:
 	case *setClusterSettingNode:
@@ -214,7 +234,11 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *showZoneConfigNode:
 	case *showRangesNode:
 	case *showFingerprintsNode:
+	case *showTraceNode:
 	case *scatterNode:
+
+	case *lookupJoinNode:
+		// The lookup join node is only planned by the optimizer.
 
 	default:
 		panic(fmt.Sprintf("unhandled node type: %T", plan))

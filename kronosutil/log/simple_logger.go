@@ -61,9 +61,5 @@ func (s *simpleLogger) V(level int32) bool {
 	return log.V(level)
 }
 
-func (s *simpleLogger) WithLogTag(ctx context.Context, name string, value interface{}) context.Context {
-	return log.WithLogTag(ctx, name, value)
-}
-
 func (s *simpleLogger) Flush() {
 }

@@ -40,6 +40,8 @@ const (
 	EventLogCreateTable EventLogType = "create_table"
 	// EventLogDropTable is recorded when a table is dropped.
 	EventLogDropTable EventLogType = "drop_table"
+	// EventLogTruncateTable is recorded when a table is truncated.
+	EventLogTruncateTable EventLogType = "truncate_table"
 	// EventLogAlterTable is recorded when a table is altered.
 	EventLogAlterTable EventLogType = "alter_table"
 
@@ -86,6 +88,11 @@ const (
 
 	// EventLogSetClusterSetting is recorded when a cluster setting is changed.
 	EventLogSetClusterSetting EventLogType = "set_cluster_setting"
+
+	// EventLogSetZoneConfig is recorded when a zone config is changed.
+	EventLogSetZoneConfig EventLogType = "set_zone_config"
+	// EventLogRemoveZoneConfig is recorded when a zone config is removed.
+	EventLogRemoveZoneConfig EventLogType = "remove_zone_config"
 )
 
 // EventLogSetClusterSettingDetail is the json details for a settings change.
@@ -97,14 +104,12 @@ type EventLogSetClusterSettingDetail struct {
 
 // An EventLogger exposes methods used to record events to the event table.
 type EventLogger struct {
-	InternalExecutor
+	*InternalExecutor
 }
 
 // MakeEventLogger constructs a new EventLogger.
 func MakeEventLogger(execCfg *ExecutorConfig) EventLogger {
-	return EventLogger{InternalExecutor{
-		ExecCfg: execCfg,
-	}}
+	return EventLogger{InternalExecutor: execCfg.InternalExecutor}
 }
 
 // InsertEventRecord inserts a single event into the event log as part of the
@@ -117,7 +122,7 @@ func (ev EventLogger) InsertEventRecord(
 	info interface{},
 ) error {
 	// Record event record insertion in local log output.
-	txn.AddCommitTrigger(func() {
+	txn.AddCommitTrigger(func(ctx context.Context) {
 		log.Infof(
 			ctx, "Event: %q, target: %d, info: %+v",
 			eventType,
@@ -148,8 +153,7 @@ VALUES(
 		args[3] = string(infoBytes)
 	}
 
-	rows, err := ev.ExecuteStatementInTransaction(
-		ctx, "log-event", txn, insertEventTableStmt, args...)
+	rows, err := ev.Exec(ctx, "log-event", txn, insertEventTableStmt, args...)
 	if err != nil {
 		return err
 	}

@@ -80,6 +80,14 @@ func (p *planner) orderBy(
 		return nil, err
 	}
 
+	// We need to reject SRFs in the ORDER BY clause until they are
+	// properly handled.
+	seenGenerator := p.semaCtx.Properties.Derived.SeenGenerator
+	p.semaCtx.Properties.Derived.SeenGenerator = false
+	defer func() {
+		p.semaCtx.Properties.Derived.SeenGenerator = p.semaCtx.Properties.Derived.SeenGenerator || seenGenerator
+	}()
+
 	for _, o := range orderBy {
 		direction := encoding.Ascending
 		if o.Direction == tree.Descending {
@@ -194,6 +202,10 @@ func (p *planner) orderBy(
 		}
 		ordering = append(ordering,
 			sqlbase.ColumnOrderInfo{ColIdx: index, Direction: direction})
+	}
+
+	if p.semaCtx.Properties.Derived.SeenGenerator {
+		return nil, tree.NewInvalidFunctionUsageError(tree.GeneratorClass, "ORDER BY")
 	}
 
 	if ordering == nil {
@@ -426,6 +438,19 @@ func (p *planner) rewriteIndexOrderings(
 				})
 			}
 
+			for _, id := range idxDesc.ExtraColumnIDs {
+				col, err := desc.FindColumnByID(id)
+				if err != nil {
+					return nil, pgerror.NewAssertionErrorf("column with ID %d not found", id)
+				}
+
+				newOrderBy = append(newOrderBy, &tree.Order{
+					OrderType: tree.OrderByColumn,
+					Expr:      tree.NewColumnItem(tn, tree.Name(col.Name)),
+					Direction: chooseDirection(o.Direction == tree.Descending, sqlbase.IndexDescriptor_ASC),
+				})
+			}
+
 		default:
 			return nil, errors.Errorf("unknown ORDER BY specification: %s", tree.ErrString(&orderBy))
 		}
@@ -461,20 +486,30 @@ func (p *planner) colIndex(numOriginalCols int, expr tree.Expr, context string) 
 			}
 			ord = val
 		} else {
-			return -1, errors.Errorf("non-integer constant in %s: %s", context, expr)
+			return -1, pgerror.NewErrorf(
+				pgerror.CodeSyntaxError,
+				"non-integer constant in %s: %s", context, expr,
+			)
 		}
 	case *tree.DInt:
 		if *i >= 0 {
 			ord = int64(*i)
 		}
 	case *tree.StrVal:
-		return -1, errors.Errorf("non-integer constant in %s: %s", context, expr)
+		return -1, pgerror.NewErrorf(
+			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
+		)
 	case tree.Datum:
-		return -1, errors.Errorf("non-integer constant in %s: %s", context, expr)
+		return -1, pgerror.NewErrorf(
+			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
+		)
 	}
 	if ord != -1 {
 		if ord < 1 || ord > int64(numOriginalCols) {
-			return -1, errors.Errorf("%s position %s is not in select list", context, expr)
+			return -1, pgerror.NewErrorf(
+				pgerror.CodeInvalidColumnReferenceError,
+				"%s position %s is not in select list", context, expr,
+			)
 		}
 		ord--
 	}

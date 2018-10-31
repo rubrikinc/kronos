@@ -18,8 +18,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/coreos/etcd/raft"
 	"github.com/pkg/errors"
+	"go.etcd.io/etcd/raft"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -121,6 +121,6 @@ func (*raftSnapshotQueue) timer(_ time.Duration) time.Duration {
 	return raftSnapshotQueueTimerDuration
 }
 
-func (rq *raftSnapshotQueue) purgatoryChan() <-chan struct{} {
+func (rq *raftSnapshotQueue) purgatoryChan() <-chan time.Time {
 	return nil
 }

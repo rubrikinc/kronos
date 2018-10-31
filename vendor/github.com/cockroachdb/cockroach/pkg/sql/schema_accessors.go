@@ -42,9 +42,19 @@ type (
 	// DatabaseDescriptor is provided for convenience and to make the
 	// interface definitions below more intuitive.
 	DatabaseDescriptor = sqlbase.DatabaseDescriptor
+	// UncachedDatabaseDescriptor is provided for convenience and to make the
+	// interface definitions below more intuitive.
+	UncachedDatabaseDescriptor = sqlbase.DatabaseDescriptor
 	// ObjectDescriptor is provided for convenience and to make the
 	// interface definitions below more intuitive.
 	ObjectDescriptor = sqlbase.TableDescriptor
+	// MutableTableDescriptor is provided for convenience and to make the
+	// interface definitions below more intuitive.
+	MutableTableDescriptor = sqlbase.TableDescriptor
+	// UncachedTableDescriptor is provided for convenience and to make the
+	// interface definitions below more intuitive.
+	// It is an immutable descriptor read from the store.
+	UncachedTableDescriptor = sqlbase.TableDescriptor
 	// TableDescriptor is provided for convenience and to make the
 	// interface definitions below more intuitive.
 	TableDescriptor = sqlbase.TableDescriptor
@@ -80,8 +90,6 @@ type SchemaAccessor interface {
 	// found and flags.required is true, an error is returned, otherwise
 	// a nil reference is returned.
 	//
-	// flag.allowAdding controls inclusion of non-public descriptors.
-	//
 	// The 2nd return value (DatabaseDescriptor) is only returned if the
 	// lookup function otherwise needed to load the database descriptor.
 	// It is not guaranteed to be non-nil even if the first return value
@@ -114,7 +122,4 @@ type DatabaseListFlags struct {
 // ObjectLookupFlags is the flag struct suitable for GetObjectDesc().
 type ObjectLookupFlags struct {
 	CommonLookupFlags
-	// if allowAdding is set, descriptors in the ADD state will be
-	// included in the results as well.
-	allowAdding bool
 }

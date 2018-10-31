@@ -15,7 +15,7 @@
 package util
 
 import (
-	fmt "fmt"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -48,6 +48,10 @@ func TestFastIntMap(t *testing.T) {
 							k, v, ok, expV, expOk,
 						)
 					}
+				}
+
+				if e := fm.Empty(); e != (len(m) == 0) {
+					t.Fatalf("incorrect Empty: %t expected %t (%+v %v)", e, len(m) == 0, fm, m)
 				}
 
 				if l := fm.Len(); l != len(m) {

@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 )
 
@@ -59,21 +60,6 @@ func (r ReplicaID) String() string {
 	return strconv.FormatInt(int64(r), 10)
 }
 
-// IsSubset returns whether attributes list a is a subset of
-// attributes list b.
-func (a Attributes) IsSubset(b Attributes) bool {
-	m := map[string]struct{}{}
-	for _, s := range b.Attrs {
-		m[s] = struct{}{}
-	}
-	for _, s := range a.Attrs {
-		if _, ok := m[s]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
 // Equals returns whether the Attributes lists are equivalent. Attributes lists
 // are treated as sets, meaning that ordering and duplicates are ignored.
 func (a Attributes) Equals(b Attributes) bool {
@@ -97,29 +83,9 @@ func (a Attributes) Equals(b Attributes) bool {
 	return true
 }
 
-func (a Attributes) uniqueAttrs() []string {
-	var attrs []string
-	m := map[string]struct{}{}
-	for _, s := range a.Attrs {
-		if _, ok := m[s]; !ok {
-			m[s] = struct{}{}
-			attrs = append(attrs, s)
-		}
-	}
-	return attrs
-}
-
 // String implements the fmt.Stringer interface.
 func (a Attributes) String() string {
-	return strings.Join(a.uniqueAttrs(), ",")
-}
-
-// SortedString returns a sorted, de-duplicated, comma-separated list
-// of the attributes.
-func (a Attributes) SortedString() string {
-	attrs := a.uniqueAttrs()
-	sort.Strings(attrs)
-	return strings.Join(attrs, ",")
+	return strings.Join(a.Attrs, ",")
 }
 
 // RSpan returns the RangeDescriptor's resolved span.
@@ -174,6 +140,22 @@ func (r RangeDescriptor) IsInitialized() bool {
 	return len(r.EndKey) != 0
 }
 
+// GetGeneration returns the generation of this RangeDescriptor.
+func (r RangeDescriptor) GetGeneration() int64 {
+	if r.Generation != nil {
+		return *r.Generation
+	}
+	return 0
+}
+
+// IncrementGeneration increments the generation of this RangeDescriptor.
+func (r *RangeDescriptor) IncrementGeneration() {
+	// Create a new *int64 for the new generation. We permit shallow copies of
+	// RangeDescriptors, so we need to be careful not to mutate the
+	// potentially-shared generation counter.
+	r.Generation = proto.Int64(r.GetGeneration() + 1)
+}
+
 // Validate performs some basic validation of the contents of a range descriptor.
 func (r RangeDescriptor) Validate() error {
 	if r.NextReplicaID == 0 {
@@ -217,7 +199,7 @@ func (r RangeDescriptor) String() string {
 	} else {
 		buf.WriteString("<no replicas>")
 	}
-	fmt.Fprintf(&buf, ", next=%d]", r.NextReplicaID)
+	fmt.Fprintf(&buf, ", next=%d, gen=%d]", r.NextReplicaID, r.GetGeneration())
 
 	return buf.String()
 }
@@ -290,11 +272,11 @@ func (p Percentiles) String() string {
 // String returns a string representation of the StoreCapacity.
 func (sc StoreCapacity) String() string {
 	return fmt.Sprintf("disk (capacity=%s, available=%s, used=%s, logicalBytes=%s), "+
-		"ranges=%d, leases=%d, writes=%.2f, "+
+		"ranges=%d, leases=%d, queries=%.2f, writes=%.2f, "+
 		"bytesPerReplica={%s}, writesPerReplica={%s}",
 		humanizeutil.IBytes(sc.Capacity), humanizeutil.IBytes(sc.Available),
 		humanizeutil.IBytes(sc.Used), humanizeutil.IBytes(sc.LogicalBytes),
-		sc.RangeCount, sc.LeaseCount, sc.WritesPerSecond,
+		sc.RangeCount, sc.LeaseCount, sc.QueriesPerSecond, sc.WritesPerSecond,
 		sc.BytesPerReplica, sc.WritesPerReplica)
 }
 

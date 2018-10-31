@@ -57,6 +57,12 @@ type SimpleIterator interface {
 	UnsafeValue() []byte
 }
 
+// IteratorStats is returned from (Iterator).Stats.
+type IteratorStats struct {
+	InternalDeleteSkippedCount int
+	TimeBoundNumSSTs           int
+}
+
 // Iterator is an interface for iterating over key/value pairs in an
 // engine. Iterator implementations are thread safe unless otherwise
 // noted.
@@ -92,12 +98,9 @@ type Iterator interface {
 	ComputeStats(start, end MVCCKey, nowNanos int64) (enginepb.MVCCStats, error)
 	// FindSplitKey finds a key from the given span such that the left side of
 	// the split is roughly targetSize bytes. The returned key will never be
-	// chosen from the key ranges listed in keys.NoSplitSpans if
-	// allowMeta2Splits is true and keys.NoSplitSpansWithoutMeta2Splits if
-	// allowMeta2Splits is false.
-	//
-	// TODO(nvanbenschoten): remove allowMeta2Splits in version 2.1.
-	FindSplitKey(start, end, minSplitKey MVCCKey, targetSize int64, allowMeta2Splits bool) (MVCCKey, error)
+	// chosen from the key ranges listed in keys.NoSplitSpans and will always
+	// sort equal to or after minSplitKey.
+	FindSplitKey(start, end, minSplitKey MVCCKey, targetSize int64) (MVCCKey, error)
 	// MVCCGet retrieves the value for the key at the specified timestamp. The
 	// value is returned in batch repr format with the key being present as the
 	// empty string. If an intent exists at the specified key, it will be
@@ -116,6 +119,40 @@ type Iterator interface {
 	MVCCScan(start, end roachpb.Key, max int64, timestamp hlc.Timestamp,
 		txn *roachpb.Transaction, consistent, reverse, tombstone bool,
 	) (kvs []byte, numKvs int64, intents []byte, err error)
+	// SetUpperBound installs a new upper bound for this iterator.
+	SetUpperBound(roachpb.Key)
+
+	Stats() IteratorStats
+}
+
+// IterOptions contains options used to create an Iterator.
+//
+// For performance, every Iterator must specify either Prefix or UpperBound.
+type IterOptions struct {
+	// If Prefix is true, Seek will use the user-key prefix of
+	// the supplied MVCC key to restrict which sstables are searched,
+	// but iteration (using Next) over keys without the same user-key
+	// prefix will not work correctly (keys may be skipped).
+	Prefix bool
+	// UpperBound gives this iterator an upper bound. Attempts to Seek or Next
+	// past this point will invalidate the iterator. UpperBound must be provided
+	// unless Prefix is true, in which case the end of the prefix will be used as
+	// the upper bound.
+	UpperBound roachpb.Key
+	// If WithStats is true, the iterator accumulates RocksDB performance
+	// counters over its lifetime which can be queried via `Stats()`.
+	WithStats bool
+	// MinTimestampHint and MaxTimestampHint, if set, indicate that keys outside
+	// of the time range formed by [MinTimestampHint, MaxTimestampHint] do not
+	// need to be presented by the iterator. The underlying iterator may be able
+	// to efficiently skip over keys outside of the hinted time range, e.g., when
+	// an SST indicates that it contains no keys within the time range.
+	//
+	// Note that time bound hints are strictly a performance optimization, and
+	// iterators with time bounds hints will frequently return keys outside of the
+	// [start, end] time range. If you must guarantee that you never see a key
+	// outside of the time bounds, perform your own filtering.
+	MinTimestampHint, MaxTimestampHint hlc.Timestamp
 }
 
 // Reader is the read interface to an engine's data.
@@ -131,34 +168,26 @@ type Reader interface {
 	// engine; exported to enable wrappers to exist in other packages.
 	Closed() bool
 	// Get returns the value for the given key, nil otherwise.
+	//
+	// Deprecated: use MVCCGet instead.
 	Get(key MVCCKey) ([]byte, error)
 	// GetProto fetches the value at the specified key and unmarshals it
 	// using a protobuf decoder. Returns true on success or false if the
 	// key was not found. On success, returns the length in bytes of the
 	// key and the value.
-	GetProto(key MVCCKey, msg protoutil.Message) (ok bool, keyBytes, valBytes int64, err error)
-	// Iterate scans from start to end keys, visiting at most max
-	// key/value pairs. On each key value pair, the function f is
-	// invoked. If f returns an error or if the scan itself encounters
-	// an error, the iteration will stop and return the error.
-	// If the first result of f is true, the iteration stops.
-	Iterate(start, end MVCCKey, f func(MVCCKeyValue) (bool, error)) error
-	// NewIterator returns a new instance of an Iterator over this engine. When
-	// prefix is true, Seek will use the user-key prefix of the supplied MVCC key
-	// to restrict which sstables are searched, but iteration (using Next) over
-	// keys without the same user-key prefix will not work correctly (keys may be
-	// skipped). The caller must invoke Iterator.Close() when finished with the
-	// iterator to free resources.
-	NewIterator(prefix bool) Iterator
-	// NewTimeBoundIterator is like NewIterator, but the underlying iterator will
-	// efficiently skip over SSTs that contain no MVCC keys in the time range
-	// [start, end].
 	//
-	// Note that time-bound iterators are strictly a performance optimization, and
-	// will frequently return keys outside of the [start, end] time range. If you
-	// must guarantee that you never see a key outside of the time bounds, perform
-	// your own filtering.
-	NewTimeBoundIterator(start, end hlc.Timestamp) Iterator
+	// Deprecated: use Iterator.ValueProto instead.
+	GetProto(key MVCCKey, msg protoutil.Message) (ok bool, keyBytes, valBytes int64, err error)
+	// Iterate scans from the start key to the end key (exclusive), invoking the
+	// function f on each key value pair. If f returns an error or if the scan
+	// itself encounters an error, the iteration will stop and return the error.
+	// If the first result of f is true, the iteration stops and returns a nil
+	// error.
+	Iterate(start, end MVCCKey, f func(MVCCKeyValue) (stop bool, err error)) error
+	// NewIterator returns a new instance of an Iterator over this
+	// engine. The caller must invoke Iterator.Close() when finished
+	// with the iterator to free resources.
+	NewIterator(opts IterOptions) Iterator
 }
 
 // Writer is the write interface to an engine's data.
@@ -204,6 +233,10 @@ type Writer interface {
 	// sstables). Currently only used for performance testing of appending to the
 	// RocksDB WAL.
 	LogData(data []byte) error
+	// LogLogicalOp logs the specified logical mvcc operation with the provided
+	// details to the writer, if it has logical op logging enabled. For most
+	// Writer implementations, this is a no-op.
+	LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails)
 }
 
 // ReadWriter is the read/write interface to an engine's data.
@@ -253,12 +286,12 @@ type Engine interface {
 	// by invoking Close(). Note that snapshots must not be used after the
 	// original engine has been stopped.
 	NewSnapshot() Reader
-	// IngestExternalFile links a file into the RocksDB log-structured merge-tree.
-	// Removes the passed path on success if `move` is true. May modify the file
-	// (including the underlying file in the case of hard-links) if
-	// allowFileModification is passed as well. See additional comments in db.cc's
-	// IngestExternalFile explaining modification behavior.
-	IngestExternalFile(ctx context.Context, path string, move, allowFileModification bool) error
+	// IngestExternalFiles atomically links a slice of files into the RocksDB
+	// log-structured merge-tree. May modify the files (including the underlying
+	// file in the case of hard-links) if allowFileModifications is passed as
+	// well. See additional comments in db.cc's IngestExternalFile explaining
+	// modification behavior.
+	IngestExternalFiles(ctx context.Context, paths []string, allowFileModifications bool) error
 	// ApproximateDiskBytes returns an approximation of the on-disk size for the given key span.
 	ApproximateDiskBytes(from, to roachpb.Key) (uint64, error)
 	// CompactRange ensures that the specified range of key value pairs is
@@ -266,6 +299,21 @@ type Engine interface {
 	// that the key range is compacted all the way to the bottommost level of
 	// SSTables, which is necessary to pick up changes to bloom filters.
 	CompactRange(start, end roachpb.Key, forceBottommost bool) error
+	// OpenFile opens a DBFile with the given filename.
+	OpenFile(filename string) (DBFile, error)
+	// ReadFile reads the content from the file with the given filename int this RocksDB's env.
+	ReadFile(filename string) ([]byte, error)
+	// DeleteFile deletes the file with the given filename from this RocksDB's env.
+	// If the file with given filename doesn't exist, return os.ErrNotExist.
+	DeleteFile(filename string) error
+	// DeleteDirAndFiles deletes the directory and any files it contains but
+	// not subdirectories from this RocksDB's env. If dir does not exist,
+	// DeleteDirAndFiles returns nil (no error).
+	DeleteDirAndFiles(dir string) error
+	// LinkFile creates 'newname' as a hard link to 'oldname'. This is done using
+	// the engine implementation. For RocksDB, this means using the Env responsible for the file
+	// which may handle extra logic (eg: copy encryption settings for EncryptedEnv).
+	LinkFile(oldname, newname string) error
 }
 
 // WithSSTables extends the Engine interface with a method to get info
@@ -292,6 +340,8 @@ type Batch interface {
 	// situations where we know all of the batched operations are for distinct
 	// keys.
 	Distinct() ReadWriter
+	// Empty returns whether the batch is empty or not.
+	Empty() bool
 	// Repr returns the underlying representation of the batch and can be used to
 	// reconstitute the batch on a remote node using Writer.ApplyBatchRepr().
 	Repr() []byte
@@ -321,9 +371,36 @@ type Stats struct {
 	PendingCompactionBytesEstimate int64
 }
 
+// EnvStats is a set of RocksDB env stats, including encryption status.
+type EnvStats struct {
+	// TotalFiles is the total number of files reported by rocksdb.
+	TotalFiles uint64
+	// TotalBytes is the total size of files reported by rocksdb.
+	TotalBytes uint64
+	// ActiveKeyFiles is the number of files using the active data key.
+	ActiveKeyFiles uint64
+	// ActiveKeyBytes is the size of files using the active data key.
+	ActiveKeyBytes uint64
+	// EncryptionStatus is a serialized enginepbccl/stats.proto::EncryptionStatus protobuf.
+	EncryptionStatus []byte
+}
+
+// EncryptionRegistries contains the encryption-related registries:
+// Both are serialized protobufs.
+type EncryptionRegistries struct {
+	// FileRegistry is the list of files with encryption status.
+	// serialized storage/engine/enginepb/file_registry.proto::FileRegistry
+	FileRegistry []byte
+	// KeyRegistry is the list of keys, scrubbed of actual key data.
+	// serialized ccl/storageccl/engineccl/enginepbccl/key_registry.proto::DataKeysRegistry
+	KeyRegistry []byte
+}
+
 // PutProto sets the given key to the protobuf-serialized byte string
 // of msg and the provided timestamp. Returns the length in bytes of
 // key and the value.
+//
+// Deprecated: use MVCCPutProto instead.
 func PutProto(
 	engine Writer, key MVCCKey, msg protoutil.Message,
 ) (keyBytes, valBytes int64, err error) {

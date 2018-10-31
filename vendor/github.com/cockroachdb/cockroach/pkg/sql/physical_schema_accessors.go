@@ -137,7 +137,7 @@ func (a UncachedPhysicalAccessor) GetObjectDesc(
 		// We have a descriptor. Is it in the right state?
 		if err := filterTableState(desc); err != nil {
 			// No: let's see the flag.
-			if flags.allowAdding && err == errTableAdding {
+			if err == errTableAdding {
 				// We'll keep that despite the ADD state.
 				return desc, dbDesc, nil
 			}
@@ -195,13 +195,5 @@ func (a *CachedPhysicalAccessor) GetDatabaseDesc(
 func (a *CachedPhysicalAccessor) GetObjectDesc(
 	name *ObjectName, flags ObjectLookupFlags,
 ) (*ObjectDescriptor, *DatabaseDescriptor, error) {
-	// Can we use the table cache?
-	// - avoidCached -> the caller said no.
-	// - allowAdding -> no, the table cache only wants to handle public descriptors.
-	if !flags.avoidCached && !flags.allowAdding {
-		return a.tc.getTableVersion(flags.ctx, name, flags)
-	}
-
-	// Default path.
-	return a.SchemaAccessor.GetObjectDesc(name, flags)
+	return a.tc.getTableVersion(flags.ctx, name, flags)
 }

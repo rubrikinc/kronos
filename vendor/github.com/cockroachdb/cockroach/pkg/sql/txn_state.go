@@ -16,7 +16,6 @@ package sql
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	opentracing "github.com/opentracing/opentracing-go"
@@ -43,7 +42,7 @@ import (
 // notably the KV client.Txn.  All mutations to txnState are performed through
 // calling fsm.Machine.Apply(event); see conn_fsm.go for the definition of the
 // state machine.
-type txnState2 struct {
+type txnState struct {
 	// Mutable fields accessed from goroutines not synchronized by this txn's
 	// session, such as when a SHOW SESSIONS statement is executed on another
 	// session.
@@ -133,14 +132,17 @@ const (
 // isolation: The transaction's isolation level.
 // priority: The transaction's priority.
 // readOnly: The read-only character of the new txn.
+// txn: If not nil, this txn will be used instead of creating a new txn. If so,
+//      all the other arguments need to correspond to the attributes of this txn.
 // tranCtx: A bag of extra execution context.
-func (ts *txnState2) resetForNewSQLTxn(
+func (ts *txnState) resetForNewSQLTxn(
 	connCtx context.Context,
 	txnType txnType,
 	sqlTimestamp time.Time,
 	isolation enginepb.IsolationType,
 	priority roachpb.UserPriority,
 	readOnly tree.ReadWriteMode,
+	txn *client.Txn,
 	tranCtx transitionCtx,
 ) {
 	// Reset state vars to defaults.
@@ -159,10 +161,13 @@ func (ts *txnState2) resetForNewSQLTxn(
 	if parentSp := opentracing.SpanFromContext(connCtx); parentSp != nil {
 		// Create a child span for this SQL txn.
 		sp = parentSp.Tracer().StartSpan(
-			opName, opentracing.ChildOf(parentSp.Context()), tracing.Recordable)
+			opName,
+			opentracing.ChildOf(parentSp.Context()), tracing.Recordable,
+			tracing.LogTagsFromCtx(connCtx),
+		)
 	} else {
 		// Create a root span for this SQL txn.
-		sp = tranCtx.tracer.StartSpan(opName, tracing.Recordable)
+		sp = tranCtx.tracer.StartSpan(opName, tracing.Recordable, tracing.LogTagsFromCtx(connCtx))
 	}
 
 	if txnType == implicitTxn {
@@ -190,8 +195,12 @@ func (ts *txnState2) resetForNewSQLTxn(
 	ts.mon.Start(ts.Ctx, tranCtx.connMon, mon.BoundAccount{} /* reserved */)
 
 	ts.mu.Lock()
-	ts.mu.txn = client.NewTxn(tranCtx.db, tranCtx.nodeID, client.RootTxn)
-	ts.mu.txn.SetDebugName(opName)
+	if txn == nil {
+		ts.mu.txn = client.NewTxn(ts.Ctx, tranCtx.db, tranCtx.nodeID, client.RootTxn)
+		ts.mu.txn.SetDebugName(opName)
+	} else {
+		ts.mu.txn = txn
+	}
 	ts.mu.Unlock()
 
 	if err := ts.mu.txn.SetIsolation(isolation); err != nil {
@@ -214,10 +223,7 @@ func (ts *txnState2) resetForNewSQLTxn(
 // finishSQLTxn finalizes a transaction's results and closes the root span for
 // the current SQL txn. This needs to be called before resetForNewSQLTxn() is
 // called for starting another SQL txn.
-//
-// ctx is the connExecutor's context. This will be used once ts.Ctx is
-// finalized.
-func (ts *txnState2) finishSQLTxn(connCtx context.Context) {
+func (ts *txnState) finishSQLTxn() {
 	ts.mon.Stop(ts.Ctx)
 	if ts.cancel != nil {
 		ts.cancel()
@@ -225,11 +231,6 @@ func (ts *txnState2) finishSQLTxn(connCtx context.Context) {
 	}
 	if ts.sp == nil {
 		panic("No span in context? Was resetForNewSQLTxn() called previously?")
-	}
-
-	if !ts.mu.txn.IsFinalized() {
-		panic(fmt.Sprintf(
-			"attempting to finishSQLTxn(), but KV txn is not finalized: %+v", ts.mu.txn))
 	}
 
 	if ts.recordingThreshold > 0 {
@@ -253,7 +254,29 @@ func (ts *txnState2) finishSQLTxn(connCtx context.Context) {
 	ts.recordingThreshold = 0
 }
 
-func (ts *txnState2) setIsolationLevel(isolation enginepb.IsolationType) error {
+// finishExternalTxn is a stripped-down version of finishSQLTxn used by
+// connExecutors that run within a higher-level transaction (through the
+// InternalExecutor). These guys don't want to mess with the transaction per-se,
+// but still want to clean up other stuff.
+func (ts *txnState) finishExternalTxn() {
+	if ts.Ctx == nil {
+		ts.mon.Stop(ts.connCtx)
+	} else {
+		ts.mon.Stop(ts.Ctx)
+	}
+	if ts.cancel != nil {
+		ts.cancel()
+		ts.cancel = nil
+	}
+	if ts.sp != nil {
+		ts.sp.Finish()
+	}
+	ts.sp = nil
+	ts.Ctx = nil
+	ts.mu.txn = nil
+}
+
+func (ts *txnState) setIsolationLevel(isolation enginepb.IsolationType) error {
 	if err := ts.mu.txn.SetIsolation(isolation); err != nil {
 		return err
 	}
@@ -261,7 +284,7 @@ func (ts *txnState2) setIsolationLevel(isolation enginepb.IsolationType) error {
 	return nil
 }
 
-func (ts *txnState2) setPriority(userPriority roachpb.UserPriority) error {
+func (ts *txnState) setPriority(userPriority roachpb.UserPriority) error {
 	if err := ts.mu.txn.SetUserPriority(userPriority); err != nil {
 		return err
 	}
@@ -269,7 +292,7 @@ func (ts *txnState2) setPriority(userPriority roachpb.UserPriority) error {
 	return nil
 }
 
-func (ts *txnState2) setReadOnlyMode(mode tree.ReadWriteMode) error {
+func (ts *txnState) setReadOnlyMode(mode tree.ReadWriteMode) error {
 	switch mode {
 	case tree.UnspecifiedReadWriteMode:
 		return nil
@@ -382,7 +405,7 @@ var noRewind = rewindCapability{}
 // setAdvanceInfo sets the adv field. This has to be called as part of any state
 // transition. The connExecutor is supposed to inspect adv after any transition
 // and act on it.
-func (ts *txnState2) setAdvanceInfo(code advanceCode, rewCap rewindCapability, ev txnEvent) {
+func (ts *txnState) setAdvanceInfo(code advanceCode, rewCap rewindCapability, ev txnEvent) {
 	if ts.adv.code != advanceUnknown {
 		panic("previous advanceInfo has not been consume()d")
 	}
@@ -398,7 +421,7 @@ func (ts *txnState2) setAdvanceInfo(code advanceCode, rewCap rewindCapability, e
 
 // consumerAdvanceInfo returns the advanceInfo set by the last transition and
 // resets the state so that another transition can overwrite it.
-func (ts *txnState2) consumeAdvanceInfo() advanceInfo {
+func (ts *txnState) consumeAdvanceInfo() advanceInfo {
 	adv := ts.adv
 	ts.adv = advanceInfo{}
 	return adv

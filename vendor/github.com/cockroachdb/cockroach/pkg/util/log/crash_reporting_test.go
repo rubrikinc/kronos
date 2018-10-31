@@ -17,33 +17,35 @@ package log
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"runtime"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
 
-var errSentinel = struct{ error }{} // explodes if Error() called
-var errFundamental = errors.Errorf("%s", "not recoverable :(")
-var errWrapped1 = errors.Wrap(errFundamental, "not recoverable :(")
-var errWrapped2 = errors.Wrapf(errWrapped1, "not recoverable :(")
-var errWrapped3 = errors.Wrap(errWrapped2, "not recoverable :(")
-var errWrappedSentinel = errors.Wrap(errors.Wrapf(errSentinel, "unseen"), "unsung")
+type safeErrorTestCase struct {
+	format string
+	rs     []interface{}
+	expErr string
+}
 
-func TestCrashReportingSafeError(t *testing.T) {
-	type testCase struct {
-		format string
-		rs     []interface{}
-		expErr string
-	}
+// Exposed globally so it can be injected with platform-specific tests.
+var safeErrorTestCases = func() []safeErrorTestCase {
+	var errSentinel = struct{ error }{} // explodes if Error() called
+	var errFundamental = errors.Errorf("%s", "not recoverable :(")
+	var errWrapped1 = errors.Wrap(errFundamental, "not recoverable :(")
+	var errWrapped2 = errors.Wrapf(errWrapped1, "not recoverable :(")
+	var errWrapped3 = errors.Wrap(errWrapped2, "not recoverable :(")
+	var errWrappedSentinel = errors.Wrap(errors.Wrapf(errSentinel, "unseen"), "unsung")
 
-	runtimeErr := &runtime.TypeAssertionError{}
+	runtimeErr := makeTypeAssertionErr()
 
-	testCases := []testCase{
+	return []safeErrorTestCase{
 		{
 			// Intended result of panic(context.DeadlineExceeded). Note that this is a known sentinel
 			// error but a safeError is returned.
@@ -53,22 +55,22 @@ func TestCrashReportingSafeError(t *testing.T) {
 		{
 			// Intended result of panic(runtimeErr) which exhibits special case of known safe error.
 			format: "", rs: []interface{}{runtimeErr},
-			expErr: "?:0: *runtime.TypeAssertionError: interface conversion: interface is nil, not ",
+			expErr: "?:0: *runtime.TypeAssertionError: interface conversion: interface {} is nil, not int",
 		},
 		{
 			// Same as last, but skipping through to the cause: panic(errors.Wrap(safeErr, "gibberish")).
 			format: "", rs: []interface{}{errors.Wrap(runtimeErr, "unseen")},
-			expErr: "?:0: crash_reporting_test.go:60: caused by *errors.withMessage: caused by *runtime.TypeAssertionError: interface conversion: interface is nil, not ",
+			expErr: "?:0: crash_reporting_test.go:62: caused by *errors.withMessage: caused by *runtime.TypeAssertionError: interface conversion: interface {} is nil, not int",
 		},
 		{
 			// Special-casing switched off when format string present.
 			format: "%s", rs: []interface{}{runtimeErr},
-			expErr: "?:0: %s | *runtime.TypeAssertionError: interface conversion: interface is nil, not ",
+			expErr: "?:0: %s | *runtime.TypeAssertionError: interface conversion: interface {} is nil, not int",
 		},
 		{
 			// Special-casing switched off when more than one reportable present.
 			format: "", rs: []interface{}{runtimeErr, "foo"},
-			expErr: "?:0: *runtime.TypeAssertionError: interface conversion: interface is nil, not ; string",
+			expErr: "?:0: *runtime.TypeAssertionError: interface conversion: interface {} is nil, not int; string",
 		},
 		{
 			format: "I like %s and %q and my pin code is %d", rs: []interface{}{Safe("A"), &SafeType{V: "B"}, 1234},
@@ -78,11 +80,7 @@ func TestCrashReportingSafeError(t *testing.T) {
 			format: "outer %+v", rs: []interface{}{
 				errors.Wrapf(context.Canceled, "this will unfortunately be lost: %d", Safe(6)),
 			},
-			expErr: "?:0: outer %+v | crash_reporting_test.go:79: caused by *errors.withMessage: caused by *errors.errorString: context canceled",
-		},
-		{
-			format: "", rs: []interface{}{os.NewSyscallError("write", syscall.ENOSPC)},
-			expErr: "?:0: *os.SyscallError: write: syscall.Errno: no space left on device",
+			expErr: "?:0: outer %+v | crash_reporting_test.go:81: caused by *errors.withMessage: caused by *errors.errorString: context canceled",
 		},
 		{
 			// Verify that the special case still scrubs inside of the error.
@@ -93,15 +91,21 @@ func TestCrashReportingSafeError(t *testing.T) {
 			// Verify that unknown sentinel errors print at least their type (regression test).
 			// Also, that its Error() is never called (since it would panic).
 			format: "%s", rs: []interface{}{errWrappedSentinel},
-			expErr: "?:0: %s | crash_reporting_test.go:35: caused by *errors.withMessage: caused by crash_reporting_test.go:35: caused by *errors.withMessage: caused by struct { error }",
+			expErr: "?:0: %s | crash_reporting_test.go:44: caused by *errors.withMessage: caused by crash_reporting_test.go:44: caused by *errors.withMessage: caused by struct { error }",
 		},
 		{
 			format: "", rs: []interface{}{errWrapped3},
-			expErr: "?:0: crash_reporting_test.go:34: caused by *errors.withMessage: caused by crash_reporting_test.go:33: caused by *errors.withMessage: caused by crash_reporting_test.go:32: caused by *errors.withMessage: caused by crash_reporting_test.go:31",
+			expErr: "?:0: crash_reporting_test.go:43: caused by *errors.withMessage: caused by crash_reporting_test.go:42: caused by *errors.withMessage: caused by crash_reporting_test.go:41: caused by *errors.withMessage: caused by crash_reporting_test.go:40",
+		},
+		{
+			format: "", rs: []interface{}{&net.OpError{Op: "write", Net: "tcp", Source: &util.UnresolvedAddr{AddressField: "sensitive-source"}, Addr: &util.UnresolvedAddr{AddressField: "sensitive-addr"}, Err: errors.New("not safe")}},
+			expErr: "?:0: *net.OpError: write tcp redacted->redacted: crash_reporting_test.go:101",
 		},
 	}
+}()
 
-	for _, test := range testCases {
+func TestCrashReportingSafeError(t *testing.T) {
+	for _, test := range safeErrorTestCases {
 		t.Run("", func(t *testing.T) {
 			err := ReportablesToSafeError(0, test.format, test.rs)
 			if err == nil {
@@ -178,4 +182,16 @@ func TestWithCause(t *testing.T) {
 	if act != exp {
 		t.Fatalf("wanted %s, got %s", exp, act)
 	}
+}
+
+// makeTypeAssertionErr returns a runtime.Error with the message:
+//     interface conversion: interface {} is nil, not int
+func makeTypeAssertionErr() (result runtime.Error) {
+	defer func() {
+		e := recover()
+		result = e.(runtime.Error)
+	}()
+	var x interface{}
+	_ = x.(int)
+	return nil
 }

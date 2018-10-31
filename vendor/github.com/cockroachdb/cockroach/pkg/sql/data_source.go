@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
@@ -79,7 +78,7 @@ func (p *planner) getVirtualDataSource(
 		return planDataSource{}, err
 	}
 
-	columns, constructor := virtual.getPlanInfo(ctx)
+	columns, constructor := virtual.getPlanInfo()
 
 	// Define the name of the source visible in EXPLAIN(NOEXPAND).
 	sourceName := tree.MakeTableNameWithSchema(
@@ -98,46 +97,13 @@ func (p *planner) getVirtualDataSource(
 	}, nil
 }
 
-// getDataSourceAsOneColumn builds a planDataSource from a data source
-// clause and ensures that it returns one column. If the plan would
-// return zero or more than one column, the columns are grouped into
-// a tuple. This is needed for SRF substitution (e.g. `SELECT
-// pg_get_keywords()`).
-func (p *planner) getDataSourceAsOneColumn(
-	ctx context.Context, src *tree.FuncExpr,
-) (planDataSource, error) {
-	ds, err := p.getDataSource(ctx, src, nil, publicColumns)
-	if err != nil {
-		return ds, err
-	}
-	if len(ds.info.SourceColumns) == 1 {
-		return ds, nil
-	}
-
-	// Zero or more than one column: make a tuple.
-
-	// We use the name of the function to determine the name of the
-	// rendered column.
-	fd, err := src.Func.Resolve(p.SessionData().SearchPath)
-	if err != nil {
-		return planDataSource{}, err
-	}
-	newPlan, err := p.makeTupleRender(ctx, ds, fd.Name)
-	if err != nil {
-		return planDataSource{}, err
-	}
-
-	tn := tree.MakeUnqualifiedTableName(tree.Name(fd.Name))
-	return planDataSource{
-		info: sqlbase.NewSourceInfoForSingleTable(tn, planColumns(newPlan)),
-		plan: newPlan,
-	}, nil
-}
-
 // getDataSource builds a planDataSource from a single data source clause
 // (TableExpr) in a SelectClause.
 func (p *planner) getDataSource(
-	ctx context.Context, src tree.TableExpr, hints *tree.IndexHints, scanVisibility scanVisibility,
+	ctx context.Context,
+	src tree.TableExpr,
+	indexFlags *tree.IndexFlags,
+	scanVisibility scanVisibility,
 ) (planDataSource, error) {
 	switch t := src.(type) {
 	case *tree.NormalizableTableName:
@@ -161,10 +127,10 @@ func (p *planner) getDataSource(
 		}
 
 		colCfg := scanColumnsConfig{visibility: scanVisibility}
-		return p.getPlanForDesc(ctx, desc, tn, hints, colCfg)
+		return p.getPlanForDesc(ctx, desc, tn, indexFlags, colCfg)
 
-	case *tree.FuncExpr:
-		return p.getGeneratorPlan(ctx, t)
+	case *tree.RowsFromExpr:
+		return p.getPlanForRowsFrom(ctx, t.Items...)
 
 	case *tree.Subquery:
 		return p.getSubqueryPlan(ctx, sqlbase.AnonymousTable, t.Select, nil)
@@ -197,19 +163,19 @@ func (p *planner) getDataSource(
 		}, nil
 
 	case *tree.ParenTableExpr:
-		return p.getDataSource(ctx, t.Expr, hints, scanVisibility)
+		return p.getDataSource(ctx, t.Expr, indexFlags, scanVisibility)
 
 	case *tree.TableRef:
-		return p.getTableScanByRef(ctx, t, hints, scanVisibility)
+		return p.getTableScanByRef(ctx, t, indexFlags, scanVisibility)
 
 	case *tree.AliasedTableExpr:
 		// Alias clause: source AS alias(cols...)
 
-		if t.Hints != nil {
-			hints = t.Hints
+		if t.IndexFlags != nil {
+			indexFlags = t.IndexFlags
 		}
 
-		src, err := p.getDataSource(ctx, t.Expr, hints, scanVisibility)
+		src, err := p.getDataSource(ctx, t.Expr, indexFlags, scanVisibility)
 		if err != nil {
 			return src, err
 		}
@@ -229,38 +195,21 @@ func (p *planner) getDataSource(
 	}
 }
 
-// QualifyWithDatabase asserts that the table with the given name
-// exists, and expands its table name with the details about its path.
-func (p *planner) QualifyWithDatabase(
-	ctx context.Context, t *tree.NormalizableTableName,
-) (*tree.TableName, error) {
-	tn, err := t.Normalize()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := ResolveExistingObject(ctx, p, tn, true /*required*/, anyDescType); err != nil {
-		return nil, err
-	}
-	return tn, nil
-}
-
-func (p *planner) getTableDescByID(
-	ctx context.Context, tableID sqlbase.ID,
-) (*sqlbase.TableDescriptor, error) {
-	// TODO(knz): replace this by an API on SchemaAccessor/SchemaResolver.
-	descFunc := p.Tables().getTableVersionByID
-	if p.avoidCachedDescriptors {
-		descFunc = sqlbase.GetTableDescFromID
-	}
-	return descFunc(ctx, p.txn, tableID)
-}
-
 func (p *planner) getTableScanByRef(
-	ctx context.Context, tref *tree.TableRef, hints *tree.IndexHints, scanVisibility scanVisibility,
+	ctx context.Context,
+	tref *tree.TableRef,
+	indexFlags *tree.IndexFlags,
+	scanVisibility scanVisibility,
 ) (planDataSource, error) {
-	desc, err := p.getTableDescByID(ctx, sqlbase.ID(tref.TableID))
+	flags := ObjectLookupFlags{CommonLookupFlags{txn: p.txn, avoidCached: p.avoidCachedDescriptors}}
+	desc, err := p.Tables().getTableVersionByID(ctx, sqlbase.ID(tref.TableID), flags)
 	if err != nil {
 		return planDataSource{}, errors.Wrapf(err, "%s", tree.ErrString(tref))
+	}
+
+	if tref.Columns != nil && len(tref.Columns) == 0 {
+		return planDataSource{}, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+			"an explicit list of column IDs must include at least one column")
 	}
 
 	// Ideally, we'd like to populate DatabaseName here, however that
@@ -278,7 +227,7 @@ func (p *planner) getTableScanByRef(
 		addUnwantedAsHidden: true,
 		visibility:          scanVisibility,
 	}
-	src, err := p.getPlanForDesc(ctx, desc, &tn, hints, colCfg)
+	src, err := p.getPlanForDesc(ctx, desc, &tn, indexFlags, colCfg)
 	if err != nil {
 		return src, err
 	}
@@ -302,8 +251,13 @@ func renameSource(
 		isAnonymousTable := (len(src.info.SourceAliases) == 0 ||
 			(len(src.info.SourceAliases) == 1 && src.info.SourceAliases[0].Name == sqlbase.AnonymousTable))
 		noColNameSpecified := len(colAlias) == 0
-		if vg, ok := src.plan.(*valueGenerator); ok && isAnonymousTable && noColNameSpecified {
-			if tType, ok := vg.expr.ResolvedType().(types.TTable); ok && len(tType.Cols) == 1 {
+
+		// A SRF uses projectSetNode.
+		if vg, ok := src.plan.(*projectSetNode); ok &&
+			isAnonymousTable && noColNameSpecified && len(vg.funcs) == 1 {
+			// And we only pluck the name if the projection is done over the
+			// unary table, and there is just one column in the result.
+			if _, ok := vg.source.(*unaryNode); ok && vg.numColsPerGen[0] == 1 {
 				colAlias = tree.NameList{as.Alias}
 			}
 		}
@@ -324,7 +278,8 @@ func renameSource(
 		for colIdx, aliasIdx := 0, 0; aliasIdx < len(colAlias); colIdx++ {
 			if colIdx >= len(src.info.SourceColumns) {
 				srcName := tree.ErrString(&tableAlias)
-				return planDataSource{}, errors.Errorf(
+				return planDataSource{}, pgerror.NewErrorf(
+					pgerror.CodeInvalidColumnReferenceError,
 					"source %q has %d columns available but %d columns specified",
 					srcName, aliasIdx, len(colAlias))
 			}
@@ -342,7 +297,7 @@ func (p *planner) getPlanForDesc(
 	ctx context.Context,
 	desc *sqlbase.TableDescriptor,
 	tn *tree.TableName,
-	hints *tree.IndexHints,
+	indexFlags *tree.IndexFlags,
 	colCfg scanColumnsConfig,
 ) (planDataSource, error) {
 	if desc.IsView() {
@@ -362,7 +317,7 @@ func (p *planner) getPlanForDesc(
 
 	// This name designates a real table.
 	scan := p.Scan()
-	if err := scan.initTable(ctx, p, desc, hints, colCfg); err != nil {
+	if err := scan.initTable(ctx, p, desc, indexFlags, colCfg); err != nil {
 		return planDataSource{}, err
 	}
 
@@ -447,15 +402,13 @@ func (p *planner) getSubqueryPlan(
 	}, nil
 }
 
-func (p *planner) getGeneratorPlan(ctx context.Context, t *tree.FuncExpr) (planDataSource, error) {
-	plan, err := p.makeGenerator(ctx, t)
-	if err != nil {
-		return planDataSource{}, err
-	}
-	return planDataSource{
-		info: sqlbase.NewSourceInfoForSingleTable(sqlbase.AnonymousTable, planColumns(plan)),
-		plan: plan,
-	}, nil
+// getPlanForRowsFrom builds the plan for a ROWS FROM(...) expression.
+func (p *planner) getPlanForRowsFrom(
+	ctx context.Context, exprs ...tree.Expr,
+) (planDataSource, error) {
+	srcPlan := &unaryNode{}
+	srcInfo := sqlbase.NewSourceInfoForSingleTable(sqlbase.AnonymousTable, nil)
+	return p.ProjectSet(ctx, srcPlan, srcInfo, "ROWS FROM", nil, exprs...)
 }
 
 func (p *planner) getSequenceSource(
@@ -475,52 +428,6 @@ func (p *planner) getSequenceSource(
 	}, nil
 }
 
-// expandStar returns the array of column metadata and name
-// expressions that correspond to the expansion of a star.
-func expandStar(
-	ctx context.Context,
-	src sqlbase.MultiSourceInfo,
-	v tree.VarName,
-	ivarHelper tree.IndexedVarHelper,
-) (columns sqlbase.ResultColumns, exprs []tree.TypedExpr, err error) {
-	if len(src) == 0 || len(src[0].SourceColumns) == 0 {
-		return nil, nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError,
-			"cannot use %q without a FROM clause", tree.ErrString(v))
-	}
-
-	colSel := func(src *sqlbase.DataSourceInfo, idx int) {
-		col := src.SourceColumns[idx]
-		if !col.Hidden {
-			ivar := ivarHelper.IndexedVar(idx + src.ColOffset)
-			columns = append(columns, sqlbase.ResultColumn{Name: col.Name, Typ: ivar.ResolvedType()})
-			exprs = append(exprs, ivar)
-		}
-	}
-
-	switch sel := v.(type) {
-	case tree.UnqualifiedStar:
-		// Simple case: a straight '*'. Take all columns.
-		for _, ds := range src {
-			for i := 0; i < len(ds.SourceColumns); i++ {
-				colSel(ds, i)
-			}
-		}
-	case *tree.AllColumnsSelector:
-		resolver := sqlbase.ColumnResolver{Sources: src}
-		_, _, err := sel.Resolve(ctx, &resolver)
-		if err != nil {
-			return nil, nil, err
-		}
-		ds := src[resolver.ResolverState.SrcIdx]
-		colSet := ds.SourceAliases[resolver.ResolverState.ColSetIdx].ColumnSet
-		for i, ok := colSet.Next(0); ok; i, ok = colSet.Next(i + 1) {
-			colSel(ds, i)
-		}
-	}
-
-	return columns, exprs, nil
-}
-
 // getAliasedTableName returns the underlying table name for a TableExpr that
 // could be either an alias or a normal table name. It also returns the original
 // table name, which will be equal to the alias name if the input is an alias,
@@ -535,11 +442,16 @@ func (p *planner) getAliasedTableName(n tree.TableExpr) (*tree.TableName, *tree.
 		n = ate.Expr
 		// It's okay to ignore the As columns here, as they're not permitted in
 		// DML aliases where this function is used.
-		alias = tree.NewUnqualifiedTableName(ate.As.Alias)
+		if ate.As.Alias != "" {
+			alias = tree.NewUnqualifiedTableName(ate.As.Alias)
+		}
 	}
 	table, ok := n.(*tree.NormalizableTableName)
 	if !ok {
-		return nil, nil, errors.Errorf("TODO(pmattis): unsupported FROM: %s", n)
+		return nil, nil, pgerror.Unimplemented(
+			"complex table expression in UPDATE/DELETE",
+			"cannot use a complex table name with DELETE/UPDATE", n,
+		)
 	}
 	tn, err := table.Normalize()
 	if err != nil {

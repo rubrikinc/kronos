@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -32,6 +33,8 @@ var consistencyCheckInterval = settings.RegisterNonNegativeDurationSetting(
 	"the time between range consistency checks; set to 0 to disable consistency checking",
 	24*time.Hour,
 )
+
+var testingAggressiveConsistencyChecks = envutil.EnvOrDefaultBool("COCKROACH_CONSISTENCY_AGGRESSIVE", false)
 
 type consistencyQueue struct {
 	*baseQueue
@@ -48,7 +51,7 @@ func newConsistencyQueue(store *Store, gossip *gossip.Gossip) *consistencyQueue 
 		replicaCountFn: store.ReplicaCount,
 	}
 	q.baseQueue = newBaseQueue(
-		"replica consistency checker", q, store, gossip,
+		"consistencyChecker", q, store, gossip,
 		queueConfig{
 			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
@@ -144,6 +147,6 @@ func (q *consistencyQueue) timer(duration time.Duration) time.Duration {
 }
 
 // purgatoryChan returns nil.
-func (*consistencyQueue) purgatoryChan() <-chan struct{} {
+func (*consistencyQueue) purgatoryChan() <-chan time.Time {
 	return nil
 }

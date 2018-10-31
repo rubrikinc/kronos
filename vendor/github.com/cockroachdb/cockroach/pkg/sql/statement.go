@@ -17,7 +17,6 @@ package sql
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 )
 
 // Statement contains a statement with optional expected result columns and metadata.
@@ -25,33 +24,21 @@ type Statement struct {
 	AST           tree.Statement
 	ExpectedTypes sqlbase.ResultColumns
 	AnonymizedStr string
-	queryID       uint128.Uint128
+	queryID       ClusterWideID
+
+	// Prepared is non-nil during the PREPARE phase, as well as during EXECUTE of
+	// a previously prepared statement. The Prepared statement can be modified
+	// during either phase; the PREPARE phase sets its initial state, and the
+	// EXECUTE phase can re-prepare it. This happens when the original plan has
+	// been invalidated by schema changes, session data changes, permission
+	// changes, or other changes to the context in which the original plan was
+	// prepared.
+	//
+	// Given that the PreparedStatement can be modified during planning, it is
+	// not safe for use on multiple threads.
+	Prepared *PreparedStatement
 }
 
 func (s Statement) String() string {
 	return s.AST.String()
-}
-
-// StatementList is a list of statements.
-type StatementList []Statement
-
-// NewStatementList creates a StatementList from a tree.StatementList.
-func NewStatementList(stmts tree.StatementList) StatementList {
-	sl := make(StatementList, len(stmts))
-	for i, s := range stmts {
-		sl[i] = Statement{AST: s}
-	}
-	return sl
-}
-
-func (l *StatementList) String() string { return tree.AsString(l) }
-
-// Format implements the NodeFormatter interface.
-func (l *StatementList) Format(ctx *tree.FmtCtx) {
-	for i := range *l {
-		if i > 0 {
-			ctx.WriteString("; ")
-		}
-		ctx.FormatNode((*l)[i].AST)
-	}
 }

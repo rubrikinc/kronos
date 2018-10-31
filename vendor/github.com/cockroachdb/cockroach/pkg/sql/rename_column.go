@@ -19,13 +19,18 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
 )
 
-var errEmptyColumnName = errors.New("empty column name")
+var errEmptyColumnName = pgerror.NewError(pgerror.CodeSyntaxError, "empty column name")
+
+type renameColumnNode struct {
+	n         *tree.RenameColumn
+	tableDesc *sqlbase.TableDescriptor
+}
 
 // RenameColumn renames the column.
 // Privileges: CREATE on table.
@@ -37,12 +42,8 @@ func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planN
 	if err != nil {
 		return nil, err
 	}
-	var tableDesc *TableDescriptor
-	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
-	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
-		tableDesc, err = ResolveExistingObject(ctx, p, tn, !n.IfExists, requireTableDesc)
-	})
+
+	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, tn, !n.IfExists, requireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -54,14 +55,22 @@ func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planN
 		return nil, err
 	}
 
-	if n.NewName == "" {
-		return nil, errEmptyColumnName
+	return &renameColumnNode{n: n, tableDesc: tableDesc}, nil
+}
+
+func (n *renameColumnNode) startExec(params runParams) error {
+	p := params.p
+	ctx := params.ctx
+	tableDesc := n.tableDesc
+
+	if n.n.NewName == "" {
+		return errEmptyColumnName
 	}
 
-	col, _, err := tableDesc.FindColumnByName(n.Name)
-	// n.IfExists only applies to table, no need to check here.
+	col, _, err := tableDesc.FindColumnByName(n.n.Name)
+	// n.n.IfExists only applies to table, no need to check here.
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	for _, tableRef := range tableDesc.DependedOnBy {
@@ -72,18 +81,18 @@ func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planN
 			}
 		}
 		if found {
-			return nil, p.dependentViewRenameError(
-				ctx, "column", n.Name.String(), tableDesc.ParentID, tableRef.ID)
+			return p.dependentViewRenameError(
+				ctx, "column", n.n.Name.String(), tableDesc.ParentID, tableRef.ID)
 		}
 	}
 
-	if n.Name == n.NewName {
+	if n.n.Name == n.n.NewName {
 		// Noop.
-		return newZeroNode(nil /* columns */), nil
+		return nil
 	}
 
-	if _, _, err := tableDesc.FindColumnByName(n.NewName); err == nil {
-		return nil, fmt.Errorf("column name %q already exists", string(n.NewName))
+	if _, _, err := tableDesc.FindColumnByName(n.n.NewName); err == nil {
+		return fmt.Errorf("column name %q already exists", string(n.n.NewName))
 	}
 
 	preFn := func(expr tree.Expr) (err error, recurse bool, newExpr tree.Expr) {
@@ -93,8 +102,8 @@ func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planN
 				return err, false, nil
 			}
 			if c, ok := v.(*tree.ColumnItem); ok {
-				if string(c.ColumnName) == string(n.Name) {
-					c.ColumnName = n.NewName
+				if string(c.ColumnName) == string(n.n.Name) {
+					c.ColumnName = n.n.NewName
 				}
 			}
 			return nil, false, v
@@ -121,7 +130,7 @@ func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planN
 		var err error
 		tableDesc.Checks[i].Expr, err = renameIn(tableDesc.Checks[i].Expr)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
@@ -130,33 +139,22 @@ func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planN
 		if tableDesc.Columns[i].IsComputed() {
 			newExpr, err := renameIn(*tableDesc.Columns[i].ComputeExpr)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			tableDesc.Columns[i].ComputeExpr = &newExpr
 		}
 	}
 
 	// Rename the column in the indexes.
-	tableDesc.RenameColumnDescriptor(col, string(n.NewName))
+	tableDesc.RenameColumnDescriptor(col, string(n.n.NewName))
 
-	if err := tableDesc.SetUpVersion(); err != nil {
-		return nil, err
-	}
-
-	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
 	if err := tableDesc.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
-		return nil, err
+		return err
 	}
-	if err := p.txn.Put(ctx, descKey, sqlbase.WrapDescriptor(tableDesc)); err != nil {
-		return nil, err
-	}
-	// TODO(vivek): the code above really should really be replaced by a call
-	// to writeTableDesc(). However if we do that then a couple of logic tests
-	// start failing. How can that be?
-	//
-	// if err := p.writeTableDesc(ctx, tableDesc); err != nil {
-	//	return nil, err
-	// }
-	p.notifySchemaChange(tableDesc, sqlbase.InvalidMutationID)
-	return newZeroNode(nil /* columns */), nil
+
+	return p.writeSchemaChange(ctx, tableDesc, sqlbase.InvalidMutationID)
 }
+
+func (n *renameColumnNode) Next(runParams) (bool, error) { return false, nil }
+func (n *renameColumnNode) Values() tree.Datums          { return tree.Datums{} }
+func (n *renameColumnNode) Close(context.Context)        {}

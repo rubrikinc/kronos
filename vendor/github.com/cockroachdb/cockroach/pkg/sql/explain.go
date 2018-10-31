@@ -17,125 +17,52 @@ package sql
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/pkg/errors"
 )
-
-type explainMode int
-
-const (
-	explainNone explainMode = iota
-	explainPlan
-	// explainDistSQL shows the physical distsql plan for a query and whether a
-	// query would be run in "auto" DISTSQL mode. See explainDistSQLNode for
-	// details.
-	explainDistSQL
-)
-
-var explainStrings = map[explainMode]string{
-	explainPlan:    "plan",
-	explainDistSQL: "distsql",
-}
 
 // Explain executes the explain statement, providing debugging and analysis
 // info about the wrapped statement.
 //
 // Privileges: the same privileges as the statement being explained.
 func (p *planner) Explain(ctx context.Context, n *tree.Explain) (planNode, error) {
-	mode := explainNone
-
-	optimized := true
-	expanded := true
-	normalizeExprs := true
-	flags := explainFlags{
-		showMetadata: false,
-		showExprs:    false,
-		showTypes:    false,
-	}
-
-	for _, opt := range n.Options {
-		optLower := strings.ToLower(opt)
-		newMode := explainNone
-		// Search for the string in `explainStrings`.
-		for mode, modeStr := range explainStrings {
-			if optLower == modeStr {
-				newMode = mode
-				break
-			}
-		}
-		if newMode == explainNone {
-			switch optLower {
-			case "types":
-				newMode = explainPlan
-				flags.showExprs = true
-				flags.showTypes = true
-				// TYPES implies METADATA.
-				flags.showMetadata = true
-
-			case "symvars":
-				flags.symbolicVars = true
-
-			case "metadata":
-				flags.showMetadata = true
-
-			case "qualify":
-				flags.qualifyNames = true
-
-			case "verbose":
-				// VERBOSE implies EXPRS.
-				flags.showExprs = true
-				// VERBOSE implies QUALIFY.
-				flags.qualifyNames = true
-				// VERBOSE implies METADATA.
-				flags.showMetadata = true
-
-			case "exprs":
-				flags.showExprs = true
-
-			case "noexpand":
-				expanded = false
-
-			case "nonormalize":
-				normalizeExprs = false
-
-			case "nooptimize":
-				optimized = false
-
-			default:
-				return nil, fmt.Errorf("unsupported EXPLAIN option: %s", opt)
-			}
-		}
-		if newMode != explainNone {
-			if mode != explainNone {
-				return nil, fmt.Errorf("cannot set EXPLAIN mode more than once: %s", opt)
-			}
-			mode = newMode
-		}
-	}
-	if mode == explainNone {
-		mode = explainPlan
+	opts, err := n.ParseOptions()
+	if err != nil {
+		return nil, err
 	}
 
 	defer func(save bool) { p.extendedEvalCtx.SkipNormalize = save }(p.extendedEvalCtx.SkipNormalize)
-	p.extendedEvalCtx.SkipNormalize = !normalizeExprs
+	p.extendedEvalCtx.SkipNormalize = opts.Flags.Contains(tree.ExplainFlagNoNormalize)
 
-	switch mode {
-	case explainDistSQL:
+	switch opts.Mode {
+	case tree.ExplainDistSQL:
+		analyze := opts.Flags.Contains(tree.ExplainFlagAnalyze)
+		if analyze && IsStmtParallelized(n.Statement) {
+			return nil, errors.New("EXPLAIN ANALYZE does not support RETURNING NOTHING statements")
+		}
 		plan, err := p.newPlan(ctx, n.Statement, nil)
 		if err != nil {
 			return nil, err
 		}
 		return &explainDistSQLNode{
-			plan: plan,
+			plan:     plan,
+			analyze:  analyze,
+			stmtType: n.Statement.StatementType(),
 		}, nil
 
-	case explainPlan:
+	case tree.ExplainPlan:
+		if opts.Flags.Contains(tree.ExplainFlagAnalyze) {
+			return nil, errors.New("EXPLAIN ANALYZE only supported with (DISTSQL) option")
+		}
 		// We may want to show placeholder types, so allow missing values.
 		p.semaCtx.Placeholders.PermitUnassigned()
-		return p.makeExplainPlanNode(ctx, flags, expanded, optimized, n.Statement)
+		return p.makeExplainPlanNode(ctx, &opts, n.Statement)
+
+	case tree.ExplainOpt:
+		return nil, errors.New("EXPLAIN (OPT) only supported with the cost-based optimizer")
 
 	default:
-		return nil, fmt.Errorf("unsupported EXPLAIN mode: %d", mode)
+		return nil, fmt.Errorf("unsupported EXPLAIN mode: %d", opts.Mode)
 	}
 }

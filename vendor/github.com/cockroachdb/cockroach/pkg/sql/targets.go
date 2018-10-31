@@ -17,7 +17,6 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -39,7 +38,7 @@ func (p *planner) computeRender(
 	// column name, we determine the name before we perform any manipulations to
 	// the expression.
 	if outputName == autoGenerateRenderOutputName {
-		if outputName, err = getRenderColName(p.SessionData().SearchPath, target, &ivarHelper); err != nil {
+		if outputName, err = tree.GetRenderColName(p.SessionData().SearchPath, target); err != nil {
 			return sqlbase.ResultColumn{}, nil, err
 		}
 	}
@@ -68,7 +67,9 @@ func (p *planner) computeRenderAllowingStars(
 		return nil, nil, false, err
 	}
 
-	if hasStar, cols, typedExprs, err := checkRenderStar(ctx, target, info, ivarHelper); err != nil {
+	if hasStar, cols, typedExprs, err := sqlbase.CheckRenderStar(
+		ctx, p.analyzeExpr, target, info, ivarHelper,
+	); err != nil {
 		return nil, nil, false, err
 	} else if hasStar {
 		return cols, typedExprs, hasStar, nil
@@ -108,14 +109,23 @@ func (s *renderNode) isRenderEquivalent(exprStr string, j int) bool {
 func (s *renderNode) addOrReuseRender(
 	col sqlbase.ResultColumn, expr tree.TypedExpr, reuseExistingRender bool,
 ) (colIdx int) {
+	return s.addOrReuseRenderStartingFromIdx(col, expr, reuseExistingRender, 0 /* idx */)
+}
+
+// addOrReuseRenderStartingFromIdx adds the given result column to the select
+// render list and returns its column index. If the expression is already
+// rendered by a render with index not smaller than idx and the reuse flag is true,
+// no new render is added and the index of the existing column is returned instead.
+func (s *renderNode) addOrReuseRenderStartingFromIdx(
+	col sqlbase.ResultColumn, expr tree.TypedExpr, reuseExistingRender bool, idx int,
+) (colIdx int) {
 	exprStr := symbolicExprStr(expr)
-	if reuseExistingRender && len(s.render) > 0 {
-		// Now, try to find an equivalent render. We use the syntax
-		// representation as approximation of equivalence.  At this
-		// point the expressions must have underwent name resolution
-		// already so that comparison occurs after replacing column names
-		// to IndexedVars.
-		for j := range s.render {
+	if reuseExistingRender {
+		for j := idx; j < len(s.render); j++ {
+			// Now, try to find an equivalent render starting from idx. We use
+			// the syntax representation as approximation of equivalence. At this point
+			// the expressions must have undergone name resolution already so that
+			// comparison occurs after replacing column names to IndexedVars.
 			if s.isRenderEquivalent(exprStr, j) && s.render[j].ResolvedType() == col.Typ {
 				return j
 			}
@@ -123,7 +133,6 @@ func (s *renderNode) addOrReuseRender(
 	}
 
 	s.addRenderColumn(expr, exprStr, col)
-
 	return len(s.render) - 1
 }
 
@@ -134,9 +143,19 @@ func (s *renderNode) addOrReuseRender(
 func (s *renderNode) addOrReuseRenders(
 	cols sqlbase.ResultColumns, exprs []tree.TypedExpr, reuseExistingRender bool,
 ) (colIdxs []int) {
+	return s.addOrReuseRendersStartingFromIdx(cols, exprs, reuseExistingRender, 0 /* idx */)
+}
+
+// addOrReuseRendersStartingFromIdx adds the given result columns to the select
+// render list and returns their column indices. If an expression is already
+// rendered by a render with index not smaller than idx and the reuse flag is true,
+// no new render is added and the index of the existing column is returned instead.
+func (s *renderNode) addOrReuseRendersStartingFromIdx(
+	cols sqlbase.ResultColumns, exprs []tree.TypedExpr, reuseExistingRender bool, idx int,
+) (colIdxs []int) {
 	colIdxs = make([]int, len(cols))
 	for i := range cols {
-		colIdxs[i] = s.addOrReuseRender(cols[i], exprs[i], reuseExistingRender)
+		colIdxs[i] = s.addOrReuseRenderStartingFromIdx(cols[i], exprs[i], reuseExistingRender, idx)
 	}
 	return colIdxs
 }
@@ -146,33 +165,4 @@ func (s *renderNode) addOrReuseRenders(
 // string can be used to determine if two expressions are equivalent.
 func symbolicExprStr(expr tree.Expr) string {
 	return tree.AsStringWithFlags(expr, tree.FmtCheckEquivalence)
-}
-
-// checkRenderStar handles the case where the target specification contains a
-// SQL star (UnqualifiedStar or AllColumnsSelector). We match the prefix of the
-// name to one of the tables in the query and then expand the "*" into a list
-// of columns. A sqlbase.ResultColumns and Expr pair is returned for each column.
-func checkRenderStar(
-	ctx context.Context,
-	target tree.SelectExpr,
-	info sqlbase.MultiSourceInfo,
-	ivarHelper tree.IndexedVarHelper,
-) (isStar bool, columns sqlbase.ResultColumns, exprs []tree.TypedExpr, err error) {
-	v, ok := target.Expr.(tree.VarName)
-	if !ok {
-		return false, nil, nil, nil
-	}
-
-	switch v.(type) {
-	case tree.UnqualifiedStar, *tree.AllColumnsSelector:
-		if target.As != "" {
-			return false, nil, nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
-				"%q cannot be aliased", tree.ErrString(v))
-		}
-
-		columns, exprs, err = expandStar(ctx, info, v, ivarHelper)
-		return true, columns, exprs, err
-	default:
-		return false, nil, nil, nil
-	}
 }

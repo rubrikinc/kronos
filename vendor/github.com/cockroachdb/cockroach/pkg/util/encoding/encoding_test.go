@@ -1791,45 +1791,6 @@ func TestValueEncodingRand(t *testing.T) {
 	}
 }
 
-func TestUpperBoundValueEncodingSize(t *testing.T) {
-	tests := []struct {
-		colID uint32
-		typ   Type
-		width int
-		size  int // -1 means unbounded
-	}{
-		{colID: 0, typ: Null, size: 1},
-		{colID: 0, typ: True, size: 1},
-		{colID: 0, typ: False, size: 1},
-		{colID: 0, typ: Int, size: 10},
-		{colID: 0, typ: Int, width: 100, size: 10},
-		{colID: 0, typ: Float, size: 9},
-		{colID: 0, typ: Decimal, size: -1},
-		{colID: 0, typ: Decimal, width: 100, size: 69},
-		{colID: 0, typ: Time, size: 19},
-		{colID: 0, typ: Duration, size: 28},
-		{colID: 0, typ: Bytes, size: -1},
-		{colID: 0, typ: Bytes, width: 100, size: 110},
-
-		{colID: 8, typ: True, size: 2},
-	}
-	for i, test := range tests {
-		testIsBounded := test.size != -1
-		size, isBounded := UpperBoundValueEncodingSize(test.colID, test.typ, test.width)
-		if isBounded != testIsBounded {
-			if isBounded {
-				t.Errorf("%d: expected unbounded but got bounded", i)
-			} else {
-				t.Errorf("%d: expected bounded but got unbounded", i)
-			}
-			continue
-		}
-		if isBounded && size != test.size {
-			t.Errorf("%d: got size %d but expected %d", i, size, test.size)
-		}
-	}
-}
-
 func TestPrettyPrintValueEncoded(t *testing.T) {
 	uuidStr := "63616665-6630-3064-6465-616462656562"
 	u, err := uuid.FromString(uuidStr)
@@ -1856,8 +1817,9 @@ func TestPrettyPrintValueEncoded(t *testing.T) {
 			time.Date(2016, 6, 29, 16, 2, 50, 5, time.UTC)), "2016-06-29T16:02:50.000000005Z"},
 		{EncodeDurationValue(nil, NoColumnID,
 			duration.Duration{Months: 1, Days: 2, Nanos: 3}), "1mon2d3ns"},
-		{EncodeBytesValue(nil, NoColumnID, []byte{0x1, 0x2, 0xF, 0xFF}), "01020fff"},
-		{EncodeBytesValue(nil, NoColumnID, []byte("foo")), "foo"},
+		{EncodeBytesValue(nil, NoColumnID, []byte{0x1, 0x2, 0xF, 0xFF}), "0x01020fff"},
+		{EncodeBytesValue(nil, NoColumnID, []byte("foo")), "foo"}, // printable bytes
+		{EncodeBytesValue(nil, NoColumnID, []byte{0x89}), "0x89"}, // non-printable bytes
 		{EncodeIPAddrValue(nil, NoColumnID, ipAddr), ip},
 		{EncodeUUIDValue(nil, NoColumnID, u), uuidStr},
 	}

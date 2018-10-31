@@ -38,12 +38,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+)
+
+const (
+	authOK                int32 = 0
+	authCleartextPassword int32 = 3
 )
 
 // conn implements a pgwire network connection (version 3 of the protocol,
@@ -65,7 +72,7 @@ type conn struct {
 	rd bufio.Reader
 
 	// stmtBuf is populated with commands queued for execution by this conn.
-	stmtBuf *sql.StmtBuf
+	stmtBuf sql.StmtBuf
 
 	// err is an error, accessed atomically. It represents any error encountered
 	// while accessing the underlying network connection. This can read via
@@ -84,7 +91,7 @@ type conn struct {
 	}
 
 	readBuf    pgwirebase.ReadBuffer
-	msgBuilder *writeBuffer
+	msgBuilder writeBuffer
 }
 
 // serveConn creates a conn that will serve the netConn. It returns once the
@@ -161,16 +168,16 @@ func newConn(
 ) *conn {
 	c := &conn{
 		conn:        netConn,
-		stmtBuf:     sql.NewStmtBuf(),
 		sessionArgs: sArgs,
-		msgBuilder:  newWriteBuffer(metrics.BytesOutCount),
+		execCfg:     execCfg,
 		metrics:     metrics,
 		rd:          *bufio.NewReader(netConn),
-		execCfg:     execCfg,
 	}
+	c.stmtBuf.Init()
 	c.writerState.fi.buf = &c.writerState.buf
 	c.writerState.fi.lastFlushed = -1
 	c.writerState.fi.cmdStarts = make(map[sql.CmdPos]int)
+	c.msgBuilder.init(metrics.BytesOutCount)
 
 	return c
 }
@@ -207,16 +214,60 @@ func (c *conn) serveImpl(
 ) error {
 	defer func() { _ = c.conn.Close() }()
 
+	ctx = logtags.AddTag(ctx, "user", c.sessionArgs.User)
+
 	// NOTE: We're going to write a few messages to the connection in this method,
 	// for the handshake. After that, all writes are done async, in the
 	// startWriter() goroutine.
 
-	for key, value := range statusReportParams {
+	sendStatusParam := func(param, value string) error {
 		c.msgBuilder.initMsg(pgwirebase.ServerMsgParameterStatus)
-		c.msgBuilder.writeTerminatedString(key)
+		c.msgBuilder.writeTerminatedString(param)
 		c.msgBuilder.writeTerminatedString(value)
-		if err := c.msgBuilder.finishMsg(c.conn); err != nil {
+		return c.msgBuilder.finishMsg(c.conn)
+	}
+
+	var connHandler sql.ConnectionHandler
+	if sqlServer != nil {
+		var err error
+		connHandler, err = sqlServer.SetupConn(
+			ctx, c.sessionArgs, &c.stmtBuf, c, c.metrics.SQLMemMetrics)
+		if err != nil {
+			_ /* err */ = writeErr(err, &c.msgBuilder, c.conn)
 			return err
+		}
+
+		// Send the initial "status parameters" to the client.  This
+		// overlaps partially with session variables. The client wants to
+		// see the values that result of the combination of server-side
+		// defaults with client-provided values.
+		// For details see: https://www.postgresql.org/docs/10/static/libpq-status.html
+		for _, param := range statusReportParams {
+			value := connHandler.GetStatusParam(ctx, param)
+			if err := sendStatusParam(param, value); err != nil {
+				return err
+			}
+		}
+		// The two following status parameters have no equivalent session
+		// variable.
+		if err := sendStatusParam("session_authorization", c.sessionArgs.User); err != nil {
+			return err
+		}
+		isSuperUser := c.sessionArgs.User == security.RootUser
+		superUserVal := "off"
+		if isSuperUser {
+			superUserVal = "on"
+		}
+		if err := sendStatusParam("is_superuser", superUserVal); err != nil {
+			return err
+		}
+	} else {
+		// sqlServer == nil means we are in a local test. In this case
+		// we only need the minimum to make pgx happy.
+		for param, value := range testingStatusReportParams {
+			if err := sendStatusParam(param, value); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -227,9 +278,8 @@ func (c *conn) serveImpl(
 		return err
 	}
 
-	ctx = log.WithLogTagStr(ctx, "user", c.sessionArgs.User)
-	ctx, stopReader := context.WithCancel(ctx)
-	defer stopReader() // This calms the linter that wants these callbacks to always be called.
+	ctx, cancelConn := context.WithCancel(ctx)
+	defer cancelConn() // This calms the linter that wants these callbacks to always be called.
 	var ctxCanceled bool
 
 	// Once a session has been set up, the underlying net.Conn is switched to
@@ -253,16 +303,14 @@ func (c *conn) serveImpl(
 
 	var wg sync.WaitGroup
 	var writerErr error
-	processorCtx, stopProcessor := context.WithCancel(ctx)
 	if sqlServer != nil {
 		wg.Add(1)
 		go func() {
-			writerErr = sqlServer.ServeConn(
-				processorCtx, c.sessionArgs, c.stmtBuf, c, reserved, &c.metrics.SQLMemMetrics)
+			writerErr = sqlServer.ServeConn(ctx, connHandler, reserved, cancelConn)
 			// TODO(andrei): Should we sometimes transmit the writerErr's to the
 			// client?
 			wg.Done()
-			stopReader()
+			cancelConn()
 		}()
 	}
 
@@ -359,7 +407,7 @@ Loop:
 	// canceled our context and that's how we got here; in that case, this will
 	// be a no-op.
 	c.stmtBuf.Close()
-	stopProcessor()
+	cancelConn() // This cancels the processor's context.
 	wg.Wait()
 
 	if terminateSeen {
@@ -369,7 +417,7 @@ Loop:
 	// and flushing the buffer.
 	if ctxCanceled || draining() {
 		_ /* err */ = writeErr(
-			newAdminShutdownErr(err), c.msgBuilder, &c.writerState.buf)
+			newAdminShutdownErr(err), &c.msgBuilder, &c.writerState.buf)
 		_ /* n */, _ /* err */ = c.writerState.buf.WriteTo(c.conn)
 
 		// Swallow whatever error we might have gotten from the writer. If we're
@@ -724,10 +772,7 @@ func (c *conn) BeginCopyIn(ctx context.Context, columns []sqlbase.ResultColumn) 
 	for range columns {
 		c.msgBuilder.putInt16(int16(pgwirebase.FormatText))
 	}
-	if err := c.msgBuilder.finishMsg(c.conn); err != nil {
-		return sql.NewWireFailureError(err)
-	}
-	return nil
+	return c.msgBuilder.finishMsg(c.conn)
 }
 
 // SendCommandComplete is part of the pgwirebase.Conn interface.
@@ -738,7 +783,7 @@ func (c *conn) SendCommandComplete(tag []byte) error {
 
 // Rd is part of the pgwirebase.Conn interface.
 func (c *conn) Rd() pgwirebase.BufferedReader {
-	return &pgwireReader2{conn: c}
+	return &pgwireReader{conn: c}
 }
 
 // flushInfo encapsulates information about what results have been flushed to
@@ -830,7 +875,10 @@ func cookTag(tagStr string, buf []byte, stmtType tree.StatementType, rowsAffecte
 // which case all columns are encoded using the text encoding. Otherwise, it
 // needs to contain an entry for every column.
 func (c *conn) bufferRow(
-	ctx context.Context, row tree.Datums, formatCodes []pgwirebase.FormatCode, loc *time.Location,
+	ctx context.Context,
+	row tree.Datums,
+	formatCodes []pgwirebase.FormatCode,
+	conv sessiondata.DataConversionConfig,
 ) {
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgDataRow)
 	c.msgBuilder.putInt16(int16(len(row)))
@@ -841,9 +889,9 @@ func (c *conn) bufferRow(
 		}
 		switch fmtCode {
 		case pgwirebase.FormatText:
-			c.msgBuilder.writeTextDatum(ctx, col, loc)
+			c.msgBuilder.writeTextDatum(ctx, col, conv)
 		case pgwirebase.FormatBinary:
-			c.msgBuilder.writeBinaryDatum(ctx, col, loc)
+			c.msgBuilder.writeBinaryDatum(ctx, col, conv.Location)
 		default:
 			c.msgBuilder.setError(errors.Errorf("unsupported format code %s", fmtCode))
 		}
@@ -892,7 +940,7 @@ func (c *conn) bufferCommandComplete(tag []byte) {
 }
 
 func (c *conn) bufferErr(err error) {
-	if err := writeErr(err, c.msgBuilder, &c.writerState.buf); err != nil {
+	if err := writeErr(err, &c.msgBuilder, &c.writerState.buf); err != nil {
 		panic(fmt.Sprintf("unexpected err from buffer: %s", err))
 	}
 }
@@ -1109,9 +1157,9 @@ func (c *conn) CreateStatementResult(
 	descOpt sql.RowDescOpt,
 	pos sql.CmdPos,
 	formatCodes []pgwirebase.FormatCode,
-	loc *time.Location,
+	conv sessiondata.DataConversionConfig,
 ) sql.CommandResult {
-	res := c.makeCommandResult(descOpt, pos, stmt, formatCodes, loc)
+	res := c.makeCommandResult(descOpt, pos, stmt, formatCodes, conv)
 	return &res
 }
 
@@ -1176,33 +1224,31 @@ func (c *conn) CreateCopyInResult(pos sql.CmdPos) sql.CopyInResult {
 	return &res
 }
 
-// pgwireReader2 is an io.Reader that wraps a conn, maintaining its metrics as
+// pgwireReader is an io.Reader that wraps a conn, maintaining its metrics as
 // it is consumed.
-//
-// TODO(andrei): rename when pgwireReader goes away.
-type pgwireReader2 struct {
+type pgwireReader struct {
 	conn *conn
 }
 
-// pgwireReader2 implements the pgwirebase.BufferedReader interface.
-var _ pgwirebase.BufferedReader = &pgwireReader2{}
+// pgwireReader implements the pgwirebase.BufferedReader interface.
+var _ pgwirebase.BufferedReader = &pgwireReader{}
 
 // Read is part of the pgwirebase.BufferedReader interface.
-func (r *pgwireReader2) Read(p []byte) (int, error) {
+func (r *pgwireReader) Read(p []byte) (int, error) {
 	n, err := r.conn.rd.Read(p)
 	r.conn.metrics.BytesInCount.Inc(int64(n))
 	return n, err
 }
 
 // ReadString is part of the pgwirebase.BufferedReader interface.
-func (r *pgwireReader2) ReadString(delim byte) (string, error) {
+func (r *pgwireReader) ReadString(delim byte) (string, error) {
 	s, err := r.conn.rd.ReadString(delim)
 	r.conn.metrics.BytesInCount.Inc(int64(len(s)))
 	return s, err
 }
 
 // ReadByte is part of the pgwirebase.BufferedReader interface.
-func (r *pgwireReader2) ReadByte() (byte, error) {
+func (r *pgwireReader) ReadByte() (byte, error) {
 	b, err := r.conn.rd.ReadByte()
 	if err == nil {
 		r.conn.metrics.BytesInCount.Inc(1)
@@ -1216,22 +1262,21 @@ func (r *pgwireReader2) ReadByte() (byte, error) {
 // point the sql.Session does not exist yet! If need exists to access the
 // database to look up authentication data, use the internal executor.
 func (c *conn) handleAuthentication(ctx context.Context, insecure bool) error {
-
 	sendError := func(err error) error {
-		_ /* err */ = writeErr(err, c.msgBuilder, c.conn)
+		_ /* err */ = writeErr(err, &c.msgBuilder, c.conn)
 		return err
 	}
 
 	// Check that the requested user exists and retrieve the hashed
 	// password in case password authentication is needed.
 	exists, hashedPassword, err := sql.GetUserHashedPassword(
-		ctx, c.execCfg, c.metrics.internalMemMetrics, c.sessionArgs.User,
+		ctx, c.execCfg, &c.metrics.SQLMemMetrics, c.sessionArgs.User,
 	)
 	if err != nil {
 		return sendError(err)
 	}
 	if !exists {
-		return sendError(errors.Errorf("user %s does not exist", c.sessionArgs.User))
+		return sendError(errors.Errorf(security.ErrPasswordUserAuthFailed, c.sessionArgs.User))
 	}
 
 	if tlsConn, ok := c.conn.(*tls.Conn); ok {
@@ -1290,4 +1335,80 @@ func (c *conn) sendAuthPasswordRequest() (string, error) {
 	}
 
 	return c.readBuf.GetString()
+}
+
+// statusReportParams is a list of session variables that are also
+// reported as server run-time parameters in the pgwire connection
+// initialization.
+//
+// The standard PostgreSQL status vars are listed here:
+// https://www.postgresql.org/docs/10/static/libpq-status.html
+var statusReportParams = []string{
+	"server_version",
+	"server_encoding",
+	"client_encoding",
+	"application_name",
+	// Note: is_superuser and session_authorization are handled
+	// specially in serveImpl().
+	"DateStyle",
+	"IntervalStyle",
+	"TimeZone",
+	"integer_datetimes",
+	"standard_conforming_strings",
+	"crdb_version", // CockroachDB extension.
+}
+
+// testingStatusReportParams is the minimum set of status parameters
+// needed to make pgx tests in the local package happy.
+var testingStatusReportParams = map[string]string{
+	"client_encoding":             "UTF8",
+	"standard_conforming_strings": "on",
+}
+
+// readTimeoutConn overloads net.Conn.Read by periodically calling
+// checkExitConds() and aborting the read if an error is returned.
+type readTimeoutConn struct {
+	net.Conn
+	checkExitConds func() error
+}
+
+func newReadTimeoutConn(c net.Conn, checkExitConds func() error) net.Conn {
+	// net.Pipe does not support setting deadlines. See
+	// https://github.com/golang/go/blob/go1.7.4/src/net/pipe.go#L57-L67
+	//
+	// TODO(andrei): starting with Go 1.10, pipes are supposed to support
+	// timeouts, so this should go away when we upgrade the compiler.
+	if c.LocalAddr().Network() == "pipe" {
+		return c
+	}
+	return &readTimeoutConn{
+		Conn:           c,
+		checkExitConds: checkExitConds,
+	}
+}
+
+func (c *readTimeoutConn) Read(b []byte) (int, error) {
+	// readTimeout is the amount of time ReadTimeoutConn should wait on a
+	// read before checking for exit conditions. The tradeoff is between the
+	// time it takes to react to session context cancellation and the overhead
+	// of waking up and checking for exit conditions.
+	const readTimeout = 1 * time.Second
+
+	// Remove the read deadline when returning from this function to avoid
+	// unexpected behavior.
+	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
+	for {
+		if err := c.checkExitConds(); err != nil {
+			return 0, err
+		}
+		if err := c.SetReadDeadline(timeutil.Now().Add(readTimeout)); err != nil {
+			return 0, err
+		}
+		n, err := c.Conn.Read(b)
+		// Continue if the error is due to timing out.
+		if err, ok := err.(net.Error); ok && err.Timeout() {
+			continue
+		}
+		return n, err
+	}
 }

@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 )
 
 func TestTableSet(t *testing.T) {
@@ -127,9 +127,10 @@ func TestPurgeOldVersions(t *testing.T) {
 	serverParams := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLLeaseManager: &LeaseManagerTestingKnobs{
-				GossipUpdateEvent: func(cfg config.SystemConfig) {
+				GossipUpdateEvent: func(cfg config.SystemConfig) error {
 					gossipSem <- struct{}{}
 					<-gossipSem
+					return nil
 				},
 			},
 		},
@@ -157,7 +158,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	var expiration hlc.Timestamp
 	getLeases := func() {
 		for i := 0; i < 3; i++ {
-			if err := leaseManager.acquireFreshestFromStore(context.TODO(), tableDesc.ID); err != nil {
+			if err := leaseManager.AcquireFreshestFromStore(context.TODO(), tableDesc.ID); err != nil {
 				t.Fatal(err)
 			}
 			table, exp, err := leaseManager.Acquire(context.TODO(), s.Clock().Now(), tableDesc.ID)
@@ -176,6 +177,14 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	if numLeases := getNumVersions(ts); numLeases != 1 {
 		t.Fatalf("found %d versions instead of 1", numLeases)
 	}
+
+	// Verifies that errDidntUpdateDescriptor doesn't leak from Publish().
+	if _, err := leaseManager.Publish(context.TODO(), tableDesc.ID, func(*sqlbase.TableDescriptor) error {
+		return errDidntUpdateDescriptor
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
 	// Publish a new version for the table
 	if _, err := leaseManager.Publish(context.TODO(), tableDesc.ID, func(*sqlbase.TableDescriptor) error {
 		return nil
@@ -188,8 +197,8 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	if numLeases := getNumVersions(ts); numLeases != 2 {
 		t.Fatalf("found %d versions instead of 2", numLeases)
 	}
-	if err := ts.purgeOldVersions(
-		context.TODO(), kvDB, false, 2 /* minVersion */, leaseManager); err != nil {
+	if err := purgeOldVersions(
+		context.TODO(), kvDB, tableDesc.ID, false, 2 /* minVersion */, leaseManager); err != nil {
 		t.Fatal(err)
 	}
 
@@ -220,8 +229,8 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	if numLeases := getNumVersions(ts); numLeases != 2 {
 		t.Fatalf("found %d versions instead of 2", numLeases)
 	}
-	if err := ts.purgeOldVersions(
-		context.TODO(), kvDB, false, 2 /* minVersion */, leaseManager); err != nil {
+	if err := purgeOldVersions(
+		context.TODO(), kvDB, tableDesc.ID, false, 2 /* minVersion */, leaseManager); err != nil {
 		t.Fatal(err)
 	}
 	if numLeases := getNumVersions(ts); numLeases != 1 {
@@ -503,7 +512,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	for i := 0; i < numRoutines; i++ {
 		go func() {
 			defer wg.Done()
-			if err := leaseManager.acquireFreshestFromStore(context.TODO(), tableDesc.ID); err != nil {
+			if err := leaseManager.AcquireFreshestFromStore(context.TODO(), tableDesc.ID); err != nil {
 				t.Error(err)
 			}
 			table, _, err := leaseManager.Acquire(context.TODO(), s.Clock().Now(), tableDesc.ID)
@@ -634,7 +643,7 @@ func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		ctx := log.WithLogTag(context.Background(), "test: Lease", nil)
+		ctx := logtags.AddTag(context.Background(), "test: Lease", nil)
 
 		t.Run(test.name, func(t *testing.T) {
 			// blockChan and freshestBlockChan is used to set up the race condition.
@@ -707,7 +716,7 @@ func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 			go acquireBlock(ctx, leaseManager, acquireResultChan)
 			if test.isSecondCallAcquireFreshest {
 				go func(ctx context.Context, m *LeaseManager, acquireChan chan Result) {
-					if err := m.acquireFreshestFromStore(ctx, descID); err != nil {
+					if err := m.AcquireFreshestFromStore(ctx, descID); err != nil {
 						acquireChan <- Result{err: err, exp: hlc.Timestamp{}, table: nil}
 						return
 					}

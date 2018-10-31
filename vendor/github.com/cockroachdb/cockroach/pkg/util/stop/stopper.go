@@ -23,13 +23,14 @@ import (
 	"strings"
 	"sync"
 
+	opentracing "github.com/opentracing/opentracing-go"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/opentracing/opentracing-go"
 )
 
 const asyncTaskNamePrefix = "[async] "
@@ -38,7 +39,9 @@ const asyncTaskNamePrefix = "[async] "
 // is no more capacity for async tasks, as limited by the semaphore.
 var ErrThrottled = errors.New("throttled on async limiting semaphore")
 
-var errUnavailable = &roachpb.NodeUnavailableError{}
+// ErrUnavailable indicates that the server is quiescing and is unable to
+// process new work.
+var ErrUnavailable = &roachpb.NodeUnavailableError{}
 
 func register(s *Stopper) {
 	trackedStoppers.Lock()
@@ -97,7 +100,7 @@ func (f CloserFn) Close() {
 //
 // Stopping occurs in two phases: the first is the request to stop, which moves
 // the stopper into a quiescing phase. While quiescing, calls to RunTask() &
-// RunAsyncTask() don't execute the function passed in and return errUnavailable.
+// RunAsyncTask() don't execute the function passed in and return ErrUnavailable.
 // When all outstanding tasks have been completed, the stopper
 // closes its stopper channel, which signals all live workers that it's safe to
 // shut down. When all workers have shutdown, the stopper is complete.
@@ -273,7 +276,7 @@ func (s *Stopper) withCancel(
 // function f was not called.
 func (s *Stopper) RunTask(ctx context.Context, taskName string, f func(context.Context)) error {
 	if !s.runPrelude(taskName) {
-		return errUnavailable
+		return ErrUnavailable
 	}
 
 	// Call f.
@@ -290,7 +293,7 @@ func (s *Stopper) RunTaskWithErr(
 	ctx context.Context, taskName string, f func(context.Context) error,
 ) error {
 	if !s.runPrelude(taskName) {
-		return errUnavailable
+		return ErrUnavailable
 	}
 
 	// Call f.
@@ -307,7 +310,7 @@ func (s *Stopper) RunAsyncTask(
 ) error {
 	taskName = asyncTaskNamePrefix + taskName
 	if !s.runPrelude(taskName) {
-		return errUnavailable
+		return ErrUnavailable
 	}
 
 	ctx, span := tracing.ForkCtxSpan(ctx, taskName)
@@ -341,7 +344,7 @@ func (s *Stopper) RunLimitedAsyncTask(
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.ShouldQuiesce():
-		return errUnavailable
+		return ErrUnavailable
 	default:
 		if !wait {
 			return ErrThrottled
@@ -353,7 +356,7 @@ func (s *Stopper) RunLimitedAsyncTask(
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-s.ShouldQuiesce():
-			return errUnavailable
+			return ErrUnavailable
 		}
 	}
 
@@ -368,7 +371,7 @@ func (s *Stopper) RunLimitedAsyncTask(
 
 	if !s.runPrelude(taskName) {
 		<-sem
-		return errUnavailable
+		return ErrUnavailable
 	}
 
 	ctx, span := tracing.ForkCtxSpan(ctx, taskName)

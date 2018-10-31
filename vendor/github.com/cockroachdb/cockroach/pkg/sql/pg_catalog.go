@@ -31,6 +31,7 @@ import (
 	"bytes"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
@@ -55,6 +56,132 @@ const (
 // in https://www.postgresql.org/docs/9.6/static/catalogs.html.
 var pgCatalog = virtualSchema{
 	name: pgCatalogName,
+	allTableNames: buildStringSet(
+		// Generated with:
+		// select distinct '"'||table_name||'",' from information_schema.tables
+		//    where table_schema='pg_catalog' order by table_name;
+		"pg_aggregate",
+		"pg_am",
+		"pg_amop",
+		"pg_amproc",
+		"pg_attrdef",
+		"pg_attribute",
+		"pg_auth_members",
+		"pg_authid",
+		"pg_available_extension_versions",
+		"pg_available_extensions",
+		"pg_cast",
+		"pg_class",
+		"pg_collation",
+		"pg_config",
+		"pg_constraint",
+		"pg_conversion",
+		"pg_cursors",
+		"pg_database",
+		"pg_db_role_setting",
+		"pg_default_acl",
+		"pg_depend",
+		"pg_description",
+		"pg_enum",
+		"pg_event_trigger",
+		"pg_extension",
+		"pg_file_settings",
+		"pg_foreign_data_wrapper",
+		"pg_foreign_server",
+		"pg_foreign_table",
+		"pg_group",
+		"pg_hba_file_rules",
+		"pg_index",
+		"pg_indexes",
+		"pg_inherits",
+		"pg_init_privs",
+		"pg_language",
+		"pg_largeobject",
+		"pg_largeobject_metadata",
+		"pg_locks",
+		"pg_matviews",
+		"pg_namespace",
+		"pg_opclass",
+		"pg_operator",
+		"pg_opfamily",
+		"pg_partitioned_table",
+		"pg_pltemplate",
+		"pg_policies",
+		"pg_policy",
+		"pg_prepared_statements",
+		"pg_prepared_xacts",
+		"pg_proc",
+		"pg_publication",
+		"pg_publication_rel",
+		"pg_publication_tables",
+		"pg_range",
+		"pg_replication_origin",
+		"pg_replication_origin_status",
+		"pg_replication_slots",
+		"pg_rewrite",
+		"pg_roles",
+		"pg_rules",
+		"pg_seclabel",
+		"pg_seclabels",
+		"pg_sequence",
+		"pg_sequences",
+		"pg_settings",
+		"pg_shadow",
+		"pg_shdepend",
+		"pg_shdescription",
+		"pg_shseclabel",
+		"pg_stat_activity",
+		"pg_stat_all_indexes",
+		"pg_stat_all_tables",
+		"pg_stat_archiver",
+		"pg_stat_bgwriter",
+		"pg_stat_database",
+		"pg_stat_database_conflicts",
+		"pg_stat_progress_vacuum",
+		"pg_stat_replication",
+		"pg_stat_ssl",
+		"pg_stat_subscription",
+		"pg_stat_sys_indexes",
+		"pg_stat_sys_tables",
+		"pg_stat_user_functions",
+		"pg_stat_user_indexes",
+		"pg_stat_user_tables",
+		"pg_stat_wal_receiver",
+		"pg_stat_xact_all_tables",
+		"pg_stat_xact_sys_tables",
+		"pg_stat_xact_user_functions",
+		"pg_stat_xact_user_tables",
+		"pg_statio_all_indexes",
+		"pg_statio_all_sequences",
+		"pg_statio_all_tables",
+		"pg_statio_sys_indexes",
+		"pg_statio_sys_sequences",
+		"pg_statio_sys_tables",
+		"pg_statio_user_indexes",
+		"pg_statio_user_sequences",
+		"pg_statio_user_tables",
+		"pg_statistic",
+		"pg_statistic_ext",
+		"pg_stats",
+		"pg_subscription",
+		"pg_subscription_rel",
+		"pg_tables",
+		"pg_tablespace",
+		"pg_timezone_abbrevs",
+		"pg_timezone_names",
+		"pg_transform",
+		"pg_trigger",
+		"pg_ts_config",
+		"pg_ts_config_map",
+		"pg_ts_dict",
+		"pg_ts_parser",
+		"pg_ts_template",
+		"pg_type",
+		"pg_user",
+		"pg_user_mapping",
+		"pg_user_mappings",
+		"pg_views",
+	),
 	tables: []virtualSchemaTable{
 		pgCatalogAmTable,
 		pgCatalogAttrDefTable,
@@ -66,6 +193,7 @@ var pgCatalog = virtualSchema{
 		pgCatalogDatabaseTable,
 		pgCatalogDependTable,
 		pgCatalogDescriptionTable,
+		pgCatalogSharedDescriptionTable,
 		pgCatalogEnumTable,
 		pgCatalogExtensionTable,
 		pgCatalogForeignDataWrapperTable,
@@ -90,6 +218,9 @@ var pgCatalog = virtualSchema{
 		pgCatalogTriggerTable,
 		pgCatalogTypeTable,
 		pgCatalogViewsTable,
+		pgCatalogStatActivityTable,
+		pgCatalogSecurityLabelTable,
+		pgCatalogSharedSecurityLabelTable,
 	},
 	// Postgres's catalogs are ill-defined when there is no current
 	// database set. Simply reject any attempts to use them in that
@@ -130,9 +261,9 @@ CREATE TABLE pg_catalog.pg_attrdef (
 	adsrc STRING
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachTableDesc(ctx, p, prefix, virtualMany,
+		return forEachTableDesc(ctx, p, dbContext, virtualMany,
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 				colNum := 0
 				return forEachColumnInTable(table, func(column *sqlbase.ColumnDescriptor) error {
@@ -181,9 +312,9 @@ CREATE TABLE pg_catalog.pg_attribute (
 	attfdwoptions STRING[]
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachTableDesc(ctx, p, prefix, virtualMany, func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
+		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 			// addColumn adds adds either a table or a index column to the pg_attribute table.
 			addColumn := func(column *sqlbase.ColumnDescriptor, attRelID tree.Datum, colNum int) error {
 				colTyp := column.Type.ToDatumType()
@@ -303,9 +434,9 @@ CREATE TABLE pg_catalog.pg_class (
 	reloptions STRING[]
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachTableDesc(ctx, p, prefix, virtualMany,
+		return forEachTableDesc(ctx, p, dbContext, virtualMany,
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 				// The only difference between tables, views and sequences is the relkind column.
 				relKind := relKindTable
@@ -403,9 +534,9 @@ CREATE TABLE pg_catalog.pg_collation (
   collctype STRING
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachDatabaseDesc(ctx, p, prefix, func(db *DatabaseDescriptor) error {
+		return forEachDatabaseDesc(ctx, p, dbContext, func(db *DatabaseDescriptor) error {
 			namespaceOid := h.NamespaceOid(db, tree.PublicSchema)
 			for _, tag := range collate.Supported() {
 				collName := tag.String()
@@ -495,9 +626,9 @@ CREATE TABLE pg_catalog.pg_constraint (
 	condef STRING
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachTableDescWithTableLookup(ctx, p, prefix, hideVirtual /*virtual tables have no constraints*/, func(
+		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual /*virtual tables have no constraints*/, func(
 			db *sqlbase.DatabaseDescriptor,
 			scName string,
 			table *sqlbase.TableDescriptor,
@@ -550,7 +681,20 @@ CREATE TABLE pg_catalog.pg_constraint (
 					confupdtype = fkActionNone
 					confdeltype = fkActionNone
 					confmatchtype = fkMatchTypeSimple
-					if conkey, err = colIDArrayToDatum(con.Index.ColumnIDs); err != nil {
+					columnIDs := con.Index.ColumnIDs
+					if int(con.FK.SharedPrefixLen) > len(columnIDs) {
+						return pgerror.NewAssertionErrorf(
+							"foreign key %q's SharedPrefixLen (%d) is greater than the columns in the index (%d)",
+							con.FK.Name,
+							con.FK.SharedPrefixLen,
+							int32(len(columnIDs)),
+						)
+					}
+					sharedPrefixLen := len(columnIDs)
+					if int(con.FK.SharedPrefixLen) > 0 {
+						sharedPrefixLen = int(con.FK.SharedPrefixLen)
+					}
+					if conkey, err = colIDArrayToDatum(columnIDs[:sharedPrefixLen]); err != nil {
 						return err
 					}
 					if confkey, err = colIDArrayToDatum(con.ReferencedIndex.ColumnIDs); err != nil {
@@ -734,7 +878,7 @@ CREATE TABLE pg_catalog.pg_depend (
   deptype CHAR
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		vt := p.getVirtualTabler()
 		pgConstraintsDesc, err := vt.getVirtualTableDesc(&pgConstraintsTableName)
 		if err != nil {
@@ -746,7 +890,7 @@ CREATE TABLE pg_catalog.pg_depend (
 		}
 
 		h := makeOidHasher()
-		return forEachTableDescWithTableLookup(ctx, p, prefix, hideVirtual /*virtual tables have no constraints*/, func(
+		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual /*virtual tables have no constraints*/, func(
 			db *sqlbase.DatabaseDescriptor,
 			scName string,
 			table *sqlbase.TableDescriptor,
@@ -794,6 +938,21 @@ CREATE TABLE pg_catalog.pg_description (
 	objoid OID,
 	classoid OID,
 	objsubid INT,
+	description STRING
+);
+`,
+	populate: func(_ context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		// Comments on database objects are not currently supported.
+		return nil
+	},
+}
+
+// See: https://www.postgresql.org/docs/current/static/catalog-pg-shdescription.html.
+var pgCatalogSharedDescriptionTable = virtualSchemaTable{
+	schema: `
+CREATE TABLE pg_catalog.pg_shdescription (
+	objoid OID,
+	classoid OID,
 	description STRING
 );
 `,
@@ -892,6 +1051,26 @@ CREATE TABLE pg_catalog.pg_foreign_table (
 	},
 }
 
+func makeZeroedOidVector(size int) (tree.Datum, error) {
+	oidArray := tree.NewDArray(types.Oid)
+	for i := 0; i < size; i++ {
+		if err := oidArray.Append(oidZero); err != nil {
+			return nil, err
+		}
+	}
+	return tree.NewDOidVectorFromDArray(oidArray), nil
+}
+
+func makeZeroedIntVector(size int) (tree.Datum, error) {
+	intArray := tree.NewDArray(types.Int)
+	for i := 0; i < size; i++ {
+		if err := intArray.Append(zeroVal); err != nil {
+			return nil, err
+		}
+	}
+	return tree.NewDIntVectorFromDArray(intArray), nil
+}
+
 // See: https://www.postgresql.org/docs/9.6/static/catalog-pg-index.html.
 var pgCatalogIndexTable = virtualSchemaTable{
 	schema: `
@@ -910,16 +1089,16 @@ CREATE TABLE pg_catalog.pg_index (
     indislive BOOL,
     indisreplident BOOL,
     indkey INT2VECTOR,
-    indcollation INT,
-    indclass INT,
-    indoption INT,
+    indcollation OIDVECTOR,
+    indclass OIDVECTOR,
+    indoption INT2VECTOR,
     indexprs STRING,
     indpred STRING
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachTableDesc(ctx, p, prefix, hideVirtual, /* virtual tables do not have indexes */
+		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /* virtual tables do not have indexes */
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 				tableOid := h.TableOid(db, scName, table)
 				return forEachIndexInTable(table, func(index *sqlbase.IndexDescriptor) error {
@@ -927,6 +1106,29 @@ CREATE TABLE pg_catalog.pg_index (
 						table.GetIndexMutationCapabilities(index.ID)
 					isReady := isMutation && isWriteOnly
 					indkey, err := colIDArrayToVector(index.ColumnIDs)
+					if err != nil {
+						return err
+					}
+					// Get the collations for all of the columns. To do this we require
+					// the type of the column.
+					collationOids := tree.NewDArray(types.Oid)
+					for _, columnID := range index.ColumnIDs {
+						col, err := table.FindColumnByID(columnID)
+						if err != nil {
+							return err
+						}
+						if err := collationOids.Append(typColl(col.Type.ToDatumType(), h)); err != nil {
+							return err
+						}
+					}
+					collationOidVector := tree.NewDOidVectorFromDArray(collationOids)
+					// TODO(bram): #27763 indclass still needs to be populated but it
+					// requires pg_catalog.pg_opclass first.
+					indclass, err := makeZeroedOidVector(len(index.ColumnIDs))
+					if err != nil {
+						return err
+					}
+					indoption, err := makeZeroedIntVector(len(index.ColumnIDs))
 					if err != nil {
 						return err
 					}
@@ -945,9 +1147,9 @@ CREATE TABLE pg_catalog.pg_index (
 						tree.DBoolTrue,                           // indislive
 						tree.DBoolFalse,                          // indisreplident
 						indkey,                                   // indkey
-						zeroVal,                                  // indcollation
-						zeroVal,                                  // indclass
-						zeroVal,                                  // indoption
+						collationOidVector,                       // indcollation
+						indclass,                                 // indclass
+						indoption,                                // indoption
 						tree.DNull,                               // indexprs
 						tree.DNull,                               // indpred
 					)
@@ -971,9 +1173,9 @@ CREATE TABLE pg_catalog.pg_indexes (
 	indexdef STRING
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachTableDescWithTableLookup(ctx, p, prefix, hideVirtual, /* virtual tables do not have indexes */
+		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual, /* virtual tables do not have indexes */
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor, tableLookup tableLookupFn) error {
 				scNameName := tree.NewDName(scName)
 				tblName := tree.NewDName(table.Name)
@@ -1104,9 +1306,9 @@ CREATE TABLE pg_catalog.pg_namespace (
 	nspacl STRING[]
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachDatabaseDesc(ctx, p, prefix, func(db *sqlbase.DatabaseDescriptor) error {
+		return forEachDatabaseDesc(ctx, p, dbContext, func(db *sqlbase.DatabaseDescriptor) error {
 			return forEachSchemaName(ctx, p, db, func(s string) error {
 				return addRow(
 					h.NamespaceOid(db, s), // oid
@@ -1187,6 +1389,12 @@ CREATE TABLE pg_catalog.pg_operator (
 			return err
 		}
 		for cmpOp, overloads := range tree.CmpOps {
+			// n.b. the In operator cannot be included in this list because it isn't
+			// a generalized operator. It is a special syntax form, because it only
+			// permits parenthesized subqueries or row expressions on the RHS.
+			if cmpOp == tree.In {
+				continue
+			}
 			for _, overload := range overloads {
 				params, returnType := tree.GetParamsAndReturnType(overload)
 				if err := addOp(cmpOp.String(), infixKind, params, returnType); err != nil {
@@ -1273,11 +1481,11 @@ CREATE TABLE pg_catalog.pg_proc (
 	proacl STRING[]
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachDatabaseDesc(ctx, p, prefix, func(db *DatabaseDescriptor) error {
+		return forEachDatabaseDesc(ctx, p, dbContext, func(db *DatabaseDescriptor) error {
 			nspOid := h.NamespaceOid(db, pgCatalogName)
-			for name, builtins := range builtins.Builtins {
+			for _, name := range builtins.AllBuiltinNames {
 				// parser.Builtins contains duplicate uppercase and lowercase keys.
 				// Only return the lowercase ones for compatibility with postgres.
 				var first rune
@@ -1288,27 +1496,28 @@ CREATE TABLE pg_catalog.pg_proc (
 				if unicode.IsUpper(first) {
 					continue
 				}
-				for _, builtin := range builtins {
+				props, overloads := builtins.GetBuiltinProperties(name)
+				isAggregate := props.Class == tree.AggregateClass
+				isWindow := props.Class == tree.WindowClass
+				for _, builtin := range overloads {
 					dName := tree.NewDName(name)
 					dSrc := tree.NewDString(name)
-					isAggregate := builtin.Class == tree.AggregateClass
-					isWindow := builtin.Class == tree.WindowClass
 
 					var retType tree.Datum
 					isRetSet := false
 					if fixedRetType := builtin.FixedReturnType(); fixedRetType != nil {
 						var retOid oid.Oid
-						if t, ok := fixedRetType.(types.TTable); ok {
+						if t, ok := fixedRetType.(types.TTuple); ok && builtin.Generator != nil {
 							isRetSet = true
 							// Functions returning tables with zero, or more than one
 							// columns are marked to return "anyelement"
 							// (e.g. `unnest`)
 							retOid = oid.T_anyelement
-							if len(t.Cols) == 1 {
+							if len(t.Types) == 1 {
 								// Functions returning tables with exactly one column
 								// are marked to return the type of that column
 								// (e.g. `generate_series`).
-								retOid = t.Cols[0].Oid()
+								retOid = t.Types[0].Oid()
 							}
 						} else {
 							retOid = fixedRetType.Oid()
@@ -1354,22 +1563,22 @@ CREATE TABLE pg_catalog.pg_proc (
 					}
 					err := addRow(
 						h.BuiltinOid(name, &builtin), // oid
-						dName,                                       // proname
-						nspOid,                                      // pronamespace
-						tree.DNull,                                  // proowner
-						oidZero,                                     // prolang
-						tree.DNull,                                  // procost
-						tree.DNull,                                  // prorows
-						variadicType,                                // provariadic
-						tree.DNull,                                  // protransform
-						tree.MakeDBool(tree.DBool(isAggregate)),     // proisagg
-						tree.MakeDBool(tree.DBool(isWindow)),        // proiswindow
-						tree.DBoolFalse,                             // prosecdef
-						tree.MakeDBool(tree.DBool(!builtin.Impure)), // proleakproof
-						tree.DBoolFalse,                             // proisstrict
-						tree.MakeDBool(tree.DBool(isRetSet)),        // proretset
-						tree.DNull,                                  // provolatile
-						tree.DNull,                                  // proparallel
+						dName,                                     // proname
+						nspOid,                                    // pronamespace
+						tree.DNull,                                // proowner
+						oidZero,                                   // prolang
+						tree.DNull,                                // procost
+						tree.DNull,                                // prorows
+						variadicType,                              // provariadic
+						tree.DNull,                                // protransform
+						tree.MakeDBool(tree.DBool(isAggregate)),   // proisagg
+						tree.MakeDBool(tree.DBool(isWindow)),      // proiswindow
+						tree.DBoolFalse,                           // prosecdef
+						tree.MakeDBool(tree.DBool(!props.Impure)), // proleakproof
+						tree.DBoolFalse,                           // proisstrict
+						tree.MakeDBool(tree.DBool(isRetSet)),      // proretset
+						tree.DNull,                                // provolatile
+						tree.DNull,                                // proparallel
 						tree.NewDInt(tree.DInt(builtin.Types.Length())), // pronargs
 						tree.NewDInt(tree.DInt(0)),                      // pronargdefaults
 						retType,                                         // prorettype
@@ -1498,9 +1707,9 @@ CREATE TABLE pg_catalog.pg_sequence (
 	seqcycle BOOL
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachTableDesc(ctx, p, prefix, hideVirtual, /* virtual schemas do not have indexes */
+		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /* virtual schemas do not have indexes */
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 				if !table.IsSequence() {
 					return nil
@@ -1553,6 +1762,22 @@ CREATE TABLE pg_catalog.pg_settings (
 			gen := varGen[vName]
 			value := gen.Get(&p.extendedEvalCtx)
 			valueDatum := tree.NewDString(value)
+			var bootDatum tree.Datum = tree.DNull
+			var resetDatum tree.Datum = tree.DNull
+			if gen.Set == nil && gen.RuntimeSet == nil {
+				// RESET/SET will leave the variable unchanged. Announce the
+				// current value as boot/reset value.
+				bootDatum = valueDatum
+				resetDatum = bootDatum
+			} else {
+				if gen.GlobalDefault != nil {
+					globalDefVal := gen.GlobalDefault(&p.EvalContext().Settings.SV)
+					bootDatum = tree.NewDString(globalDefVal)
+				}
+				if hasDefault, defVal := getSessionVarDefaultString(vName, gen, p.sessionDataMutator); hasDefault {
+					resetDatum = tree.NewDString(defVal)
+				}
+			}
 			if err := addRow(
 				tree.NewDString(strings.ToLower(vName)), // name
 				valueDatum,                              // setting
@@ -1566,8 +1791,8 @@ CREATE TABLE pg_catalog.pg_settings (
 				tree.DNull,                              // min_val
 				tree.DNull,                              // max_val
 				tree.DNull,                              // enumvals
-				valueDatum,                              // boot_val
-				valueDatum,                              // reset_val
+				bootDatum,                               // boot_val
+				resetDatum,                              // reset_val
 				tree.DNull,                              // sourcefile
 				tree.DNull,                              // sourceline
 				tree.DBoolFalse,                         // pending_restart
@@ -1593,11 +1818,11 @@ CREATE TABLE pg_catalog.pg_tables (
 	rowsecurity BOOL
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		// Note: pg_catalog.pg_tables is not well-defined if the prefix is
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		// Note: pg_catalog.pg_tables is not well-defined if the dbContext is
 		// empty -- listing tables across databases can yield duplicate
 		// schema/table names.
-		return forEachTableDesc(ctx, p, prefix, virtualMany,
+		return forEachTableDesc(ctx, p, dbContext, virtualMany,
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
 				if table.IsView() {
 					return nil
@@ -1628,7 +1853,7 @@ CREATE TABLE pg_catalog.pg_tablespace (
 	spcoptions TEXT[]
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return addRow(
 			oidZero, // oid
 			tree.NewDString("pg_default"), // spcname
@@ -1664,7 +1889,7 @@ CREATE TABLE pg_catalog.pg_trigger (
 	tgnewtable NAME
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		// Triggers are unsupported.
 		return nil
 	},
@@ -1703,12 +1928,9 @@ var (
 	typCategoryUnknown     = tree.NewDString("X")
 
 	// Avoid unused warning for constants.
-	_ = typCategoryArray
 	_ = typCategoryComposite
 	_ = typCategoryEnum
 	_ = typCategoryGeometric
-	_ = typCategoryNetworkAddr
-	_ = typCategoryPseudo
 	_ = typCategoryRange
 	_ = typCategoryBitString
 	_ = typCategoryUnknown
@@ -1753,13 +1975,14 @@ CREATE TABLE pg_catalog.pg_type (
 	typacl STRING[]
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachDatabaseDesc(ctx, p, prefix, func(db *DatabaseDescriptor) error {
+		return forEachDatabaseDesc(ctx, p, dbContext, func(db *DatabaseDescriptor) error {
 			nspOid := h.NamespaceOid(db, pgCatalogName)
 
 			for o, typ := range types.OidToType {
 				cat := typCategory(typ)
+				typType := typTypeBase
 				typElem := oidZero
 				typArray := oidZero
 				builtinPrefix := builtins.PGIOBuiltinPrefix(typ)
@@ -1783,7 +2006,10 @@ CREATE TABLE pg_catalog.pg_type (
 				} else {
 					typArray = tree.NewDOid(tree.DInt(types.TArray{Typ: typ}.Oid()))
 				}
-				typname := types.PGDisplayName(typ)
+				if cat == typCategoryPseudo {
+					typType = typTypePseudo
+				}
+				typname := strings.ToLower(oid.TypeName[o])
 
 				if err := addRow(
 					tree.NewDOid(tree.DInt(o)), // oid
@@ -1792,7 +2018,7 @@ CREATE TABLE pg_catalog.pg_type (
 					tree.DNull,                 // typowner
 					typLen(typ),                // typlen
 					typByVal(typ),              // typbyval
-					typTypeBase,                // typtype
+					typType,                    // typtype
 					cat,                        // typcategory
 					tree.DBoolFalse,            // typispreferred
 					tree.DBoolTrue,             // typisdefined
@@ -1884,6 +2110,68 @@ CREATE TABLE pg_catalog.pg_user_mapping (
 	},
 }
 
+// See: https://www.postgresql.org/docs/9.6/static/monitoring-stats.html#PG-STAT-ACTIVITY-VIEW
+var pgCatalogStatActivityTable = virtualSchemaTable{
+	schema: `
+CREATE TABLE pg_catalog.pg_stat_activity (
+	datid OID,
+	datname NAME,
+	pid INTEGER,
+	usesysid OID,
+	username NAME,
+	application_name TEXT,
+	client_addr INET,
+	client_hostname TEXT,
+	client_port INTEGER,
+	backend_start TIMESTAMPTZ,
+	xact_start TIMESTAMPTZ,
+	query_start TIMESTAMPTZ,
+	state_change TIMESTAMPTZ,
+	wait_event_type TEXT,
+	wait_event TEXT,
+	state TEXT,
+	backend_xid INTEGER,
+	backend_xmin INTEGER,
+	query TEXT
+)
+`,
+	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+}
+
+//
+// See https://www.postgresql.org/docs/current/static/catalog-pg-seclabel.html
+var pgCatalogSecurityLabelTable = virtualSchemaTable{
+	schema: `
+CREATE TABLE pg_catalog.pg_seclabel (
+	objoid OID,
+	classoid OID,
+	objsubid INTEGER,
+	provider TEXT,
+	label TEXT
+)
+`,
+	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+}
+
+// See https://www.postgresql.org/docs/current/static/catalog-pg-shseclabel.html
+var pgCatalogSharedSecurityLabelTable = virtualSchemaTable{
+	schema: `
+CREATE TABLE pg_catalog.pg_shseclabel (
+	objoid OID,
+	classoid OID,
+	provider TEXT,
+	label TEXT
+)
+`,
+	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+}
+
 // typOid is the only OID generation approach that does not use oidHasher, because
 // object identifiers for types are not arbitrary, but instead need to be kept in
 // sync with Postgres.
@@ -1933,7 +2221,6 @@ var datumToTypeCategory = map[reflect.Type]*tree.DString{
 	reflect.TypeOf(types.Timestamp):   typCategoryDateTime,
 	reflect.TypeOf(types.TimestampTZ): typCategoryDateTime,
 	reflect.TypeOf(types.FamTuple):    typCategoryPseudo,
-	reflect.TypeOf(types.FamTable):    typCategoryPseudo,
 	reflect.TypeOf(types.Oid):         typCategoryNumeric,
 	reflect.TypeOf(types.UUID):        typCategoryUserDefined,
 	reflect.TypeOf(types.INet):        typCategoryNetworkAddr,
@@ -1941,6 +2228,9 @@ var datumToTypeCategory = map[reflect.Type]*tree.DString{
 
 func typCategory(typ types.T) tree.Datum {
 	if typ.FamilyEqual(types.FamArray) {
+		if typ == types.AnyArray {
+			return typCategoryPseudo
+		}
 		return typCategoryArray
 	}
 	return datumToTypeCategory[reflect.TypeOf(types.UnwrapType(typ))]
@@ -1956,10 +2246,10 @@ CREATE TABLE pg_catalog.pg_views (
 	definition STRING
 );
 `,
-	populate: func(ctx context.Context, p *planner, prefix *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		// Note: pg_views is not well defined if the prefix is empty,
+	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		// Note: pg_views is not well defined if the dbContext is empty,
 		// because it does not distinguish views in separate databases.
-		return forEachTableDesc(ctx, p, prefix, hideVirtual, /*virtual schemas do not have views*/
+		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /*virtual schemas do not have views*/
 			func(db *sqlbase.DatabaseDescriptor, scName string, desc *sqlbase.TableDescriptor) error {
 				if !desc.IsView() {
 					return nil
@@ -2126,7 +2416,10 @@ func (h oidHasher) TableOid(
 }
 
 func (h oidHasher) IndexOid(
-	db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor,
+	db *sqlbase.DatabaseDescriptor,
+	scName string,
+	table *sqlbase.TableDescriptor,
+	index *sqlbase.IndexDescriptor,
 ) *tree.DOid {
 	h.writeTypeTag(indexTypeTag)
 	h.writeDB(db)
@@ -2137,7 +2430,10 @@ func (h oidHasher) IndexOid(
 }
 
 func (h oidHasher) ColumnOid(
-	db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor, column *sqlbase.ColumnDescriptor,
+	db *sqlbase.DatabaseDescriptor,
+	scName string,
+	table *sqlbase.TableDescriptor,
+	column *sqlbase.ColumnDescriptor,
 ) *tree.DOid {
 	h.writeTypeTag(columnTypeTag)
 	h.writeDB(db)
@@ -2162,7 +2458,10 @@ func (h oidHasher) CheckConstraintOid(
 }
 
 func (h oidHasher) PrimaryKeyConstraintOid(
-	db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor, pkey *sqlbase.IndexDescriptor,
+	db *sqlbase.DatabaseDescriptor,
+	scName string,
+	table *sqlbase.TableDescriptor,
+	pkey *sqlbase.IndexDescriptor,
 ) *tree.DOid {
 	h.writeTypeTag(pKeyConstraintTypeTag)
 	h.writeDB(db)
@@ -2173,7 +2472,10 @@ func (h oidHasher) PrimaryKeyConstraintOid(
 }
 
 func (h oidHasher) ForeignKeyConstraintOid(
-	db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor, fk *sqlbase.ForeignKeyReference,
+	db *sqlbase.DatabaseDescriptor,
+	scName string,
+	table *sqlbase.TableDescriptor,
+	fk *sqlbase.ForeignKeyReference,
 ) *tree.DOid {
 	h.writeTypeTag(fkConstraintTypeTag)
 	h.writeDB(db)
@@ -2184,7 +2486,10 @@ func (h oidHasher) ForeignKeyConstraintOid(
 }
 
 func (h oidHasher) UniqueConstraintOid(
-	db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor,
+	db *sqlbase.DatabaseDescriptor,
+	scName string,
+	table *sqlbase.TableDescriptor,
+	index *sqlbase.IndexDescriptor,
 ) *tree.DOid {
 	h.writeTypeTag(uniqueConstraintTypeTag)
 	h.writeDB(db)
@@ -2194,7 +2499,7 @@ func (h oidHasher) UniqueConstraintOid(
 	return h.getOid()
 }
 
-func (h oidHasher) BuiltinOid(name string, builtin *tree.Builtin) *tree.DOid {
+func (h oidHasher) BuiltinOid(name string, builtin *tree.Overload) *tree.DOid {
 	h.writeTypeTag(functionTypeTag)
 	h.writeStr(name)
 	h.writeStr(builtin.Types.String())
@@ -2203,11 +2508,11 @@ func (h oidHasher) BuiltinOid(name string, builtin *tree.Builtin) *tree.DOid {
 }
 
 func (h oidHasher) RegProc(name string) tree.Datum {
-	builtin, ok := builtins.Builtins[name]
-	if !ok {
+	_, overloads := builtins.GetBuiltinProperties(name)
+	if len(overloads) == 0 {
 		return tree.DNull
 	}
-	return h.BuiltinOid(name, &builtin[0]).AsRegProc(name)
+	return h.BuiltinOid(name, &overloads[0]).AsRegProc(name)
 }
 
 func (h oidHasher) UserOid(username string) *tree.DOid {

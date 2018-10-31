@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 var upsertNodePool = sync.Pool{
@@ -32,19 +33,14 @@ var upsertNodePool = sync.Pool{
 }
 
 type upsertNode struct {
-	// The following fields are populated during makePlan.
-	editNodeBase
-	defaultExprs []tree.TypedExpr
-	computeExprs []tree.TypedExpr
-	checkHelper  *sqlbase.CheckHelper
+	source planNode
 
-	insertCols   []sqlbase.ColumnDescriptor
-	computedCols []sqlbase.ColumnDescriptor
-	tw           tableWriter
+	// columns is set if this UPDATE is returning any rows, to be
+	// consumed by a renderNode upstream. This occurs when there is a
+	// RETURNING clause with some scalar expressions.
+	columns sqlbase.ResultColumns
 
 	run upsertRun
-
-	autoCommit autoCommitOpt
 }
 
 // upsertNode implements the autoCommitNode interface.
@@ -53,42 +49,42 @@ var _ autoCommitNode = &upsertNode{}
 func (p *planner) newUpsertNode(
 	ctx context.Context,
 	n *tree.Insert,
-	en editNodeBase,
+	desc *sqlbase.TableDescriptor,
 	ri sqlbase.RowInserter,
 	tn, alias *tree.TableName,
-	rows planNode,
+	sourceRows planNode,
+	needRows bool,
+	resultCols sqlbase.ResultColumns,
 	defaultExprs []tree.TypedExpr,
 	computeExprs []tree.TypedExpr,
 	computedCols []sqlbase.ColumnDescriptor,
 	fkTables sqlbase.TableLookupsByID,
 	desiredTypes []types.T,
-) (res planNode, err error) {
+) (res batchedPlanNode, err error) {
 	// Extract the index that will detect upsert conflicts
 	// (conflictIndex) and the assignment expressions to use when
 	// conflicts are detected (updateExprs).
-	updateExprs, conflictIndex, err := upsertExprsAndIndex(en.tableDesc, *n.OnConflict, ri.InsertCols)
+	autoGenUpdates, updateExprs, conflictIndex, err := upsertExprsAndIndex(desc, *n.OnConflict, ri.InsertCols)
 	if err != nil {
 		return nil, err
-	}
-
-	// needRows determines whether we need to accumulate result rows.
-	needRows := false
-	if _, ok := n.Returning.(*tree.ReturningExprs); ok {
-		needRows = true
 	}
 
 	// Instantiate the upsert node.
 	un := upsertNodePool.Get().(*upsertNode)
 	*un = upsertNode{
-		editNodeBase: en,
-		defaultExprs: defaultExprs,
-		computeExprs: computeExprs,
-		insertCols:   ri.InsertCols,
-		computedCols: computedCols,
+		source:  sourceRows,
+		columns: resultCols,
 		run: upsertRun{
-			insertColIDtoRowIndex: ri.InsertColIDtoRowIndex,
+			checkHelper:  fkTables[desc.ID].CheckHelper,
+			insertCols:   ri.InsertCols,
+			defaultExprs: defaultExprs,
+			computedCols: computedCols,
+			computeExprs: computeExprs,
+			iVarContainerForComputedCols: sqlbase.RowIndexedVarContainer{
+				Cols:    desc.Columns,
+				Mapping: ri.InsertColIDtoRowIndex,
+			},
 		},
-		checkHelper: fkTables[en.tableDesc.ID].CheckHelper,
 	}
 	defer func() {
 		// If anything below fails, we don't want to leak
@@ -100,14 +96,23 @@ func (p *planner) newUpsertNode(
 	}()
 
 	if n.OnConflict.DoNothing {
-		// TODO(dan): Postgres allows ON CONFLICT DO NOTHING without specifying a
-		// conflict index, which means do nothing on any conflict. Support this if
-		// someone needs it.
-		un.tw = &tableUpserter{
-			ri:            ri,
-			conflictIndex: *conflictIndex,
-			collectRows:   needRows,
-			alloc:         &p.alloc,
+		if conflictIndex == nil {
+			un.run.tw = &strictTableUpserter{
+				tableUpserterBase: tableUpserterBase{
+					ri:          ri,
+					collectRows: needRows,
+					alloc:       &p.alloc,
+				},
+			}
+		} else {
+			un.run.tw = &tableUpserter{
+				conflictIndex: *conflictIndex,
+				tableUpserterBase: tableUpserterBase{
+					ri:          ri,
+					collectRows: needRows,
+					alloc:       &p.alloc,
+				},
+			}
 		}
 	} else {
 		// We're going to work on allocating an upsertHelper here, even
@@ -127,11 +132,22 @@ func (p *planner) newUpsertNode(
 
 		// We use ensureColumns = false in processColumns, because
 		// updateCols may be legitimately empty (when there is no DO
-		// UPDATE clause). We set allowMutations because we need
-		// to populate all columns even those that are being added.
-		updateCols, err := p.processColumns(en.tableDesc, names,
-			false /* ensureColumns */, true /* allowMutations */)
+		// UPDATE clause).
+		//
+		// If the SET expressions were automatically generated (UPSERT
+		// alias) then we are assigning all columns and we want also
+		// to include mutation columns being added. If the SET
+		// expressions were explicit (specified by the client),
+		// then we want to reject assignments to mutation columns.
+		updateCols, err := p.processColumns(desc, names,
+			false /* ensureColumns */, autoGenUpdates /* allowMutations */)
 		if err != nil {
+			return nil, err
+		}
+
+		// Ensure that the user cannot include computed columns
+		// in the list of columns explicitly updated.
+		if err := checkHasNoComputedCols(updateCols); err != nil {
 			return nil, err
 		}
 
@@ -144,7 +160,7 @@ func (p *planner) newUpsertNode(
 		// SQL expressions. As described above, this also performs a
 		// semantic check, so it cannot be skipped on the fast path below.
 		helper, err := p.newUpsertHelper(
-			ctx, tn, en.tableDesc,
+			ctx, tn, desc,
 			ri.InsertCols,
 			updateCols,
 			updateExprs,
@@ -167,210 +183,230 @@ func (p *planner) newUpsertNode(
 			// Tables with secondary indexes are not eligible for fast path (it
 			// would be easy to add the new secondary index entry but we can't clean
 			// up the old one without the previous values).
-			len(en.tableDesc.Indexes) == 0 &&
+			len(desc.Indexes) == 0 &&
 			// When adding or removing a column in a schema change (mutation), the user
 			// can't specify it, which means we need to do a lookup and so we can't use
 			// the fast path. When adding or removing an index, same result, so the fast
 			// path is disabled during all mutations.
-			len(en.tableDesc.Mutations) == 0 &&
+			len(desc.Mutations) == 0 &&
 			// For the fast path, all columns must be specified in the insert.
-			len(ri.InsertCols) == len(en.tableDesc.Columns)
+			len(ri.InsertCols) == len(desc.Columns) &&
+			// We cannot use the fast path if we also have a RETURNING clause, because
+			// RETURNING wants to see only the updated rows.
+			!needRows
 
 		if enableFastPath {
 			// We then use the super-simple, super-fast writer. There's not
 			// much else to prepare.
-			un.tw = &fastTableUpserter{
-				ri:          ri,
-				collectRows: needRows,
+			un.run.tw = &fastTableUpserter{
+				tableUpserterBase: tableUpserterBase{
+					ri: ri,
+				},
 			}
 		} else {
 			// General/slow path.
-			un.tw = &tableUpserter{
-				ri:            ri,
-				alloc:         &p.alloc,
+			un.run.tw = &tableUpserter{
+				tableUpserterBase: tableUpserterBase{
+					ri:          ri,
+					alloc:       &p.alloc,
+					collectRows: needRows,
+				},
 				anyComputed:   len(computeExprs) >= 0,
 				fkTables:      fkTables,
 				updateCols:    updateCols,
 				conflictIndex: *conflictIndex,
-				collectRows:   needRows,
 				evaler:        helper,
 			}
 		}
 	}
 
-	// Common initialization in any case, includes setting up the
-	// returning helper.
-	if err := un.run.initEditNode(
-		ctx, &un.editNodeBase, rows, un.tw, alias, n.Returning, desiredTypes); err != nil {
-		return nil, err
-	}
-
 	return un, nil
 }
 
+// upsertRun contains the run-time state of upsertNode during local execution.
+type upsertRun struct {
+	// In contrast with the run part of insert/delete/update, the
+	// upsertRun has a tableWriter interface reference instead of
+	// embedding a direct struct because it can run with either the
+	// fastTableUpdater or the regular tableUpdater.
+	tw          batchedTableWriter
+	checkHelper *sqlbase.CheckHelper
+
+	// insertCols are the columns being inserted/upserted into.
+	insertCols []sqlbase.ColumnDescriptor
+
+	// defaultExprs are the expressions used to generate default values.
+	defaultExprs []tree.TypedExpr
+
+	// computedCols are the columns that need to be (re-)computed as
+	// the result of computing some of the source rows prior to the upsert.
+	computedCols []sqlbase.ColumnDescriptor
+	// computeExprs are the expressions to evaluate to re-compute the
+	// columns in computedCols.
+	computeExprs []tree.TypedExpr
+	// iVarContainerForComputedCols is used as a temporary buffer that
+	// holds the updated values for every column in the source, to
+	// serve as input for indexed vars contained in the computeExprs.
+	iVarContainerForComputedCols sqlbase.RowIndexedVarContainer
+
+	// done informs a new call to BatchedNext() that the previous call to
+	// BatchedNext() has completed the work already.
+	done bool
+
+	// autoCommit indicates whether the last KV batch processed by
+	// this update will also commit the KV txn.
+	autoCommit autoCommitOpt
+
+	// traceKV caches the current KV tracing flag.
+	traceKV bool
+}
+
+func (n *upsertNode) startExec(params runParams) error {
+	if err := params.p.maybeSetSystemConfig(n.run.tw.tableDesc().GetID()); err != nil {
+		return err
+	}
+
+	// cache traceKV during execution, to avoid re-evaluating it for every row.
+	n.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
+
+	return n.run.tw.init(params.p.txn, params.EvalContext())
+}
+
+// Next is required because batchedPlanNode inherits from planNode, but
+// batchedPlanNode doesn't really provide it. See the explanatory comments
+// in plan_batch.go.
+func (n *upsertNode) Next(params runParams) (bool, error) { panic("not valid") }
+
+// Values is required because batchedPlanNode inherits from planNode, but
+// batchedPlanNode doesn't really provide it. See the explanatory comments
+// in plan_batch.go.
+func (n *upsertNode) Values() tree.Datums { panic("not valid") }
+
+// maxUpsertBatchSize is the max number of entries in the KV batch for
+// the upsert operation (including secondary index updates, FK
+// cascading updates, etc), before the current KV batch is executed
+// and a new batch is started.
+const maxUpsertBatchSize = 10000
+
+// BatchedNext implements the batchedPlanNode interface.
+func (n *upsertNode) BatchedNext(params runParams) (bool, error) {
+	if n.run.done {
+		return false, nil
+	}
+
+	tracing.AnnotateTrace()
+
+	// Now consume/accumulate the rows for this batch.
+	lastBatch := false
+	for {
+		if err := params.p.cancelChecker.Check(); err != nil {
+			return false, err
+		}
+
+		// Advance one individual row.
+		if next, err := n.source.Next(params); !next {
+			lastBatch = true
+			if err != nil {
+				return false, err
+			}
+			break
+		}
+
+		// Process the insertion for the current source row, potentially
+		// accumulating the result row for later.
+		if err := n.processSourceRow(params, n.source.Values()); err != nil {
+			return false, err
+		}
+
+		// Are we done yet with the current batch?
+		if n.run.tw.curBatchSize() >= maxUpsertBatchSize {
+			break
+		}
+	}
+
+	// In Upsert, curBatchSize indicates whether "there is still work to do in this batch".
+	batchSize := n.run.tw.curBatchSize()
+
+	if batchSize > 0 {
+		if err := n.run.tw.atBatchEnd(params.ctx, n.run.traceKV); err != nil {
+			return false, err
+		}
+
+		if !lastBatch {
+			// We only run/commit the batch if there were some rows processed
+			// in this batch.
+			if err := n.run.tw.flushAndStartNewBatch(params.ctx); err != nil {
+				return false, err
+			}
+		}
+	}
+
+	if lastBatch {
+		if _, err := n.run.tw.finalize(params.ctx, n.run.autoCommit, n.run.traceKV); err != nil {
+			return false, err
+		}
+		// Remember we're done for the next call to BatchedNext().
+		n.run.done = true
+	}
+
+	return n.run.tw.batchedCount() > 0, nil
+}
+
+// processSourceRow processes one row from the source for upsertion.
+// The table writer is in charge of accumulating the result rows.
+func (n *upsertNode) processSourceRow(params runParams, sourceVals tree.Datums) error {
+	// Process the incoming row tuple and generate the full inserted
+	// row. This fills in the defaults, computes computed columns, and
+	// checks the data width complies with the schema constraints.
+	rowVals, err := GenerateInsertRow(
+		n.run.defaultExprs,
+		n.run.computeExprs,
+		n.run.insertCols,
+		n.run.computedCols,
+		*params.EvalContext(),
+		n.run.tw.tableDesc(),
+		sourceVals,
+		&n.run.iVarContainerForComputedCols,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Run the CHECK constraints, if any.
+	if len(n.run.checkHelper.Exprs) > 0 {
+		insertColIDtoRowIndex := n.run.iVarContainerForComputedCols.Mapping
+		if err := n.run.checkHelper.LoadRow(insertColIDtoRowIndex, rowVals, false); err != nil {
+			return err
+		}
+		if err := n.run.checkHelper.Check(params.EvalContext()); err != nil {
+			return err
+		}
+	}
+
+	// Process the row. This is also where the tableWriter will accumulate
+	// the row for later.
+	_, err = n.run.tw.row(params.ctx, rowVals, n.run.traceKV)
+	return err
+}
+
+// BatchedCount implements the batchedPlanNode interface.
+func (n *upsertNode) BatchedCount() int { return n.run.tw.batchedCount() }
+
+// BatchedCount implements the batchedPlanNode interface.
+func (n *upsertNode) BatchedValues(rowIdx int) tree.Datums { return n.run.tw.batchedValues(rowIdx) }
+
 func (n *upsertNode) Close(ctx context.Context) {
-	if n.tw != nil {
-		n.tw.close(ctx)
-	}
-	if n.run.rows != nil {
-		n.run.rows.Close(ctx)
-	}
-	if n.run.rowsUpserted != nil {
-		n.run.rowsUpserted.Close(ctx)
-		n.run.rowsUpserted = nil
+	n.source.Close(ctx)
+	if n.run.tw != nil {
+		n.run.tw.close(ctx)
 	}
 	*n = upsertNode{}
 	upsertNodePool.Put(n)
 }
 
-// upsertRun contains the run-time state of upsertNode during local execution.
-type upsertRun struct {
-	// The following fields are populated during Start().
-	editNodeRun
-
-	insertColIDtoRowIndex map[sqlbase.ColumnID]int
-
-	rowIdxToRetIdx []int
-	rowTemplate    tree.Datums
-
-	rowsUpserted *sqlbase.RowContainer
-
-	numRows   int
-	curRowIdx int
-}
-
-func (n *upsertNode) startExec(params runParams) error {
-	if n.rh.exprs != nil {
-		// In some cases (e.g. `INSERT INTO t (a) ...`) rowVals does not contain all the table
-		// columns. We need to pass values for all table columns to rh, in the correct order; we
-		// will use rowTemplate for this. We also need a table that maps row indices to rowTemplate indices
-		// to fill in the row values; any absent values will be NULLs.
-		n.run.rowTemplate = make(tree.Datums, len(n.tableDesc.Columns))
-		for i := range n.run.rowTemplate {
-			n.run.rowTemplate[i] = tree.DNull
-		}
-
-		colIDToRetIndex := map[sqlbase.ColumnID]int{}
-		for i, col := range n.tableDesc.Columns {
-			colIDToRetIndex[col.ID] = i
-		}
-
-		n.run.rowIdxToRetIdx = make([]int, len(n.insertCols))
-		for i, col := range n.insertCols {
-			n.run.rowIdxToRetIdx[i] = colIDToRetIndex[col.ID]
-		}
-
-		n.run.rowsUpserted = sqlbase.NewRowContainer(
-			params.EvalContext().Mon.MakeBoundAccount(),
-			sqlbase.ColTypeInfoFromResCols(n.rh.columns),
-			0,
-		)
-	}
-
-	if err := n.run.startEditNode(params, &n.editNodeBase); err != nil {
-		return err
-	}
-
-	if err := n.run.tw.init(params.p.txn, params.EvalContext()); err != nil {
-		return err
-	}
-
-	// Do all the work upfront.
-	for {
-		next, err := n.internalNext(params)
-		if err != nil {
-			return err
-		}
-		if !next {
-			break
-		}
-	}
-	// Initialize the current row index for the first call to Next().
-	n.run.curRowIdx = -1
-	return nil
-}
-
-// spooled implements the planNodeSpooled interface.
-func (n *upsertNode) spooled() {}
-
-func (n *upsertNode) FastPathResults() (int, bool) {
-	if n.run.rowsUpserted != nil {
-		return 0, false
-	}
-	return n.run.numRows, true
-}
-
-func (n *upsertNode) Next(params runParams) (bool, error) {
-	if n.run.rowsUpserted == nil {
-		return false, nil
-	}
-	n.run.curRowIdx++
-	return n.run.curRowIdx < n.run.rowsUpserted.Len(), nil
-}
-
-func (n *upsertNode) internalNext(params runParams) (bool, error) {
-	if err := params.p.cancelChecker.Check(); err != nil {
-		return false, err
-	}
-	if next, err := n.run.rows.Next(params); !next {
-		if err != nil {
-			return false, err
-		}
-		// We're done. Finish the batch.
-		rows, err := n.tw.finalize(
-			params.ctx, n.autoCommit, params.extendedEvalCtx.Tracing.KVTracingEnabled())
-		if err != nil {
-			return false, err
-		}
-
-		if n.run.rowsUpserted != nil {
-			for i := 0; i < rows.Len(); i++ {
-				cooked, err := n.rh.cookResultRow(rows.At(i))
-				if err != nil {
-					return false, err
-				}
-				_, err = n.run.rowsUpserted.AddRow(params.ctx, cooked)
-				if err != nil {
-					return false, err
-				}
-			}
-		}
-		return false, nil
-	}
-
-	n.run.numRows++
-	rowVals, err := GenerateInsertRow(
-		n.defaultExprs,
-		n.computeExprs,
-		n.run.insertColIDtoRowIndex,
-		n.insertCols,
-		n.computedCols,
-		*params.EvalContext(),
-		n.tableDesc,
-		n.run.rows.Values(),
-	)
-	if err != nil {
-		return false, err
-	}
-
-	if err := n.checkHelper.LoadRow(n.run.insertColIDtoRowIndex, rowVals, false); err != nil {
-		return false, err
-	}
-	if err := n.checkHelper.Check(params.EvalContext()); err != nil {
-		return false, err
-	}
-
-	_, err = n.tw.row(params.ctx, rowVals, params.extendedEvalCtx.Tracing.KVTracingEnabled())
-	return err == nil, err
-}
-
-func (n *upsertNode) Values() tree.Datums {
-	return n.run.rowsUpserted.At(n.run.curRowIdx)
-}
-
 // enableAutoCommit is part of the autoCommitNode interface.
 func (n *upsertNode) enableAutoCommit() {
-	n.autoCommit = autoCommitEnabled
+	n.run.autoCommit = autoCommitEnabled
 }
 
 // upsertExcludedTable is the name of a synthetic table used in an upsert's set
@@ -438,7 +474,7 @@ type upsertHelper struct {
 	// ccIvarContainer buffers the current values after the upsert
 	// conflict resolution, to serve as input while evaluating
 	// computeExprs.
-	ccIvarContainer rowIndexedVarContainer
+	ccIvarContainer sqlbase.RowIndexedVarContainer
 
 	// This struct must be allocated on the heap and its location stay
 	// stable after construction because it implements
@@ -571,6 +607,14 @@ func (p *planner) newUpsertHelper(
 	ivarHelper := tree.MakeIndexedVarHelper(helper,
 		len(helper.sourceInfo.SourceColumns)+len(helper.excludedSourceInfo.SourceColumns))
 
+	// We need to save and restore the previous value of the field in
+	// semaCtx in case we are recursively called within a subquery
+	// context.
+	defer p.semaCtx.Properties.Restore(p.semaCtx.Properties)
+
+	// Ensure there are no special functions in the clause.
+	p.semaCtx.Properties.Require("ON CONFLICT", tree.RejectSpecial)
+
 	// Start with evalExprs, which will contain all the RHS expressions
 	// of UPDATE SET clauses. Again, evalExprs will contain one entry
 	// per column in updateCols and untupledExprs.
@@ -588,31 +632,18 @@ func (p *planner) newUpsertHelper(
 			return nil, err
 		}
 
-		// Make sure there are no aggregation/window functions in the
-		// expression (after subqueries have been expanded).
-		if err := p.txCtx.AssertNoAggregationOrWindowing(
-			normExpr, "ON CONFLICT", p.SessionData().SearchPath,
-		); err != nil {
-			return nil, err
-		}
-
 		helper.evalExprs[i] = normExpr
 	}
 
 	// If there's a conflict WHERE clause, analyze it.
 	if whereClause != nil {
+		p.semaCtx.Properties.Require("ON CONFLICT...WHERE", tree.RejectSpecial)
+
 		// Resolve names, type and normalize.
 		whereExpr, err := p.analyzeExpr(
-			ctx, whereClause.Expr, sources, ivarHelper, types.Bool, true /* requireType */, "WHERE")
+			ctx, whereClause.Expr, sources, ivarHelper, types.Bool, true, /* requireType */
+			"ON CONFLICT...WHERE")
 		if err != nil {
-			return nil, err
-		}
-
-		// Make sure there are no aggregation/window functions in the filter
-		// (after subqueries have been expanded).
-		if err := p.txCtx.AssertNoAggregationOrWindowing(
-			whereExpr, "ON CONFLICT...WHERE", p.SessionData().SearchPath,
-		); err != nil {
 			return nil, err
 		}
 
@@ -624,13 +655,9 @@ func (p *planner) newUpsertHelper(
 	//
 	// This will use the layout from the table columns. The mapping from
 	// column IDs to row datum positions is straightforward.
-	mapping := make(map[sqlbase.ColumnID]int)
-	for i, c := range tableDesc.Columns {
-		mapping[c.ID] = i
-	}
-	helper.ccIvarContainer = rowIndexedVarContainer{
-		cols:    tableDesc.Columns,
-		mapping: mapping,
+	helper.ccIvarContainer = sqlbase.RowIndexedVarContainer{
+		Cols:    tableDesc.Columns,
+		Mapping: sqlbase.ColIDtoRowIndexFromCols(tableDesc.Columns),
 	}
 
 	return helper, nil
@@ -670,7 +697,7 @@ func (uh *upsertHelper) evalComputedCols(
 	updatedRow tree.Datums, appendTo tree.Datums,
 ) (tree.Datums, error) {
 	// Buffer the row.
-	uh.ccIvarContainer.curSourceRow = updatedRow
+	uh.ccIvarContainer.CurSourceRow = updatedRow
 
 	// Evaluate the computed columns.
 	uh.p.EvalContext().PushIVarContainer(&uh.ccIvarContainer)
@@ -700,11 +727,23 @@ func (uh *upsertHelper) shouldUpdate(insertRow tree.Datums, existingRow tree.Dat
 
 // upsertExprsAndIndex returns the upsert conflict index and the (possibly
 // synthetic) SET expressions used when a row conflicts.
+//
+// Return values:
+// - autoGeneratedAssignments is true iff the UPSERT statement was used
+//   and there was no explicit ON CONFLICT DO UPDATE clause.
+// - updateExprs: the assignment expressions in ON CONFLICT DO UPDATE,
+//   or auto-generated assignments for UPSERT.
+// - conflictIdx: the conflicting index, if specified.
 func upsertExprsAndIndex(
 	tableDesc *sqlbase.TableDescriptor,
 	onConflict tree.OnConflict,
 	insertCols []sqlbase.ColumnDescriptor,
-) (tree.UpdateExprs, *sqlbase.IndexDescriptor, error) {
+) (
+	autoGeneratedAssignments bool,
+	updateExprs tree.UpdateExprs,
+	conflictIdx *sqlbase.IndexDescriptor,
+	err error,
+) {
 	if onConflict.IsUpsertAlias() {
 		// Construct a fake set of UPDATE SET expressions. This enables sharing
 		// the same implementation for UPSERT and INSERT ... ON CONFLICT DO UPDATE.
@@ -736,7 +775,11 @@ func upsertExprsAndIndex(
 			expr := tree.NewColumnItem(&upsertExcludedTable, n)
 			updateExprs = append(updateExprs, &tree.UpdateExpr{Names: tree.NameList{n}, Expr: expr})
 		}
-		return updateExprs, conflictIndex, nil
+		return true, updateExprs, conflictIndex, nil
+	}
+
+	if onConflict.DoNothing && len(onConflict.Columns) == 0 {
+		return false, onConflict.Exprs, nil, nil
 	}
 
 	// General case: INSERT with an ON CONFLICT clause.
@@ -757,12 +800,12 @@ func upsertExprsAndIndex(
 	}
 
 	if indexMatch(tableDesc.PrimaryIndex) {
-		return onConflict.Exprs, &tableDesc.PrimaryIndex, nil
+		return false, onConflict.Exprs, &tableDesc.PrimaryIndex, nil
 	}
-	for _, index := range tableDesc.Indexes {
-		if indexMatch(index) {
-			return onConflict.Exprs, &index, nil
+	for i := range tableDesc.Indexes {
+		if indexMatch(tableDesc.Indexes[i]) {
+			return false, onConflict.Exprs, &tableDesc.Indexes[i], nil
 		}
 	}
-	return nil, nil, fmt.Errorf("there is no unique or exclusion constraint matching the ON CONFLICT specification")
+	return false, nil, nil, fmt.Errorf("there is no unique or exclusion constraint matching the ON CONFLICT specification")
 }

@@ -19,11 +19,11 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
 )
 
 type showFingerprintsNode struct {
@@ -59,16 +59,10 @@ func (p *planner) ShowFingerprints(
 		return nil, err
 	}
 
-	var tableDesc *TableDescriptor
 	// We avoid the cache so that we can observe the fingerprints without
-	// taking a lease, like other SHOW commands. We also use
-	// allowAdding=true so we can look at the fingerprints of a table
-	// added in the same transaction.
-	//
-	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
-		tableDesc, err = ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
-	})
+	// taking a lease, like other SHOW commands.
+	tableDesc, err := p.ResolveUncachedTableDescriptor(
+		ctx, tn, true /*required*/, requireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +78,7 @@ func (p *planner) ShowFingerprints(
 }
 
 var showFingerprintsColumns = sqlbase.ResultColumns{
-	{Name: "index", Typ: types.String},
+	{Name: "index_name", Typ: types.String},
 	{Name: "fingerprint", Typ: types.String},
 }
 
@@ -149,17 +143,29 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	// TODO(dan): If/when this ever loses its EXPERIMENTAL prefix and gets
 	// exposed to users, consider adding a version to the fingerprint output.
 	sql := fmt.Sprintf(`SELECT
-	  XOR_AGG(FNV64(%s))::string AS fingerprint
-	  FROM [%d AS t]@{FORCE_INDEX=[%d],NO_INDEX_JOIN}
+	  xor_agg(fnv64(%s))::string AS fingerprint
+	  FROM [%d AS t]@{FORCE_INDEX=[%d]}
 	`, strings.Join(cols, `,`), n.tableDesc.ID, index.ID)
+	// If were'in in an AOST context, propagate it to the inner statement so that
+	// the inner statement gets planned with planner.avoidCachedDescriptors set,
+	// like the outter one.
+	if params.p.semaCtx.AsOfTimestamp != nil {
+		ts := params.p.txn.OrigTimestamp()
+		sql = sql + " AS OF SYSTEM TIME " + ts.AsOfSystemTime()
+	}
 
-	fingerprintCols, err := params.p.queryRow(params.ctx, sql)
+	fingerprintCols, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRow(
+		params.ctx, "hash-fingerprint",
+		params.p.txn,
+		sql,
+	)
 	if err != nil {
 		return false, err
 	}
 
 	if len(fingerprintCols) != 1 {
-		return false, errors.Errorf("unexpected number of columns returned: 1 vs %d",
+		return false, pgerror.NewAssertionErrorf(
+			"unexpected number of columns returned: 1 vs %d",
 			len(fingerprintCols))
 	}
 	fingerprint := fingerprintCols[0]

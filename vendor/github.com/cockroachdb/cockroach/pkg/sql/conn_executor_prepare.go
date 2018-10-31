@@ -137,13 +137,17 @@ func (ex *connExecutor) addPreparedStmt(
 // prepare prepares the given statement.
 //
 // placeholderHints may contain partial type information for placeholders.
-// prepare will populate the missing types.
+// prepare will populate the missing types. It can be nil.
 //
 // The PreparedStatement is returned (or nil if there are no results). The
 // returned PreparedStatement needs to be close()d once its no longer in use.
 func (ex *connExecutor) prepare(
 	ctx context.Context, stmt Statement, placeholderHints tree.PlaceholderTypes,
 ) (*PreparedStatement, error) {
+	if placeholderHints == nil {
+		placeholderHints = make(tree.PlaceholderTypes)
+	}
+
 	prepared := &PreparedStatement{
 		TypeHints: placeholderHints,
 		memAcc:    ex.sessionMon.MakeBoundAccount(),
@@ -160,12 +164,19 @@ func (ex *connExecutor) prepare(
 	prepared.Statement = stmt.AST
 	prepared.AnonymizedStr = anonymizeStmt(stmt)
 
+	// Point to the prepared state, which can be further populated during query
+	// preparation.
+	stmt.Prepared = prepared
+
 	if err := placeholderHints.ProcessPlaceholderAnnotations(stmt.AST); err != nil {
 		return nil, err
 	}
 	// Preparing needs a transaction because it needs to retrieve db/table
 	// descriptors for type checking.
-	txn := client.NewTxn(ex.server.cfg.DB, ex.server.cfg.NodeID.Get(), client.RootTxn)
+	// TODO(andrei): Needing a transaction for preparing seems non-sensical, as
+	// the prepared statement outlives the txn. I hope that it's not used for
+	// anything other than getting a timestamp.
+	txn := client.NewTxn(ctx, ex.server.cfg.DB, ex.server.cfg.NodeID.Get(), client.RootTxn)
 
 	// Create a plan for the statement to figure out the typing, then close the
 	// plan.
@@ -181,12 +192,12 @@ func (ex *connExecutor) prepare(
 		p.extendedEvalCtx.ActiveMemAcc = &constantMemAcc
 		defer constantMemAcc.Close(ctx)
 
-		protoTS, err := isAsOf(stmt.AST, p.EvalContext(), ex.server.cfg.Clock.Now() /* max */)
+		protoTS, err := p.isAsOf(stmt.AST, ex.server.cfg.Clock.Now() /* max */)
 		if err != nil {
 			return err
 		}
 		if protoTS != nil {
-			p.asOfSystemTime = true
+			p.semaCtx.AsOfTimestamp = protoTS
 			// We can't use cached descriptors anywhere in this query, because
 			// we want the descriptors at the timestamp given, not the latest
 			// known to the cache.
@@ -194,9 +205,26 @@ func (ex *connExecutor) prepare(
 			txn.SetFixedTimestamp(ctx, *protoTS)
 		}
 
-		if err := p.prepare(ctx, stmt.AST); err != nil {
+		// PREPARE has a limited subset of statements it can be run with. Postgres
+		// only allows SELECT, INSERT, UPDATE, DELETE and VALUES statements to be
+		// prepared.
+		// See: https://www.postgresql.org/docs/current/static/sql-prepare.html
+		// However, we allow a large number of additional statements.
+		// As of right now, the optimizer only works on SELECT statements and will
+		// fallback for all others, so this should be safe for the foreseeable
+		// future.
+		if optimizerPlanned, err := p.optionallyUseOptimizer(ctx, ex.sessionData, stmt); err != nil {
 			return err
+		} else if !optimizerPlanned {
+			isCorrelated := p.curPlan.isCorrelated
+			log.VEventf(ctx, 1, "query is correlated: %v", isCorrelated)
+			// Fallback if the optimizer was not enabled or used.
+			if err := p.prepare(ctx, stmt.AST); err != nil {
+				enhanceErrWithCorrelation(err, isCorrelated)
+				return err
+			}
 		}
+
 		if p.curPlan.plan == nil {
 			// The statement cannot be prepared. Nothing to do.
 			return nil
@@ -212,19 +240,21 @@ func (ex *connExecutor) prepare(
 		prepared.Types = p.semaCtx.Placeholders.Types
 		return nil
 	}(); err != nil {
+		txn.CleanupOnError(ctx, err)
+		return nil, err
+	}
+	if err := txn.CommitOrCleanup(ctx); err != nil {
 		return nil, err
 	}
 
-	// Account for the memory used by this prepared statement: for now we are just
-	// counting the size of the query string (we'll account for the statement name
-	// at a higher layer). When we start storing the prepared query plan during
-	// prepare, this should be tallied up to the monitor as well.
-	if err := prepared.memAcc.Grow(ctx,
-		int64(len(prepared.Str)+int(unsafe.Sizeof(*prepared))),
-	); err != nil {
+	// Account for the memory used by this prepared statement:
+	//   1. Size of the query string and prepared struct.
+	//   2. Size of the prepared memo, if using the cost-based optimizer.
+	size := int64(len(prepared.Str) + int(unsafe.Sizeof(*prepared)))
+	size += prepared.Memo.MemoryEstimate()
+	if err := prepared.memAcc.Grow(ctx, size); err != nil {
 		return nil, err
 	}
-
 	return prepared, nil
 }
 
@@ -256,46 +286,68 @@ func (ex *connExecutor) execBind(
 	}
 
 	numQArgs := uint16(len(ps.InTypes))
-	qArgFormatCodes := bindCmd.ArgFormatCodes
 
-	// If a single code is specified, it is applied to all arguments.
-	if len(qArgFormatCodes) != 1 && len(qArgFormatCodes) != int(numQArgs) {
-		return retErr(pgwirebase.NewProtocolViolationErrorf(
-			"wrong number of format codes specified: %d for %d arguments",
-			len(qArgFormatCodes), numQArgs))
-	}
-	// If a single format code was specified, it applies to all the arguments.
-	if len(qArgFormatCodes) == 1 {
-		fmtCode := qArgFormatCodes[0]
-		qArgFormatCodes = make([]pgwirebase.FormatCode, numQArgs)
-		for i := range qArgFormatCodes {
-			qArgFormatCodes[i] = fmtCode
-		}
-	}
-
-	if len(bindCmd.Args) != int(numQArgs) {
-		return retErr(
-			pgwirebase.NewProtocolViolationErrorf(
-				"expected %d arguments, got %d", numQArgs, len(bindCmd.Args)))
-	}
+	// Decode the arguments, except for internal queries for which we just verify
+	// that the arguments match what's expected.
 	qargs := tree.QueryArguments{}
-	for i, arg := range bindCmd.Args {
-		k := strconv.Itoa(i + 1)
-		t := ps.InTypes[i]
-		if arg == nil {
-			// nil indicates a NULL argument value.
-			qargs[k] = tree.DNull
-		} else {
-			d, err := pgwirebase.DecodeOidDatum(t, qArgFormatCodes[i], arg)
-			if err != nil {
-				if _, ok := err.(*pgerror.Error); ok {
-					return retErr(err)
-				}
-				return retErr(pgwirebase.NewProtocolViolationErrorf(
-					"error in argument for $%d: %s", i+1, err.Error()))
-
+	if bindCmd.internalArgs != nil {
+		if len(bindCmd.internalArgs) != int(numQArgs) {
+			return retErr(
+				pgwirebase.NewProtocolViolationErrorf(
+					"expected %d arguments, got %d", numQArgs, len(bindCmd.internalArgs)))
+		}
+		for i, datum := range bindCmd.internalArgs {
+			t := ps.InTypes[i]
+			if oid := datum.ResolvedType().Oid(); datum != tree.DNull && oid != t {
+				return retErr(
+					pgwirebase.NewProtocolViolationErrorf(
+						"for argument %d expected OID %d, got %d", i, t, oid))
 			}
-			qargs[k] = d
+			k := strconv.Itoa(i + 1)
+			qargs[k] = datum
+		}
+	} else {
+		qArgFormatCodes := bindCmd.ArgFormatCodes
+
+		// If a single code is specified, it is applied to all arguments.
+		if len(qArgFormatCodes) != 1 && len(qArgFormatCodes) != int(numQArgs) {
+			return retErr(pgwirebase.NewProtocolViolationErrorf(
+				"wrong number of format codes specified: %d for %d arguments",
+				len(qArgFormatCodes), numQArgs))
+		}
+		// If a single format code was specified, it applies to all the arguments.
+		if len(qArgFormatCodes) == 1 {
+			fmtCode := qArgFormatCodes[0]
+			qArgFormatCodes = make([]pgwirebase.FormatCode, numQArgs)
+			for i := range qArgFormatCodes {
+				qArgFormatCodes[i] = fmtCode
+			}
+		}
+
+		if len(bindCmd.Args) != int(numQArgs) {
+			return retErr(
+				pgwirebase.NewProtocolViolationErrorf(
+					"expected %d arguments, got %d", numQArgs, len(bindCmd.Args)))
+		}
+
+		for i, arg := range bindCmd.Args {
+			k := strconv.Itoa(i + 1)
+			t := ps.InTypes[i]
+			if arg == nil {
+				// nil indicates a NULL argument value.
+				qargs[k] = tree.DNull
+			} else {
+				d, err := pgwirebase.DecodeOidDatum(t, qArgFormatCodes[i], arg)
+				if err != nil {
+					if _, ok := err.(*pgerror.Error); ok {
+						return retErr(err)
+					}
+					return retErr(pgwirebase.NewProtocolViolationErrorf(
+						"error in argument for $%d: %s", i+1, err.Error()))
+
+				}
+				qargs[k] = d
+			}
 		}
 	}
 

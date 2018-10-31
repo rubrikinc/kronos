@@ -17,23 +17,24 @@ package cockroach.roachpb;
 option go_package = "roachpb";
 
 import "roachpb/metadata.proto";
+import "storage/engine/enginepb/mvcc.proto";
 import "storage/engine/enginepb/mvcc3.proto";
 import "util/hlc/timestamp.proto";
 import "gogoproto/gogo.proto";
 
-// Span is supplied with every storage node request.
+// Span is a key range with an inclusive start Key and an exclusive end Key.
 message Span {
   option (gogoproto.equal) = true;
 
   option (gogoproto.goproto_stringer) = false;
   option (gogoproto.populate) = true;
 
-  // The key for request. If the request operates on a range, this
-  // represents the starting key for the range.
+  reserved 1, 2;
+  // The start key of the key range.
   bytes key = 3 [(gogoproto.casttype) = "Key"];
-  // The end key is empty if the request spans only a single key. Otherwise,
-  // it must order strictly after Key. In such a case, the header indicates
-  // that the operation takes place on the key range from Key to EndKey,
+  // The end key of the key range. The value is empty if the key range
+  // contains only a single key. Otherwise, it must order strictly after Key.
+  // In such a case, the Span encompasses the key range from Key to EndKey,
   // including Key and excluding EndKey.
   bytes end_key = 4 [(gogoproto.casttype) = "Key"];
 }
@@ -47,7 +48,7 @@ enum ValueType {
   // storage for various types. The DELIMITED_foo entries each represent a foo
   // variant that self-delimits length.
   UNKNOWN = 0;
-  NULL = 7;
+  reserved 7;
   INT = 1;
   FLOAT = 2;
   BYTES = 3;
@@ -132,6 +133,20 @@ message MergeTrigger {
 
   RangeDescriptor left_desc = 1 [(gogoproto.nullable) = false];
   RangeDescriptor right_desc = 2 [(gogoproto.nullable) = false];
+
+  reserved 3;
+
+  storage.engine.enginepb.MVCCStats right_mvcc_stats = 4 [
+    (gogoproto.customname) = "RightMVCCStats",
+    (gogoproto.nullable) = false
+  ];
+
+  // FreezeStart is a timestamp that is guaranteed to be greater than the
+  // timestamps at which any requests were serviced by the responding replica
+  // before it stopped responding to requests altogether (in anticipation of
+  // being subsumed). It is suitable for use as the timestamp cache's low water
+  // mark for the keys previously owned by the subsumed range.
+  util.hlc.Timestamp freeze_start = 5 [(gogoproto.nullable) = false];
 }
 
 // ReplicaChangeType is a parameter of ChangeReplicasTrigger.
@@ -146,6 +161,10 @@ message ChangeReplicasTrigger {
   option (gogoproto.equal) = true;
 
   option (gogoproto.goproto_stringer) = false;
+
+  // TODO(benesch): this trigger should just specify the updated descriptor,
+  // like the split and merge triggers, so that the receiver doesn't need to
+  // reconstruct the range descriptor update.
 
   ReplicaChangeType change_type = 1;
   // The replica being modified.
@@ -239,22 +258,22 @@ message Transaction {
   util.hlc.Timestamp last_heartbeat = 5 [(gogoproto.nullable) = false];
   // The original timestamp at which the transaction started. For serializable
   // transactions, if the timestamp drifts from the original timestamp, the
-  // transaction will retry.
+  // transaction will retry unless we manage to "refresh the reads" - see
+  // refreshed_timestamp.
   //
-  // This timestamp is the one at which all transactions will read. It is also,
-  // surprisingly, the timestamp at which transactions will provisionally
-  // _write_ (i.e. intents are written at this orig_timestamp and, after commit,
-  // when the intents are resolved, their timestamps are bumped to the to the
-  // commit timestamp).
+  // This timestamp is the one at which all transactions will read, unless
+  // refreshed_timestamp is set. It is also, surprisingly, the timestamp at
+  // which transactions will provisionally _write_ (i.e. intents are written at
+  // this orig_timestamp and, after commit, when the intents are resolved,
+  // their timestamps are bumped to the to the commit timestamp), if
+  // refreshed_timestamp isn't set.
   // This is ultimately because of correctness concerns around SNAPSHOT
-  // transactions.  Note first that for SERIALIZABLE transactions, the original
-  // and commit timestamps must not diverge, and so an intent which may be
-  // committed is always written when both timestamps coincide.
+  // transactions.
   //
-  // For a SNAPSHOT transaction however, this is not the case. Intuitively,
-  // one could think that the timestamp at which intents should be written
-  // should be the provisional commit timestamp, and while this is morally
-  // true, consider the following scenario, where txn1 is a SNAPSHOT txn:
+  // Intuitively, one could think that the timestamp at which intents should be
+  // written should be the provisional commit timestamp, and while this is
+  // morally true, consider the following scenario, where txn1 is a SNAPSHOT
+  // txn:
   //
   // - txn1 at orig_timestamp=5 reads key1: (value) 1.
   // - txn1 writes elsewhere, has its commit timestamp increased to 20.
@@ -267,7 +286,7 @@ message Transaction {
   // future of 5), and restarts.
   // Using instead its candidate commit timestamp, it wouldn't see a conflict
   // and commit, but this is not the expected outcome (the expected outcome is
-  // {key1: 6} (since txn2 is not expected to commit)) and we would be
+  // {key1: 6} (since txn1 is not expected to commit)) and we would be
   // experiencing the Lost Update Anomaly.
   //
   // Note that in practice, before restarting, txn1 would still lay down an
@@ -288,9 +307,11 @@ message Transaction {
   util.hlc.Timestamp max_timestamp = 7 [(gogoproto.nullable) = false];
   // The refreshed timestamp is the timestamp at which the transaction
   // can commit without necessitating a serializable restart. This
-  // value is forwarded to the transaction's current timestamp if the
-  // transaction coordinator is able to refresh all refreshable spans
-  // encountered during the course of the txn.
+  // value is forwarded to the transaction's current timestamp (meta.timestamp)
+  // if the transaction coordinator is able to refresh all refreshable spans
+  // encountered during the course of the txn. If set, this take precedence
+  // over orig_timestamp and is the timestamp at which the transaction both
+  // reads and writes going forward.
   util.hlc.Timestamp refreshed_timestamp = 15 [(gogoproto.nullable) = false];
   // A list of <NodeID, timestamp> pairs. The list maps NodeIDs to timestamps
   // as observed from their local clock during this transaction. The purpose of
@@ -333,12 +354,17 @@ message Transaction {
   // The list of observed timestamps is kept sorted by NodeID. Use
   // Transaction.UpdateObservedTimestamp to maintain the sorted order.
   repeated ObservedTimestamp observed_timestamps = 8 [(gogoproto.nullable) = false];
-  // Writing is true if the transaction has previously executed a successful
-  // write request, i.e. a request that may have left intents (across retries).
+  // Writing is true if the transaction has previously sent a Begin transaction
+  // (i.e. if it ever attempted to perform a write, so if it ever attempted to
+  // leave intents (across retries)). The flag will be set even if the BeginTxn
+  // batch failed.
+  // When set, the AbortCache must be checked by reads so that they don't miss
+  // to see the txn's previous writes.
   bool writing = 9;
   // If this is true, the transaction must retry. Relevant only for
   // SNAPSHOT transactions: a SERIALIZABLE transaction would have to
-  // retry anyway due to its commit timestamp having moved forward.
+  // retry anyway due to its commit timestamp having moved forward (whenever
+  // write_too_old is set, meta.Timestamp has been pushed above orig_timestamp).
   // This bool is set instead of immediately returning a txn retry
   // error so that intents can continue to be laid down, minimizing
   // work required on txn restart.
@@ -370,6 +396,18 @@ message Intent {
   Span span = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   storage.engine.enginepb.TxnMeta txn = 2 [(gogoproto.nullable) = false];
   TransactionStatus status = 3;
+}
+
+// A SequencedWrite is a point write to a key with a certain sequence number.
+//
+// TODO(nvanbenschoten/tschottdorf): This message type can be used as the
+// PromisedWrites repeated field in EndTransaction in the parallel commits
+// proposal (#24194).
+message SequencedWrite {
+  // The key that the write was made at.
+  bytes key = 1 [(gogoproto.casttype) = "Key"];
+  // The sequence number of the request that created the write.
+  int32 sequence = 2;
 }
 
 // Lease contains information about range leases including the
@@ -424,6 +462,7 @@ message Lease {
 // previously, this entry informs the transaction that it has aborted
 // and must start fresh with an updated priority.
 message AbortSpanEntry {
+  option (gogoproto.equal) = true;
   option (gogoproto.populate) = true;
 
   // The key of the associated transaction.
@@ -462,10 +501,20 @@ message TxnCoordMeta {
   // the transaction can continue.
   repeated Span refresh_reads = 4 [(gogoproto.nullable) = false];
   repeated Span refresh_writes = 5 [(gogoproto.nullable) = false];
-  // refresh_valid indicates that all spans encountered during the
-  // transaction which need refreshing have been collected to the
-  // refresh_reads and refresh_writes span slices. This is false if
-  // any spans were discarded or not collected (i.e. because of a dist
-  // SQL processor running a version before refreshing was introduced).
-  bool refresh_valid = 6;
+  // refresh_invalid indicates that spans were discarded or not collected
+  // (i.e. because of a dist SQL processor running a version before refreshing
+  // was introduced). This is false if all spans encountered during the
+  // transaction which need refreshing have been collected to the refresh_reads
+  // and refresh_writes span slices.
+  bool refresh_invalid = 7;
+  // deprecated_refresh_valid is the inverse of refresh_invalid. It was
+  // deprecated in favor of refresh_invalid in order to give the struct a useful
+  // zero value.
+  // TODO(nvanbenschoten): Can be removed in 2.2.
+  bool deprecated_refresh_valid = 6;
+  // outstanding_writes stores all writes that are outstanding and have
+  // not yet been resolved. Any client wishing to send a request that
+  // overlaps with them must chain on to their success using a QueryIntent
+  // request.
+  repeated SequencedWrite outstanding_writes = 8 [(gogoproto.nullable) = false];
 }

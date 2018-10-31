@@ -17,7 +17,6 @@ package storage
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -25,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/pkg/errors"
 	"golang.org/x/time/rate"
 )
@@ -36,6 +36,7 @@ type diskSideloadStorage struct {
 	limiter    *rate.Limiter
 	dir        string
 	dirCreated bool
+	eng        engine.Engine
 }
 
 func newDiskSideloadStorage(
@@ -44,6 +45,7 @@ func newDiskSideloadStorage(
 	replicaID roachpb.ReplicaID,
 	baseDir string,
 	limiter *rate.Limiter,
+	eng engine.Engine,
 ) (sideloadStorage, error) {
 	ss := &diskSideloadStorage{
 		dir: filepath.Join(
@@ -52,6 +54,7 @@ func newDiskSideloadStorage(
 			fmt.Sprintf("%d", rangeID%1000), // sharding
 			fmt.Sprintf("%d.%d", rangeID, replicaID),
 		),
+		eng:     eng,
 		st:      st,
 		limiter: limiter,
 	}
@@ -75,11 +78,13 @@ func (ss *diskSideloadStorage) Put(ctx context.Context, index, term uint64, cont
 	for {
 		// Use 0644 since that's what RocksDB uses:
 		// https://github.com/facebook/rocksdb/blob/56656e12d67d8a63f1e4c4214da9feeec2bd442b/env/env_posix.cc#L171
-		if err := writeFileSyncing(ctx, filename, contents, 0644, ss.st, ss.limiter); err == nil {
+		if err := writeFileSyncing(ctx, filename, contents, ss.eng, 0644, ss.st, ss.limiter); err == nil {
 			return nil
 		} else if !os.IsNotExist(err) {
 			return err
 		}
+		// createDir() ensures ss.dir exists but will not create any subdirectories
+		// within ss.dir because filename() does not make subdirectories in ss.dir.
 		if err := ss.createDir(); err != nil {
 			return err
 		}
@@ -89,7 +94,7 @@ func (ss *diskSideloadStorage) Put(ctx context.Context, index, term uint64, cont
 
 func (ss *diskSideloadStorage) Get(ctx context.Context, index, term uint64) ([]byte, error) {
 	filename := ss.filename(ctx, index, term)
-	b, err := ioutil.ReadFile(filename)
+	b, err := ss.eng.ReadFile(filename)
 	if os.IsNotExist(err) {
 		return nil, errSideloadedFileNotFound
 	}
@@ -109,7 +114,7 @@ func (ss *diskSideloadStorage) Purge(ctx context.Context, index, term uint64) er
 }
 
 func (ss *diskSideloadStorage) purgeFile(ctx context.Context, filename string) error {
-	if err := os.Remove(filename); err != nil {
+	if err := ss.eng.DeleteFile(filename); err != nil {
 		if os.IsNotExist(err) {
 			return errSideloadedFileNotFound
 		}
@@ -119,7 +124,7 @@ func (ss *diskSideloadStorage) purgeFile(ctx context.Context, filename string) e
 }
 
 func (ss *diskSideloadStorage) Clear(_ context.Context) error {
-	err := os.RemoveAll(ss.dir)
+	err := ss.eng.DeleteDirAndFiles(ss.dir)
 	ss.dirCreated = ss.dirCreated && err != nil
 	return err
 }

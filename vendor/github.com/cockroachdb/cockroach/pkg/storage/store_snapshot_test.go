@@ -26,7 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/coreos/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/raftpb"
+	"golang.org/x/time/rate"
 )
 
 func TestSnapshotRaftLogLimit(t *testing.T) {
@@ -44,7 +45,7 @@ func TestSnapshotRaftLogLimit(t *testing.T) {
 
 	var bytesWritten int64
 	blob := []byte(strings.Repeat("a", 1024*1024))
-	for i := 0; bytesWritten < 5*raftLogMaxSize; i++ {
+	for i := 0; bytesWritten < 5*store.cfg.RaftLogTruncationThreshold; i++ {
 		pArgs := putArgs(roachpb.Key("a"), blob)
 		_, pErr := client.SendWrappedWith(ctx, store, roachpb.Header{RangeID: 1}, &pArgs)
 		if pErr != nil {
@@ -63,6 +64,11 @@ func TestSnapshotRaftLogLimit(t *testing.T) {
 			snap := eng.NewSnapshot()
 			defer snap.Close()
 
+			ss := kvBatchSnapshotStrategy{
+				raftCfg:  &store.cfg.RaftConfig,
+				limiter:  rate.NewLimiter(1<<10, 1),
+				newBatch: eng.NewBatch,
+			}
 			iter := rditer.NewReplicaDataIterator(repl.Desc(), snap, true /* replicatedOnly */)
 			defer iter.Close()
 			outSnap := &OutgoingSnapshot{
@@ -76,27 +82,18 @@ func TestSnapshotRaftLogLimit(t *testing.T) {
 				},
 			}
 
-			stream := fakeSnapshotStream{
-				nextResp: &SnapshotResponse{
-					Status: SnapshotResponse_ACCEPTED,
-				},
-			}
+			var stream fakeSnapshotStream
 			header := SnapshotRequest_Header{
-				State:    repl.State().ReplicaState,
-				Priority: SnapshotRequest_RECOVERY,
+				State: repl.State().ReplicaState,
 			}
 
-			err = sendSnapshot(ctx, store.ClusterSettings(), stream, store.cfg.StorePool, header, outSnap,
-				eng.NewBatch, func() {})
+			err = ss.Send(ctx, stream, header, outSnap)
 			if snapType == snapTypePreemptive {
 				if !testutils.IsError(err, "aborting snapshot because raft log is too large") {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			} else {
-				// HACK: the release-2.0 version of the snapshot code is not
-				// well-factored for testing, so we just guarantee that we
-				// make it through to the end and get an "expected EOF" error.
-				if !testutils.IsError(err, "expected EOF") {
+				if err != nil {
 					t.Fatal(err)
 				}
 			}

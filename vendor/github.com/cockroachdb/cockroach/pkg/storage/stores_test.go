@@ -41,7 +41,9 @@ func newStores(ambientCtx log.AmbientContext, clock *hlc.Clock) *Stores {
 func TestStoresAddStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ls := newStores(log.AmbientContext{Tracer: tracing.NewTracer()}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
-	store := Store{}
+	store := Store{
+		Ident: &roachpb.StoreIdent{StoreID: 123},
+	}
 	ls.AddStore(&store)
 	if !ls.HasStore(store.Ident.StoreID) {
 		t.Errorf("expected local sender to contain storeID=%d", store.Ident.StoreID)
@@ -57,9 +59,9 @@ func TestStoresRemoveStore(t *testing.T) {
 
 	storeID := roachpb.StoreID(89)
 
-	ls.AddStore(&Store{Ident: roachpb.StoreIdent{StoreID: storeID}})
+	ls.AddStore(&Store{Ident: &roachpb.StoreIdent{StoreID: storeID}})
 
-	ls.RemoveStore(&Store{Ident: roachpb.StoreIdent{StoreID: storeID}})
+	ls.RemoveStore(&Store{Ident: &roachpb.StoreIdent{StoreID: storeID}})
 
 	if ls.HasStore(storeID) {
 		t.Errorf("expted local sender to remove storeID=%d", storeID)
@@ -75,7 +77,7 @@ func TestStoresGetStoreCount(t *testing.T) {
 
 	expectedCount := 10
 	for i := 0; i < expectedCount; i++ {
-		ls.AddStore(&Store{Ident: roachpb.StoreIdent{StoreID: roachpb.StoreID(i)}})
+		ls.AddStore(&Store{Ident: &roachpb.StoreIdent{StoreID: roachpb.StoreID(i)}})
 	}
 	if count := ls.GetStoreCount(); count != expectedCount {
 		t.Errorf("expected store count to be %d but was %d", expectedCount, count)
@@ -87,7 +89,7 @@ func TestStoresVisitStores(t *testing.T) {
 	ls := newStores(log.AmbientContext{Tracer: tracing.NewTracer()}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
 	numStores := 10
 	for i := 0; i < numStores; i++ {
-		ls.AddStore(&Store{Ident: roachpb.StoreIdent{StoreID: roachpb.StoreID(i)}})
+		ls.AddStore(&Store{Ident: &roachpb.StoreIdent{StoreID: roachpb.StoreID(i)}})
 	}
 
 	visit := make([]bool, numStores)
@@ -130,7 +132,9 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 		cfg.Transport = NewDummyRaftTransport(cfg.Settings)
 
 		store := NewStore(cfg, memEngine, &roachpb.NodeDescriptor{NodeID: 1})
-		store.Ident.StoreID = storeID
+		// Fake-set an ident. This is usually read from the engine on store.Start()
+		// which we're not even going to call.
+		store.Ident = &roachpb.StoreIdent{StoreID: storeID}
 		ls.AddStore(store)
 
 		desc := &roachpb.RangeDescriptor{
@@ -169,7 +173,7 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 	if replica2 != nil {
 		t.Fatalf("expected replica to be nil; was %v", replica2)
 	}
-	expectedError := roachpb.NewRangeNotFoundError(rangeID2)
+	expectedError := roachpb.NewRangeNotFoundError(rangeID2, 0)
 	if err2.Error() != expectedError.Error() {
 		t.Fatalf("expected err to be %v; was %v", expectedError, err2)
 	}
@@ -178,7 +182,7 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 func TestStoresGetStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ls := newStores(log.AmbientContext{Tracer: tracing.NewTracer()}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
-	store := Store{}
+	store := Store{Ident: &roachpb.StoreIdent{StoreID: 1}}
 	replica := roachpb.ReplicaDescriptor{StoreID: store.Ident.StoreID}
 	s, pErr := ls.GetStore(replica.StoreID)
 	if s != nil || pErr == nil {
@@ -194,103 +198,6 @@ func TestStoresGetStore(t *testing.T) {
 			s.Ident.StoreID, store.Ident.StoreID)
 	} else if pErr != nil {
 		t.Errorf("expected no error, instead had err=%s", pErr)
-	}
-}
-
-func TestStoresLookupReplica(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
-	cfg := TestStoreConfig(nil)
-	ls := newStores(log.AmbientContext{Tracer: tracing.NewTracer()}, cfg.Clock)
-
-	// Create two new stores with ranges we care about.
-	var e [2]engine.Engine
-	var s [2]*Store
-	var d [2]*roachpb.RangeDescriptor
-	ranges := []struct {
-		storeID    roachpb.StoreID
-		start, end roachpb.RKey
-	}{
-		{2, roachpb.RKeyMin, roachpb.RKey("c")},
-		{3, roachpb.RKey("x"), roachpb.RKey("z")},
-	}
-	for i, rng := range ranges {
-		e[i] = engine.NewInMem(roachpb.Attributes{}, 1<<20)
-		stopper.AddCloser(e[i])
-		cfg.Transport = NewDummyRaftTransport(cfg.Settings)
-		s[i] = NewStore(cfg, e[i], &roachpb.NodeDescriptor{NodeID: 1})
-		s[i].Ident.StoreID = rng.storeID
-
-		d[i] = &roachpb.RangeDescriptor{
-			RangeID:  roachpb.RangeID(i),
-			StartKey: rng.start,
-			EndKey:   rng.end,
-			Replicas: []roachpb.ReplicaDescriptor{{StoreID: rng.storeID}},
-		}
-		newRng, err := NewReplica(d[i], s[i], 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := s[i].AddReplica(newRng); err != nil {
-			t.Error(err)
-		}
-		ls.AddStore(s[i])
-	}
-
-	testCases := []struct {
-		start, end roachpb.RKey
-		expStoreID roachpb.StoreID
-		expError   string
-	}{
-		{
-			start:      roachpb.RKey("a"),
-			end:        roachpb.RKey("c"),
-			expStoreID: s[0].Ident.StoreID,
-		},
-		{
-			start:      roachpb.RKey("b"),
-			end:        nil,
-			expStoreID: s[0].Ident.StoreID,
-		},
-		{
-			start:    roachpb.RKey("b"),
-			end:      roachpb.RKey("d"),
-			expError: "outside of bounds of range",
-		},
-		{
-			start:      roachpb.RKey("x"),
-			end:        roachpb.RKey("z"),
-			expStoreID: s[1].Ident.StoreID,
-		},
-		{
-			start:      roachpb.RKey("y"),
-			end:        nil,
-			expStoreID: s[1].Ident.StoreID,
-		},
-		{
-			start:    roachpb.RKey("z1"),
-			end:      roachpb.RKey("z2"),
-			expError: "r0 was not found",
-		},
-	}
-	for testIdx, tc := range testCases {
-		_, r, err := ls.LookupReplica(tc.start, tc.end)
-		if tc.expError != "" {
-			if !testutils.IsError(err, tc.expError) {
-				t.Errorf("%d: got error %v (expected %s)", testIdx, err, tc.expError)
-			}
-		} else if err != nil {
-			t.Errorf("%d: %s", testIdx, err)
-		} else if r.StoreID != tc.expStoreID {
-			t.Errorf("%d: expected store %d; got %d", testIdx, tc.expStoreID, r.StoreID)
-		}
-	}
-
-	if desc, err := ls.FirstRange(); err != nil {
-		t.Error(err)
-	} else if !reflect.DeepEqual(desc, d[0]) {
-		t.Fatalf("expected first range %+v; got %+v", desc, d[0])
 	}
 }
 
@@ -311,7 +218,7 @@ func createStores(count int, t *testing.T) (*hlc.ManualClock, []*Store, *Stores,
 		stopper.AddCloser(eng)
 		s := NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 		storeIDAlloc++
-		s.Ident.StoreID = storeIDAlloc
+		s.Ident = &roachpb.StoreIdent{StoreID: storeIDAlloc}
 		stores = append(stores, s)
 	}
 

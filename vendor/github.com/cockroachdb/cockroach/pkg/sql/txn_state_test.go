@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+
 	// We dot-import fsm to use common names such as fsm.True/False.
 	. "github.com/cockroachdb/cockroach/pkg/util/fsm"
 )
@@ -56,18 +58,18 @@ type testContext struct {
 func makeTestContext() testContext {
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
-	factory := client.TxnSenderFactoryFunc(func(client.TxnType) client.TxnSender {
-		return client.TxnSenderFunc(
-			func(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-				return nil, nil
-			},
-		)
-	})
+	factory := client.MakeMockTxnSenderFactory(
+		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
+		) (*roachpb.BatchResponse, *roachpb.Error) {
+			return nil, nil
+		})
+
 	settings := cluster.MakeTestingClusterSettings()
+	ambient := testutils.MakeAmbientCtx()
 	return testContext{
 		manualClock: manual,
 		clock:       clock,
-		mockDB:      client.NewDB(factory, clock),
+		mockDB:      client.NewDB(ambient, factory, clock),
 		mon: mon.MakeMonitor(
 			"test root mon",
 			mon.MemoryResource,
@@ -77,7 +79,7 @@ func makeTestContext() testContext {
 			1000, /* noteworthy */
 			settings,
 		),
-		tracer:   tracing.NewTracer(),
+		tracer:   ambient.Tracer,
 		ctx:      context.TODO(),
 		settings: settings,
 	}
@@ -94,7 +96,7 @@ const (
 // createOpenState returns a txnState initialized with an open txn.
 func (tc *testContext) createOpenState(
 	typ txnType, retryIntentOpt retryIntentEnum,
-) (State, *txnState2) {
+) (State, *txnState) {
 	if retryIntentOpt == retryIntentUnknown {
 		log.Fatalf(context.TODO(), "retryIntentOpt not specified")
 	}
@@ -113,7 +115,7 @@ func (tc *testContext) createOpenState(
 	)
 	txnStateMon.Start(tc.ctx, &tc.mon, mon.BoundAccount{})
 
-	ts := txnState2{
+	ts := txnState{
 		Ctx:           ctx,
 		connCtx:       tc.ctx,
 		sp:            sp,
@@ -124,7 +126,7 @@ func (tc *testContext) createOpenState(
 		mon:           &txnStateMon,
 		txnAbortCount: metric.NewCounter(MetaTxnAbort),
 	}
-	ts.mu.txn = client.NewTxn(tc.mockDB, roachpb.NodeID(1) /* gatewayNodeID */, client.RootTxn)
+	ts.mu.txn = client.NewTxn(ctx, tc.mockDB, roachpb.NodeID(1) /* gatewayNodeID */, client.RootTxn)
 
 	state := stateOpen{
 		ImplicitTxn: FromBool(typ == implicitTxn),
@@ -134,14 +136,14 @@ func (tc *testContext) createOpenState(
 }
 
 // createAbortedState returns a txnState initialized with an aborted txn.
-func (tc *testContext) createAbortedState(retryIntentOpt retryIntentEnum) (State, *txnState2) {
+func (tc *testContext) createAbortedState(retryIntentOpt retryIntentEnum) (State, *txnState) {
 	_, ts := tc.createOpenState(explicitTxn, retryIntentOpt)
 	ts.mu.txn.CleanupOnError(ts.Ctx, errors.Errorf("dummy error"))
 	s := stateAborted{RetryIntent: FromBool(retryIntentOpt == retryIntentSet)}
 	return s, ts
 }
 
-func (tc *testContext) createRestartWaitState() (State, *txnState2) {
+func (tc *testContext) createRestartWaitState() (State, *txnState) {
 	_, ts := tc.createOpenState(
 		explicitTxn,
 		// retryIntent must had been set in order for the state to advance to
@@ -151,7 +153,7 @@ func (tc *testContext) createRestartWaitState() (State, *txnState2) {
 	return s, ts
 }
 
-func (tc *testContext) createCommitWaitState() (State, *txnState2, error) {
+func (tc *testContext) createCommitWaitState() (State, *txnState, error) {
 	_, ts := tc.createOpenState(explicitTxn, retryIntentSet)
 	// Commit the KV txn, simulating what the execution layer is doing.
 	if err := ts.mu.txn.Commit(ts.Ctx); err != nil {
@@ -161,7 +163,7 @@ func (tc *testContext) createCommitWaitState() (State, *txnState2, error) {
 	return s, ts, nil
 }
 
-func (tc *testContext) createNoTxnState() (State, *txnState2) {
+func (tc *testContext) createNoTxnState() (State, *txnState) {
 	txnStateMon := mon.MakeMonitor("test mon",
 		mon.MemoryResource,
 		nil,  /* curCount */
@@ -170,7 +172,7 @@ func (tc *testContext) createNoTxnState() (State, *txnState2) {
 		1000, /* noteworthy */
 		cluster.MakeTestingClusterSettings(),
 	)
-	ts := txnState2{mon: &txnStateMon, connCtx: tc.ctx}
+	ts := txnState{mon: &txnStateMon, connCtx: tc.ctx}
 	return stateNoTxn{}, &ts
 }
 
@@ -207,7 +209,6 @@ type expKVTxn struct {
 	tsNanos     *int64
 	origTSNanos *int64
 	maxTSNanos  *int64
-	isFinalized *bool
 }
 
 func checkTxn(txn *client.Txn, exp expKVTxn) error {
@@ -226,21 +227,19 @@ func checkTxn(txn *client.Txn, exp expKVTxn) error {
 		return errors.Errorf("expected UserPriority: %s, but got: %s",
 			*exp.userPriority, txn.UserPriority())
 	}
-	if exp.tsNanos != nil && *exp.tsNanos != txn.Proto().Timestamp.WallTime {
+	proto := txn.Serialize()
+	if exp.tsNanos != nil && *exp.tsNanos != proto.Timestamp.WallTime {
 		return errors.Errorf("expected Timestamp: %d, but got: %s",
-			*exp.tsNanos, txn.Proto().Timestamp)
+			*exp.tsNanos, proto.Timestamp)
 	}
 	if origTimestamp := txn.OrigTimestamp(); exp.origTSNanos != nil &&
 		*exp.origTSNanos != origTimestamp.WallTime {
 		return errors.Errorf("expected OrigTimestamp: %d, but got: %s",
 			*exp.origTSNanos, origTimestamp)
 	}
-	if exp.maxTSNanos != nil && *exp.maxTSNanos != txn.Proto().MaxTimestamp.WallTime {
+	if exp.maxTSNanos != nil && *exp.maxTSNanos != proto.MaxTimestamp.WallTime {
 		return errors.Errorf("expected MaxTimestamp: %d, but got: %s",
-			*exp.maxTSNanos, txn.Proto().MaxTimestamp)
-	}
-	if exp.isFinalized != nil && *exp.isFinalized != txn.IsFinalized() {
-		return errors.Errorf("expected finalized: %t but wasn't", *exp.isFinalized)
+			*exp.maxTSNanos, proto.MaxTimestamp)
 	}
 	return nil
 }
@@ -271,15 +270,13 @@ func TestTransitions(t *testing.T) {
 	iso := enginepb.SERIALIZABLE
 	pri := roachpb.NormalUserPriority
 	maxTS := testCon.clock.Now().Add(testCon.clock.MaxOffset().Nanoseconds(), 0 /* logical */)
-	varTrue := true
-	varFalse := false
 	type test struct {
 		name string
 
 		// A function used to init the txnState to the desired state before the
 		// transition. The returned State and txnState are to be used to initialize
 		// a Machine.
-		init func() (State, *txnState2, error)
+		init func() (State, *txnState, error)
 
 		// The event to deliver to the state machine.
 		ev Event
@@ -287,7 +284,7 @@ func TestTransitions(t *testing.T) {
 		evPayload EventPayload
 		// evFun, if specified, replaces ev and allows a test to create an event
 		// that depends on the transactionState.
-		evFun func(ts *txnState2) (Event, EventPayload)
+		evFun func(ts *txnState) (Event, EventPayload)
 
 		// The expected state of the fsm after the transition.
 		expState State
@@ -306,7 +303,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// Start an implicit txn from NoTxn.
 			name: "NoTxn->Starting (implicit txn)",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createNoTxnState()
 				return s, ts, nil
 			},
@@ -326,13 +323,12 @@ func TestTransitions(t *testing.T) {
 				tsNanos:      &now.WallTime,
 				origTSNanos:  &now.WallTime,
 				maxTSNanos:   &maxTS.WallTime,
-				isFinalized:  &varFalse,
 			},
 		},
 		{
 			// Start an explicit txn from NoTxn.
 			name: "NoTxn->Starting (explicit txn)",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createNoTxnState()
 				return s, ts, nil
 			},
@@ -350,7 +346,6 @@ func TestTransitions(t *testing.T) {
 				tsNanos:      &now.WallTime,
 				origTSNanos:  &now.WallTime,
 				maxTSNanos:   &maxTS.WallTime,
-				isFinalized:  &varFalse,
 			},
 		},
 		//
@@ -359,7 +354,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// Set the retry intent.
 			name: "Open->Open + retry intent",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentNotSet)
 				return s, ts, nil
 			},
@@ -373,7 +368,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// Finish an implicit txn.
 			name: "Open (implicit) -> NoTxn",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(implicitTxn, retryIntentNotSet)
 				// We commit the KV transaction, as that's done by the layer below
 				// txnState.
@@ -394,7 +389,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// Finish an explicit txn.
 			name: "Open (explicit) -> NoTxn",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentNotSet)
 				// We commit the KV transaction, as that's done by the layer below
 				// txnState.
@@ -415,16 +410,16 @@ func TestTransitions(t *testing.T) {
 		{
 			// Get a retriable error while we can auto-retry.
 			name: "Open + auto-retry",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentNotSet)
 				return s, ts, nil
 			},
-			evFun: func(ts *txnState2) (Event, EventPayload) {
+			evFun: func(ts *txnState) (Event, EventPayload) {
 				b := eventRetriableErrPayload{
 					err: roachpb.NewHandledRetryableTxnError(
 						"test retriable err",
 						ts.mu.txn.ID(),
-						*ts.mu.txn.Proto()),
+						*ts.mu.txn.Serialize()),
 					rewCap: dummyRewCap,
 				}
 				return eventRetriableErr{CanAutoRetry: True, IsCommit: False}, b
@@ -435,25 +430,23 @@ func TestTransitions(t *testing.T) {
 				expEv:   txnRestart,
 			},
 			// Expect non-nil txn.
-			expTxn: &expKVTxn{
-				isFinalized: &varFalse,
-			},
+			expTxn: &expKVTxn{},
 		},
 		{
 			// Like the above test - get a retriable error while we can auto-retry,
 			// except this time the error is on a COMMIT. This shouldn't make any
 			// difference; we should still auto-retry like the above.
 			name: "Open + auto-retry (COMMIT)",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentNotSet)
 				return s, ts, nil
 			},
-			evFun: func(ts *txnState2) (Event, EventPayload) {
+			evFun: func(ts *txnState) (Event, EventPayload) {
 				b := eventRetriableErrPayload{
 					err: roachpb.NewHandledRetryableTxnError(
 						"test retriable err",
 						ts.mu.txn.ID(),
-						*ts.mu.txn.Proto()),
+						*ts.mu.txn.Serialize()),
 					rewCap: dummyRewCap,
 				}
 				return eventRetriableErr{CanAutoRetry: True, IsCommit: True}, b
@@ -464,24 +457,22 @@ func TestTransitions(t *testing.T) {
 				expEv:   txnRestart,
 			},
 			// Expect non-nil txn.
-			expTxn: &expKVTxn{
-				isFinalized: &varFalse,
-			},
+			expTxn: &expKVTxn{},
 		},
 		{
 			// Get a retriable error when we can no longer auto-retry, but the client
 			// is doing client-side retries.
 			name: "Open + client retry",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentSet)
 				return s, ts, nil
 			},
-			evFun: func(ts *txnState2) (Event, EventPayload) {
+			evFun: func(ts *txnState) (Event, EventPayload) {
 				b := eventRetriableErrPayload{
 					err: roachpb.NewHandledRetryableTxnError(
 						"test retriable err",
 						ts.mu.txn.ID(),
-						*ts.mu.txn.Proto()),
+						*ts.mu.txn.Serialize()),
 					rewCap: rewindCapability{},
 				}
 				return eventRetriableErr{CanAutoRetry: False, IsCommit: False}, b
@@ -492,9 +483,7 @@ func TestTransitions(t *testing.T) {
 				expEv:   txnRestart,
 			},
 			// Expect non-nil txn.
-			expTxn: &expKVTxn{
-				isFinalized: &varFalse,
-			},
+			expTxn: &expKVTxn{},
 		},
 		{
 			// Like the above (a retriable error when we can no longer auto-retry, but
@@ -504,16 +493,16 @@ func TestTransitions(t *testing.T) {
 			// done a RELEASE such that COMMIT couldn't get retriable errors), and so
 			// we can't go to RestartWait.
 			name: "Open + client retry + error on COMMIT",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentSet)
 				return s, ts, nil
 			},
-			evFun: func(ts *txnState2) (Event, EventPayload) {
+			evFun: func(ts *txnState) (Event, EventPayload) {
 				b := eventRetriableErrPayload{
 					err: roachpb.NewHandledRetryableTxnError(
 						"test retriable err",
 						ts.mu.txn.ID(),
-						*ts.mu.txn.Proto()),
+						*ts.mu.txn.Serialize()),
 					rewCap: rewindCapability{},
 				}
 				return eventRetriableErr{CanAutoRetry: False, IsCommit: True}, b
@@ -529,7 +518,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// An error on COMMIT leaves us in NoTxn, not in Aborted.
 			name: "Open + non-retriable error on COMMIT",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentSet)
 				return s, ts, nil
 			},
@@ -547,16 +536,16 @@ func TestTransitions(t *testing.T) {
 			// We get a retriable error, but we can't auto-retry and the client is not
 			// doing client-directed retries.
 			name: "Open + useless retriable error (explicit)",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentNotSet)
 				return s, ts, nil
 			},
-			evFun: func(ts *txnState2) (Event, EventPayload) {
+			evFun: func(ts *txnState) (Event, EventPayload) {
 				b := eventRetriableErrPayload{
 					err: roachpb.NewHandledRetryableTxnError(
 						"test retriable err",
 						ts.mu.txn.ID(),
-						*ts.mu.txn.Proto()),
+						*ts.mu.txn.Serialize()),
 					rewCap: rewindCapability{},
 				}
 				return eventRetriableErr{CanAutoRetry: False, IsCommit: False}, b
@@ -566,24 +555,22 @@ func TestTransitions(t *testing.T) {
 				expCode: skipBatch,
 				expEv:   txnAborted,
 			},
-			expTxn: &expKVTxn{
-				isFinalized: &varTrue,
-			},
+			expTxn: &expKVTxn{},
 		},
 		{
 			// Like the above, but this time with an implicit txn: we get a retriable
 			// error, but we can't auto-retry. We expect to go to NoTxn.
 			name: "Open + useless retriable error (implicit)",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(implicitTxn, retryIntentNotSet)
 				return s, ts, nil
 			},
-			evFun: func(ts *txnState2) (Event, EventPayload) {
+			evFun: func(ts *txnState) (Event, EventPayload) {
 				b := eventRetriableErrPayload{
 					err: roachpb.NewHandledRetryableTxnError(
 						"test retriable err",
 						ts.mu.txn.ID(),
-						*ts.mu.txn.Proto()),
+						*ts.mu.txn.Serialize()),
 					rewCap: rewindCapability{},
 				}
 				return eventRetriableErr{CanAutoRetry: False, IsCommit: False}, b
@@ -599,7 +586,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// We get a non-retriable error.
 			name: "Open + non-retriable error",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentNotSet)
 				return s, ts, nil
 			},
@@ -610,14 +597,12 @@ func TestTransitions(t *testing.T) {
 				expCode: skipBatch,
 				expEv:   txnAborted,
 			},
-			expTxn: &expKVTxn{
-				isFinalized: &varTrue,
-			},
+			expTxn: &expKVTxn{},
 		},
 		{
 			// We go to CommitWait (after a RELEASE SAVEPOINT).
 			name: "Open->CommitWait",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentSet)
 				// Simulate what execution does before generating this event.
 				err := ts.mu.txn.Commit(ts.Ctx)
@@ -629,14 +614,12 @@ func TestTransitions(t *testing.T) {
 				expCode: advanceOne,
 				expEv:   txnCommit,
 			},
-			expTxn: &expKVTxn{
-				isFinalized: &varTrue,
-			},
+			expTxn: &expKVTxn{},
 		},
 		{
 			// Restarting from Open via ROLLBACK TO SAVEPOINT.
 			name: "Open + restart",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createOpenState(explicitTxn, retryIntentSet)
 				return s, ts, nil
 			},
@@ -656,7 +639,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// The txn finished, such as after a ROLLBACK.
 			name: "Aborted->NoTxn",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createAbortedState(retryIntentNotSet)
 				return s, ts, nil
 			},
@@ -672,7 +655,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// The txn is starting again (e.g. ROLLBACK TO SAVEPOINT while in Aborted).
 			name: "Aborted->Starting",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createAbortedState(retryIntentSet)
 				return s, ts, nil
 			},
@@ -683,9 +666,7 @@ func TestTransitions(t *testing.T) {
 				expCode: advanceOne,
 				expEv:   noEvent,
 			},
-			expTxn: &expKVTxn{
-				isFinalized: &varFalse,
-			},
+			expTxn: &expKVTxn{},
 		},
 		//
 		// Tests starting from the RestartWait state.
@@ -693,7 +674,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// The txn got finished, such as after a ROLLBACK.
 			name: "RestartWait->NoTxn",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createRestartWaitState()
 				err := ts.mu.txn.Rollback(ts.Ctx)
 				return s, ts, err
@@ -710,7 +691,7 @@ func TestTransitions(t *testing.T) {
 		{
 			// The txn got restarted, through a ROLLBACK TO SAVEPOINT.
 			name: "RestartWait->Open",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createRestartWaitState()
 				return s, ts, nil
 			},
@@ -724,7 +705,7 @@ func TestTransitions(t *testing.T) {
 		},
 		{
 			name: "RestartWait->Aborted",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				s, ts := testCon.createRestartWaitState()
 				return s, ts, nil
 			},
@@ -742,7 +723,7 @@ func TestTransitions(t *testing.T) {
 		//
 		{
 			name: "CommitWait->NoTxn",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				return testCon.createCommitWaitState()
 			},
 			ev:        eventTxnFinish{},
@@ -756,7 +737,7 @@ func TestTransitions(t *testing.T) {
 		},
 		{
 			name: "CommitWait + err",
-			init: func() (State, *txnState2, error) {
+			init: func() (State, *txnState, error) {
 				return testCon.createCommitWaitState()
 			},
 			ev:        eventNonRetriableErr{IsCommit: False},
@@ -765,9 +746,7 @@ func TestTransitions(t *testing.T) {
 			expAdv: expAdvance{
 				expCode: skipBatch,
 			},
-			expTxn: &expKVTxn{
-				isFinalized: &varTrue,
-			},
+			expTxn: &expKVTxn{},
 		},
 	}
 

@@ -16,13 +16,14 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -73,7 +74,7 @@ type planMaker interface {
 var _ planMaker = &planner{}
 
 // runParams is a struct containing all parameters passed to planNode.Next() and
-// planNode.Start().
+// startPlan.
 type runParams struct {
 	// context.Context for this method call.
 	ctx context.Context
@@ -158,27 +159,26 @@ type planNodeFastPath interface {
 }
 
 var _ planNode = &alterIndexNode{}
-var _ planNode = &alterTableNode{}
 var _ planNode = &alterSequenceNode{}
+var _ planNode = &alterTableNode{}
 var _ planNode = &createDatabaseNode{}
 var _ planNode = &createIndexNode{}
-var _ planNode = &createTableNode{}
-var _ planNode = &createViewNode{}
 var _ planNode = &createSequenceNode{}
 var _ planNode = &createStatsNode{}
+var _ planNode = &createTableNode{}
+var _ planNode = &CreateUserNode{}
+var _ planNode = &createViewNode{}
 var _ planNode = &delayedNode{}
 var _ planNode = &deleteNode{}
 var _ planNode = &distinctNode{}
 var _ planNode = &dropDatabaseNode{}
 var _ planNode = &dropIndexNode{}
-var _ planNode = &dropTableNode{}
-var _ planNode = &dropViewNode{}
 var _ planNode = &dropSequenceNode{}
-var _ planNode = &zeroNode{}
-var _ planNode = &unaryNode{}
+var _ planNode = &dropTableNode{}
+var _ planNode = &DropUserNode{}
+var _ planNode = &dropViewNode{}
 var _ planNode = &explainDistSQLNode{}
 var _ planNode = &explainPlanNode{}
-var _ planNode = &showTraceNode{}
 var _ planNode = &filterNode{}
 var _ planNode = &groupNode{}
 var _ planNode = &hookFnNode{}
@@ -187,30 +187,40 @@ var _ planNode = &insertNode{}
 var _ planNode = &joinNode{}
 var _ planNode = &limitNode{}
 var _ planNode = &ordinalityNode{}
-var _ planNode = &testingRelocateNode{}
+var _ planNode = &projectSetNode{}
+var _ planNode = &relocateNode{}
+var _ planNode = &renameColumnNode{}
+var _ planNode = &renameDatabaseNode{}
+var _ planNode = &renameIndexNode{}
+var _ planNode = &renameTableNode{}
 var _ planNode = &renderNode{}
+var _ planNode = &rowCountNode{}
 var _ planNode = &scanNode{}
 var _ planNode = &scatterNode{}
-var _ planNode = &showRangesNode{}
+var _ planNode = &serializeNode{}
 var _ planNode = &showFingerprintsNode{}
+var _ planNode = &showRangesNode{}
+var _ planNode = &showTraceNode{}
 var _ planNode = &sortNode{}
 var _ planNode = &splitNode{}
+var _ planNode = &truncateNode{}
+var _ planNode = &unaryNode{}
 var _ planNode = &unionNode{}
 var _ planNode = &updateNode{}
 var _ planNode = &upsertNode{}
-var _ planNode = &valueGenerator{}
 var _ planNode = &valuesNode{}
 var _ planNode = &windowNode{}
-var _ planNode = &CreateUserNode{}
-var _ planNode = &DropUserNode{}
+var _ planNode = &zeroNode{}
 
 var _ planNodeFastPath = &CreateUserNode{}
 var _ planNodeFastPath = &DropUserNode{}
 var _ planNodeFastPath = &alterUserSetPasswordNode{}
 var _ planNodeFastPath = &createTableNode{}
 var _ planNodeFastPath = &deleteNode{}
+var _ planNodeFastPath = &rowCountNode{}
+var _ planNodeFastPath = &serializeNode{}
 var _ planNodeFastPath = &setZoneConfigNode{}
-var _ planNodeFastPath = &upsertNode{}
+var _ planNodeFastPath = &controlJobsNode{}
 
 // planNodeRequireSpool serves as marker for nodes whose parent must
 // ensure that the node is fully run to completion (and the results
@@ -220,9 +230,7 @@ type planNodeRequireSpool interface {
 	requireSpool()
 }
 
-var _ planNodeRequireSpool = &insertNode{}
-var _ planNodeRequireSpool = &deleteNode{}
-var _ planNodeRequireSpool = &updateNode{}
+var _ planNodeRequireSpool = &serializeNode{}
 
 // planNodeSpool serves as marker for nodes that can perform all their
 // execution during the start phase. This is different from the "fast
@@ -237,7 +245,6 @@ type planNodeSpooled interface {
 	spooled()
 }
 
-var _ planNodeSpooled = &upsertNode{}
 var _ planNodeSpooled = &spoolNode{}
 
 // planTop is the struct that collects the properties
@@ -269,11 +276,12 @@ type planTop struct {
 	// #10028 is addressed.
 	hasStar bool
 
+	// isCorrelated collects whether the query was found to be correlated.
+	// Used to produce better error messages.
+	isCorrelated bool
+
 	// subqueryPlans contains all the sub-query plans.
 	subqueryPlans []subquery
-
-	// plannedExecute is true if this planner has planned an EXECUTE statement.
-	plannedExecute bool
 
 	// auditEvents becomes non-nil if any of the descriptors used by
 	// current statement is causing an auditing event. See exec_log.go.
@@ -291,6 +299,8 @@ type planTop struct {
 func (p *planner) makePlan(ctx context.Context, stmt Statement) error {
 	// Reinitialize.
 	p.curPlan = planTop{AST: stmt.AST}
+
+	log.VEvent(ctx, 1, "heuristic planner starts")
 
 	var err error
 	p.curPlan.plan, err = p.newPlan(ctx, stmt.AST, nil /*desiredTypes*/)
@@ -319,12 +329,16 @@ func (p *planner) makePlan(ctx context.Context, stmt Statement) error {
 		return err
 	}
 
+	log.VEvent(ctx, 1, "heuristic planner optimizes plan")
+
 	needed := allColumns(p.curPlan.plan)
 	p.curPlan.plan, err = p.optimizePlan(ctx, p.curPlan.plan, needed)
 	if err != nil {
 		p.curPlan.close(ctx)
 		return err
 	}
+
+	log.VEvent(ctx, 1, "heuristic planner optimizes subqueries")
 
 	// Now do the same work for all sub-queries.
 	for i := range p.curPlan.subqueryPlans {
@@ -342,27 +356,143 @@ func (p *planner) makePlan(ctx context.Context, stmt Statement) error {
 	return nil
 }
 
-// makeOptimizerPlan is an alternative to makePlan which uses the (experimental)
+// makeOptimizerPlan is an alternative to makePlan which uses the cost-based
 // optimizer.
 func (p *planner) makeOptimizerPlan(ctx context.Context, stmt Statement) error {
-	// execEngine is both an exec.Factory and an optbase.Catalog.
-	eng := &execEngine{
-		planner: p,
+	// Ensure that p.curPlan is populated in case an error occurs early,
+	// so that maybeLogStatement in the error case does not find an empty AST.
+	p.curPlan = planTop{AST: stmt.AST}
+
+	// Start with fast check to see if top-level statement is supported.
+	switch stmt.AST.(type) {
+	case *tree.ParenSelect, *tree.Select, *tree.SelectClause,
+		*tree.UnionClause, *tree.ValuesClause, *tree.Explain:
+
+	default:
+		return pgerror.Unimplemented("statement", fmt.Sprintf("unsupported statement: %T", stmt.AST))
 	}
 
-	o := xform.NewOptimizer(eng, xform.OptimizeAll)
-	root, props, err := optbuilder.New(ctx, o.Factory(), stmt.AST).Build()
+	var catalog optCatalog
+	catalog.init(p.execCfg.TableStatsCache, p)
+
+	p.optimizer.Init(p.EvalContext())
+	f := p.optimizer.Factory()
+
+	// If the statement includes a PreparedStatement, then separate planning into
+	// two distinct phases:
+	//
+	//   PREPARE - Build the Memo (optbuild) and apply normalization rules to it.
+	//             If the query contains placeholders, values are not assigned
+	//             during this phase, as that only happens during the EXECUTE
+	//             phase. If the query does not contain placeholders, then also
+	//             apply exploration rules to the Memo so that there's even less
+	//             to do during the EXECUTE phase.
+	//
+	//   EXECUTE - Before the query can be executed, first any placeholders must
+	//             be assigned values. This can trigger additional normalization
+	//             rules, such as with this example:
+	//
+	//               SELECT * FROM abc WHERE b = $1 - 5
+	//
+	//             Without folding the Sub expression, any index on the "b" column
+	//             won't be found. This also means that after placeholders are
+	//             assigned, exploration rules must be applied (vs. applying them
+	//             during PREPARE when there are no placeholders).
+	//
+	//             Whether there were placeholders or not, after exploration the
+	//             plan tree must be built (execbuild). This tree is set as the
+	//             planner.curPlan, and the EXECUTE phase of planning is complete.
+	//
+	var prepMemo *memo.Memo
+	inPreparePhase := p.EvalContext().PrepareOnly
+	if stmt.Prepared != nil {
+		// Don't use memo if it was never prepared, typically because of fallback
+		// to the heuristic planner.
+		if inPreparePhase || stmt.Prepared.Memo.RootGroup() != 0 {
+			prepMemo = &stmt.Prepared.Memo
+		}
+	}
+
+	// If this is the prepare phase, or if a prepared memo:
+	//   1. doesn't yet exist, or
+	//   2. it's been invalidated by schema or other changes
+	//
+	// Then entirely rebuild the memo from the AST.
+	if inPreparePhase || prepMemo == nil || prepMemo.IsStale(ctx, p.EvalContext(), &catalog) {
+		bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &catalog, f, stmt.AST)
+		bld.KeepPlaceholders = prepMemo != nil
+		err := bld.Build()
+		if err != nil {
+			// isCorrelated is used in the fallback case to create a better error.
+			p.curPlan.isCorrelated = bld.IsCorrelated
+			return err
+		}
+
+		if prepMemo != nil {
+			// If the memo doesn't have placeholders, then fully optimize it, since
+			// it can be reused without further changes to build the execution tree.
+			if !f.Memo().HasPlaceholders() {
+				p.optimizer.Optimize()
+			}
+
+			// Update the prepared memo.
+			prepMemo.InitFrom(f.Memo())
+		}
+	}
+
+	// If in the PREPARE phase, construct a dummy plan that has correct output
+	// columns. Only output columns and placeholder types are needed.
+	if inPreparePhase {
+		mem := f.Memo()
+		md := mem.Metadata()
+		physical := mem.LookupPhysicalProps(mem.RootProps())
+		resultCols := make(sqlbase.ResultColumns, len(physical.Presentation))
+		for i, col := range physical.Presentation {
+			resultCols[i].Name = col.Label
+			resultCols[i].Typ = md.ColumnType(col.ID)
+		}
+		p.curPlan.plan = &zeroNode{columns: resultCols}
+		return nil
+	}
+
+	// This is the EXECUTE phase, so finish optimization by assigning any
+	// remaining placeholders and applying exploration rules.
+	var ev memo.ExprView
+	if prepMemo == nil {
+		ev = p.optimizer.Optimize()
+	} else {
+		if prepMemo.HasPlaceholders() {
+			// Assign placeholders in the prepared memo.
+			f.Memo().InitFrom(prepMemo)
+			err := f.AssignPlaceholders()
+			if err != nil {
+				return err
+			}
+			ev = p.optimizer.Optimize()
+		} else {
+			ev = prepMemo.Root()
+		}
+	}
+
+	// Build the plan tree and store it in planner.curPlan.
+	execFactory := makeExecFactory(p)
+	plan, err := execbuilder.New(&execFactory, ev, p.EvalContext()).Build()
 	if err != nil {
 		return err
 	}
 
-	ev := o.Optimize(root, props)
+	p.curPlan = *plan.(*planTop)
+	// Since the assignment above just cleared the AST, we need to set it again.
+	p.curPlan.AST = stmt.AST
 
-	node, err := execbuilder.New(eng, ev).Build()
-	if err != nil {
-		return err
+	cols := planColumns(p.curPlan.plan)
+	if stmt.ExpectedTypes != nil {
+		if !stmt.ExpectedTypes.TypesEqual(cols) {
+			return pgerror.NewError(pgerror.CodeFeatureNotSupportedError,
+				"cached plan must not change result type")
+		}
 	}
-	p.curPlan.plan = node.(planNode)
+
 	return nil
 }
 
@@ -522,10 +652,10 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 	// upcoming IR work will provide unique numeric type tags, which will
 	// elegantly solve this.
 	for _, planHook := range planHooks {
-		if fn, header, err := planHook(ctx, stmt, p); err != nil {
+		if fn, header, subplans, err := planHook(ctx, stmt, p); err != nil {
 			return nil, err
 		} else if fn != nil {
-			return &hookFnNode{f: fn, header: header}, nil
+			return &hookFnNode{f: fn, header: header, subplans: subplans}, nil
 		}
 	}
 	for _, planHook := range wrappedPlanHooks {
@@ -635,10 +765,12 @@ func (p *planner) newPlan(
 		return p.AlterSequence(ctx, n)
 	case *tree.AlterUserSetPassword:
 		return p.AlterUserSetPassword(ctx, n)
-	case *tree.CancelQuery:
-		return p.CancelQuery(ctx, n)
-	case *tree.CancelJob:
-		return p.CancelJob(ctx, n)
+	case *tree.CancelQueries:
+		return p.CancelQueries(ctx, n)
+	case *tree.CancelSessions:
+		return p.CancelSessions(ctx, n)
+	case *tree.ControlJobs:
+		return p.ControlJobs(ctx, n)
 	case *tree.Scrub:
 		return p.Scrub(ctx, n)
 	case *tree.CreateDatabase:
@@ -673,8 +805,6 @@ func (p *planner) newPlan(
 		return p.DropSequence(ctx, n)
 	case *tree.DropUser:
 		return p.DropUser(ctx, n)
-	case *tree.Execute:
-		return p.Execute(ctx, n)
 	case *tree.Explain:
 		return p.Explain(ctx, n)
 	case *tree.Grant:
@@ -683,10 +813,8 @@ func (p *planner) newPlan(
 		return p.Insert(ctx, n, desiredTypes)
 	case *tree.ParenSelect:
 		return p.newPlan(ctx, n.Select, desiredTypes)
-	case *tree.PauseJob:
-		return p.PauseJob(ctx, n)
-	case *tree.TestingRelocate:
-		return p.TestingRelocate(ctx, n)
+	case *tree.Relocate:
+		return p.Relocate(ctx, n)
 	case *tree.RenameColumn:
 		return p.RenameColumn(ctx, n)
 	case *tree.RenameDatabase:
@@ -695,8 +823,6 @@ func (p *planner) newPlan(
 		return p.RenameIndex(ctx, n)
 	case *tree.RenameTable:
 		return p.RenameTable(ctx, n)
-	case *tree.ResumeJob:
-		return p.ResumeJob(ctx, n)
 	case *tree.Revoke:
 		return p.Revoke(ctx, n)
 	case *tree.Scatter:
@@ -724,12 +850,8 @@ func (p *planner) newPlan(
 		return p.ShowColumns(ctx, n)
 	case *tree.ShowConstraints:
 		return p.ShowConstraints(ctx, n)
-	case *tree.ShowCreateTable:
-		return p.ShowCreateTable(ctx, n)
-	case *tree.ShowCreateView:
-		return p.ShowCreateView(ctx, n)
-	case *tree.ShowCreateSequence:
-		return p.ShowCreateSequence(ctx, n)
+	case *tree.ShowCreate:
+		return p.ShowCreate(ctx, n)
 	case *tree.ShowDatabases:
 		return p.ShowDatabases(ctx, n)
 	case *tree.ShowGrants:
@@ -756,7 +878,7 @@ func (p *planner) newPlan(
 		return p.ShowTables(ctx, n)
 	case *tree.ShowSchemas:
 		return p.ShowSchemas(ctx, n)
-	case *tree.ShowTrace:
+	case *tree.ShowTraceForSession:
 		return p.ShowTrace(ctx, n)
 	case *tree.ShowTransactionStatus:
 		return p.ShowTransactionStatus(ctx)
@@ -771,15 +893,14 @@ func (p *planner) newPlan(
 	case *tree.Split:
 		return p.Split(ctx, n)
 	case *tree.Truncate:
-		if err := p.txn.SetSystemConfigTrigger(); err != nil {
-			return nil, err
-		}
 		return p.Truncate(ctx, n)
 	case *tree.UnionClause:
 		return p.Union(ctx, n, desiredTypes)
 	case *tree.Update:
 		return p.Update(ctx, n, desiredTypes)
 	case *tree.ValuesClause:
+		return p.Values(ctx, n, desiredTypes)
+	case *tree.ValuesClauseWithNames:
 		return p.Values(ctx, n, desiredTypes)
 	default:
 		return nil, errors.Errorf("unknown statement type: %T", stmt)
@@ -816,10 +937,12 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 	switch n := stmt.(type) {
 	case *tree.AlterUserSetPassword:
 		return p.AlterUserSetPassword(ctx, n)
-	case *tree.CancelQuery:
-		return p.CancelQuery(ctx, n)
-	case *tree.CancelJob:
-		return p.CancelJob(ctx, n)
+	case *tree.CancelQueries:
+		return p.CancelQueries(ctx, n)
+	case *tree.CancelSessions:
+		return p.CancelSessions(ctx, n)
+	case *tree.ControlJobs:
+		return p.ControlJobs(ctx, n)
 	case *tree.CreateUser:
 		return p.CreateUser(ctx, n)
 	case *tree.CreateTable:
@@ -832,10 +955,8 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.Explain(ctx, n)
 	case *tree.Insert:
 		return p.Insert(ctx, n, nil)
-	case *tree.PauseJob:
-		return p.PauseJob(ctx, n)
-	case *tree.ResumeJob:
-		return p.ResumeJob(ctx, n)
+	case *tree.Scrub:
+		return p.Scrub(ctx, n)
 	case *tree.Select:
 		return p.Select(ctx, n, nil)
 	case *tree.SelectClause:
@@ -845,16 +966,14 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.SetClusterSetting(ctx, n)
 	case *tree.SetVar:
 		return p.SetVar(ctx, n)
+	case *tree.SetZoneConfig:
+		return p.SetZoneConfig(ctx, n)
 	case *tree.ShowClusterSetting:
 		return p.ShowClusterSetting(ctx, n)
 	case *tree.ShowVar:
 		return p.ShowVar(ctx, n)
-	case *tree.ShowCreateTable:
-		return p.ShowCreateTable(ctx, n)
-	case *tree.ShowCreateView:
-		return p.ShowCreateView(ctx, n)
-	case *tree.ShowCreateSequence:
-		return p.ShowCreateSequence(ctx, n)
+	case *tree.ShowCreate:
+		return p.ShowCreate(ctx, n)
 	case *tree.ShowColumns:
 		return p.ShowColumns(ctx, n)
 	case *tree.ShowDatabases:
@@ -879,7 +998,7 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.ShowTables(ctx, n)
 	case *tree.ShowSchemas:
 		return p.ShowSchemas(ctx, n)
-	case *tree.ShowTrace:
+	case *tree.ShowTraceForSession:
 		return p.ShowTrace(ctx, n)
 	case *tree.ShowUsers:
 		return p.ShowUsers(ctx, n)
@@ -889,8 +1008,10 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.ShowRanges(ctx, n)
 	case *tree.Split:
 		return p.Split(ctx, n)
-	case *tree.TestingRelocate:
-		return p.TestingRelocate(ctx, n)
+	case *tree.Truncate:
+		return p.Truncate(ctx, n)
+	case *tree.Relocate:
+		return p.Relocate(ctx, n)
 	case *tree.Scatter:
 		return p.Scatter(ctx, n)
 	case *tree.Update:
@@ -901,4 +1022,14 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		// handling here.
 		return nil, nil
 	}
+}
+
+// Mark transaction as operating on the system DB if the descriptor id
+// is within the SystemConfig range.
+func (p *planner) maybeSetSystemConfig(id sqlbase.ID) error {
+	if !sqlbase.IsSystemConfigID(id) {
+		return nil
+	}
+	// Mark transaction as operating on the system DB.
+	return p.txn.SetSystemConfigTrigger()
 }

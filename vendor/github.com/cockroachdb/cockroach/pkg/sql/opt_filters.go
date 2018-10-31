@@ -267,22 +267,36 @@ func (p *planner) propagateFilters(
 		}
 
 	case *deleteNode:
-		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
 			return plan, extraFilter, err
 		}
 
+	case *rowCountNode:
+		newSource, err := p.triggerFilterPropagation(ctx, n.source)
+		if err != nil {
+			return plan, extraFilter, err
+		}
+		n.source = newSource.(batchedPlanNode)
+
+	case *serializeNode:
+		newSource, err := p.triggerFilterPropagation(ctx, n.source)
+		if err != nil {
+			return plan, extraFilter, err
+		}
+		n.source = newSource.(batchedPlanNode)
+
 	case *insertNode:
-		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
 			return plan, extraFilter, err
 		}
 
 	case *upsertNode:
-		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
 			return plan, extraFilter, err
 		}
 
 	case *updateNode:
-		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
 			return plan, extraFilter, err
 		}
 
@@ -296,11 +310,6 @@ func (p *planner) propagateFilters(
 			if n.plan, err = p.triggerFilterPropagation(ctx, n.plan); err != nil {
 				return plan, extraFilter, err
 			}
-		}
-
-	case *showTraceNode:
-		if n.plan, err = p.triggerFilterPropagation(ctx, n.plan); err != nil {
-			return plan, extraFilter, err
 		}
 
 	case *showTraceReplicaNode:
@@ -320,8 +329,30 @@ func (p *planner) propagateFilters(
 			return plan, extraFilter, err
 		}
 
-	case *testingRelocateNode:
+	case *relocateNode:
 		if n.rows, err = p.triggerFilterPropagation(ctx, n.rows); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *cancelQueriesNode:
+		if n.rows, err = p.triggerFilterPropagation(ctx, n.rows); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *cancelSessionsNode:
+		if n.rows, err = p.triggerFilterPropagation(ctx, n.rows); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *controlJobsNode:
+		if n.rows, err = p.triggerFilterPropagation(ctx, n.rows); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *projectSetNode:
+		// TODO(knz): we can propagate the part of the filter that applies
+		// to the source columns.
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
 			return plan, extraFilter, err
 		}
 
@@ -329,9 +360,12 @@ func (p *planner) propagateFilters(
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
+	case *renameColumnNode:
+	case *renameDatabaseNode:
+	case *renameIndexNode:
+	case *renameTableNode:
 	case *scrubNode:
-	case *controlJobNode:
+	case *truncateNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:
@@ -345,7 +379,6 @@ func (p *planner) propagateFilters(
 	case *dropSequenceNode:
 	case *DropUserNode:
 	case *hookFnNode:
-	case *valueGenerator:
 	case *valuesNode:
 	case *sequenceSelectNode:
 	case *setVarNode:
@@ -354,6 +387,7 @@ func (p *planner) propagateFilters(
 	case *showZoneConfigNode:
 	case *showRangesNode:
 	case *showFingerprintsNode:
+	case *showTraceNode:
 	case *scatterNode:
 
 	default:
@@ -423,9 +457,8 @@ func (p *planner) addGroupFilter(
 		// aggregations"), and renumber the indexed vars accordingly.
 		convFunc := func(v tree.VariableExpr) (bool, tree.Expr) {
 			if iv, ok := v.(*tree.IndexedVar); ok {
-				f := g.funcs[iv.Idx]
-				if f.identAggregate {
-					return true, &tree.IndexedVar{Idx: f.argRenderIdx}
+				if groupingCol, ok := g.aggIsGroupingColumn(iv.Idx); ok {
+					return true, &tree.IndexedVar{Idx: groupingCol}
 				}
 			}
 			return false, v
@@ -893,4 +926,19 @@ func mergeConj(left, right tree.TypedExpr) tree.TypedExpr {
 
 func isFilterTrue(expr tree.TypedExpr) bool {
 	return expr == nil || expr == tree.DBoolTrue
+}
+
+// splitAndExpr flattens a tree of AND expressions, appending all of the child
+// expressions as a list. Any non-AND expression is appended as a single element
+// in the list.
+//
+//   a AND b AND c AND d -> [a, b, c, d]
+func splitAndExpr(
+	evalCtx *tree.EvalContext, e tree.TypedExpr, exprs tree.TypedExprs,
+) tree.TypedExprs {
+	switch t := e.(type) {
+	case *tree.AndExpr:
+		return splitAndExpr(evalCtx, t.TypedRight(), splitAndExpr(evalCtx, t.TypedLeft(), exprs))
+	}
+	return append(exprs, e)
 }

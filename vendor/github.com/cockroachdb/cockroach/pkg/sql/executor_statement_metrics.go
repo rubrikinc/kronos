@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 )
@@ -64,7 +65,12 @@ type phaseTimes [sessionNumPhases]time.Time
 // EngineMetrics groups a set of SQL metrics.
 type EngineMetrics struct {
 	// The subset of SELECTs that are processed through DistSQL.
-	DistSQLSelectCount    *metric.Counter
+	DistSQLSelectCount *metric.Counter
+	// The subset of queries that are processed by the cost-based optimizer.
+	SQLOptCount *metric.Counter
+	// The subset of queries which we attempted and failed to plan with the
+	// cost-based optimizer.
+	SQLOptFallbackCount   *metric.Counter
 	DistSQLExecLatency    *metric.Histogram
 	SQLExecLatency        *metric.Histogram
 	DistSQLServiceLatency *metric.Histogram
@@ -85,15 +91,20 @@ func (EngineMetrics) MetricStruct() {}
 //   so far.
 // - result is the result set computed by the query/statement.
 // - err is the error encountered, if any.
-func recordStatementSummary(
+func (ex *connExecutor) recordStatementSummary(
 	planner *planner,
 	stmt Statement,
 	distSQLUsed bool,
+	optUsed bool,
 	automaticRetryCount int,
 	rowsAffected int,
 	err error,
 	m *EngineMetrics,
 ) {
+	if ex.stmtCounterDisabled {
+		return
+	}
+
 	phaseTimes := planner.statsCollector.PhaseTimes()
 
 	// Compute the run latency. This is always recorded in the
@@ -118,20 +129,27 @@ func recordStatementSummary(
 	execOverhead := svcLat - processingLat
 
 	if automaticRetryCount == 0 {
+		if optUsed {
+			m.SQLOptCount.Inc(1)
+		}
+
+		if !optUsed && planner.SessionData().OptimizerMode == sessiondata.OptimizerOn {
+			m.SQLOptFallbackCount.Inc(1)
+		}
+
 		if distSQLUsed {
 			if _, ok := stmt.AST.(*tree.Select); ok {
 				m.DistSQLSelectCount.Inc(1)
 			}
 			m.DistSQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
 			m.DistSQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
-		} else {
-			m.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
-			m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 		}
+		m.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
+		m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 	}
 
 	planner.statsCollector.RecordStatement(
-		stmt, distSQLUsed, automaticRetryCount, rowsAffected, err,
+		stmt, distSQLUsed, optUsed, automaticRetryCount, rowsAffected, err,
 		parseLat, planLat, runLat, svcLat, execOverhead,
 	)
 

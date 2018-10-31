@@ -89,6 +89,11 @@ func (p *planner) CheckPrivilege(
 		return nil
 	}
 
+	// Check if the 'public' pseudo-role has privileges.
+	if privs.CheckPrivilege(sqlbase.PublicRole, privilege) {
+		return nil
+	}
+
 	// Expand role memberships.
 	memberOf, err := p.MemberOfWithAdminOption(ctx, user)
 	if err != nil {
@@ -108,15 +113,16 @@ func (p *planner) CheckPrivilege(
 
 // CheckAnyPrivilege implements the AuthorizationAccessor interface.
 func (p *planner) CheckAnyPrivilege(ctx context.Context, descriptor sqlbase.DescriptorProto) error {
-	if isVirtualDescriptor(descriptor) {
-		return nil
-	}
-
 	user := p.SessionData().User
 	privs := descriptor.GetPrivileges()
 
 	// Check if 'user' itself has privileges.
 	if privs.AnyPrivilege(user) {
+		return nil
+	}
+
+	// Check if 'public' has privileges.
+	if privs.AnyPrivilege(sqlbase.PublicRole) {
 		return nil
 	}
 
@@ -231,8 +237,6 @@ func (p *planner) resolveMemberOfWithAdminOption(
 	toVisit := []string{member}
 	lookupRolesStmt := `SELECT "role", "isAdmin" FROM system.role_members WHERE "member" = $1`
 
-	internalExecutor := InternalExecutor{ExecCfg: p.ExecCfg()}
-
 	for len(toVisit) > 0 {
 		// Pop first element.
 		m := toVisit[0]
@@ -242,11 +246,8 @@ func (p *planner) resolveMemberOfWithAdminOption(
 		}
 		visited[m] = struct{}{}
 
-		rows, _ /* cols */, err := internalExecutor.QueryRows(
-			ctx,
-			"expand-roles",
-			lookupRolesStmt,
-			m,
+		rows, _ /* cols */, err := p.ExecCfg().InternalExecutor.Query(
+			ctx, "expand-roles", nil /* txn */, lookupRolesStmt, m,
 		)
 		if err != nil {
 			return nil, err

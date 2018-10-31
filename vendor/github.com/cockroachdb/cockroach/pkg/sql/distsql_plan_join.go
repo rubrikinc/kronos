@@ -37,10 +37,10 @@ var planInterleavedJoins = settings.RegisterBoolSetting(
 )
 
 func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
-	planCtx *planningCtx, n *joinNode,
-) (plan physicalPlan, ok bool, err error) {
+	planCtx *PlanningCtx, n *joinNode,
+) (plan PhysicalPlan, ok bool, err error) {
 	if !useInterleavedJoin(n) {
-		return physicalPlan{}, false, nil
+		return PhysicalPlan{}, false, nil
 	}
 
 	leftScan, leftOk := n.left.plan.(*scanNode)
@@ -49,16 +49,13 @@ func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
 	// We know they are scan nodes from useInterleaveJoin, but we add
 	// this check to prevent future panics.
 	if !leftOk || !rightOk {
-		return physicalPlan{}, false, pgerror.NewErrorf(
-			pgerror.CodeInternalError,
-			"left and right children of join node must be scan nodes to execute an interleaved join",
-		)
+		return PhysicalPlan{}, false, pgerror.NewAssertionErrorf("left and right children of join node must be scan nodes to execute an interleaved join")
 	}
 
 	// We iterate through each table and collate their metadata for
 	// the InterleavedReaderJoinerSpec.
 	tables := make([]distsqlrun.InterleavedReaderJoinerSpec_Table, 2)
-	plans := make([]physicalPlan, 2)
+	plans := make([]PhysicalPlan, 2)
 	var totalLimitHint int64
 	for i, t := range []struct {
 		scan      *scanNode
@@ -79,10 +76,10 @@ func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
 		// onCond and columns.
 		var err error
 		if plans[i], err = dsp.createTableReaders(planCtx, t.scan, nil); err != nil {
-			return physicalPlan{}, false, err
+			return PhysicalPlan{}, false, err
 		}
 
-		eqCols := eqCols(t.eqIndices, plans[i].planToStreamColMap)
+		eqCols := eqCols(t.eqIndices, plans[i].PlanToStreamColMap)
 		ordering := distsqlOrdering(n.mergeJoinOrdering, eqCols)
 
 		// Doesn't matter which processor we choose since the metadata
@@ -111,19 +108,22 @@ func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
 
 	joinType := n.joinType
 
-	post, joinToStreamColMap := joinOutColumns(n, plans[0].planToStreamColMap, plans[1].planToStreamColMap)
-	onExpr := remapOnExpr(planCtx.EvalContext(), n, plans[0].planToStreamColMap, plans[1].planToStreamColMap)
+	post, joinToStreamColMap := joinOutColumns(n, plans[0].PlanToStreamColMap, plans[1].PlanToStreamColMap)
+	onExpr, err := remapOnExpr(planCtx.EvalContext(), n, plans[0].PlanToStreamColMap, plans[1].PlanToStreamColMap)
+	if err != nil {
+		return PhysicalPlan{}, false, err
+	}
 
 	ancestor, descendant := n.interleavedNodes()
 
 	// We partition each set of spans to their respective nodes.
-	ancsPartitions, err := dsp.partitionSpans(planCtx, ancestor.spans)
+	ancsPartitions, err := dsp.PartitionSpans(planCtx, ancestor.spans)
 	if err != nil {
-		return physicalPlan{}, false, err
+		return PhysicalPlan{}, false, err
 	}
-	descPartitions, err := dsp.partitionSpans(planCtx, descendant.spans)
+	descPartitions, err := dsp.PartitionSpans(planCtx, descendant.spans)
 	if err != nil {
-		return physicalPlan{}, false, err
+		return PhysicalPlan{}, false, err
 	}
 
 	// We want to ensure that all child spans with a given interleave
@@ -143,17 +143,17 @@ func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
 	// partitioned to node 2 and 3, then we need to move the child spans
 	// to node 1 where the PK1 = 1 parent row is read.
 	if descPartitions, err = alignInterleavedSpans(n, ancsPartitions, descPartitions); err != nil {
-		return physicalPlan{}, false, err
+		return PhysicalPlan{}, false, err
 	}
 
 	// Figure out which nodes we need to schedule a processor on.
 	seen := make(map[roachpb.NodeID]struct{})
 	var nodes []roachpb.NodeID
-	for _, partitions := range [][]spanPartition{ancsPartitions, descPartitions} {
+	for _, partitions := range [][]SpanPartition{ancsPartitions, descPartitions} {
 		for _, part := range partitions {
-			if _, ok := seen[part.node]; !ok {
-				seen[part.node] = struct{}{}
-				nodes = append(nodes, part.node)
+			if _, ok := seen[part.Node]; !ok {
+				seen[part.Node] = struct{}{}
+				nodes = append(nodes, part.Node)
 			}
 		}
 	}
@@ -176,14 +176,14 @@ func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
 		// (but not both).
 		var ancsSpans, descSpans roachpb.Spans
 		for _, part := range ancsPartitions {
-			if part.node == nodeID {
-				ancsSpans = part.spans
+			if part.Node == nodeID {
+				ancsSpans = part.Spans
 				break
 			}
 		}
 		for _, part := range descPartitions {
-			if part.node == nodeID {
-				descSpans = part.spans
+			if part.Node == nodeID {
+				descSpans = part.Spans
 				break
 			}
 		}
@@ -228,10 +228,13 @@ func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
 		plan.ResultRouters[i] = distsqlplan.ProcessorIdx(i)
 	}
 
-	plan.planToStreamColMap = joinToStreamColMap
-	plan.ResultTypes = getTypesForPlanResult(n, joinToStreamColMap)
+	plan.PlanToStreamColMap = joinToStreamColMap
+	plan.ResultTypes, err = getTypesForPlanResult(n, joinToStreamColMap)
+	if err != nil {
+		return PhysicalPlan{}, false, err
+	}
 
-	plan.SetMergeOrdering(dsp.convertOrdering(n.props, plan.planToStreamColMap))
+	plan.SetMergeOrdering(dsp.convertOrdering(n.props, plan.PlanToStreamColMap))
 	return plan, true, nil
 }
 
@@ -264,13 +267,15 @@ func joinOutColumns(
 		joinCol++
 	}
 
-	for i := 0; i < n.pred.numRightCols; i++ {
-		if !n.columns[joinCol].Omitted {
-			joinToStreamColMap[joinCol] = addOutCol(
-				uint32(leftCols + rightPlanToStreamColMap[i]),
-			)
+	if n.pred.joinType != sqlbase.LeftSemiJoin && n.pred.joinType != sqlbase.LeftAntiJoin {
+		for i := 0; i < n.pred.numRightCols; i++ {
+			if !n.columns[joinCol].Omitted {
+				joinToStreamColMap[joinCol] = addOutCol(
+					uint32(leftCols + rightPlanToStreamColMap[i]),
+				)
+			}
+			joinCol++
 		}
-		joinCol++
 	}
 
 	return post, joinToStreamColMap
@@ -281,12 +286,12 @@ func joinOutColumns(
 // to N-1 for the left input columns, N to N+M-1 for the right input columns).
 func remapOnExpr(
 	evalCtx *tree.EvalContext, n *joinNode, leftPlanToStreamColMap, rightPlanToStreamColMap []int,
-) distsqlrun.Expression {
+) (distsqlrun.Expression, error) {
 	if n.pred.onCond == nil {
-		return distsqlrun.Expression{}
+		return distsqlrun.Expression{}, nil
 	}
 
-	joinColMap := make([]int, len(n.columns))
+	joinColMap := make([]int, n.pred.numLeftCols+n.pred.numRightCols)
 	idx := 0
 	leftCols := 0
 	for i := 0; i < n.pred.numLeftCols; i++ {
@@ -302,31 +307,6 @@ func remapOnExpr(
 	}
 
 	return distsqlplan.MakeExpression(n.pred.onCond, evalCtx, joinColMap)
-}
-
-// shiftExprCols remaps expression columns when merging rows in a join. It takes
-// expression columns for the right side of a join, and remaps the indices so
-// that they refer to indices in the merged row.
-func shiftExprCols(
-	evalCtx *tree.EvalContext, expr tree.TypedExpr, leftPlanToStream, rightPlanToStream []int,
-) distsqlrun.Expression {
-	offset := 0
-	for _, val := range leftPlanToStream {
-		if val >= 0 {
-			offset++
-		}
-	}
-	shiftMap := make([]int, len(rightPlanToStream))
-	idx := 0
-	for i := 0; i < len(rightPlanToStream); i++ {
-		if rightPlanToStream[i] >= 0 {
-			shiftMap[i] = idx + offset
-			idx++
-		} else {
-			shiftMap[i] = -1
-		}
-	}
-	return distsqlplan.MakeExpression(expr, evalCtx, shiftMap)
 }
 
 // eqCols produces a slice of ordinal references for the plan columns specified
@@ -577,11 +557,11 @@ func maximalJoinPrefix(
 
 // sortedSpanPartitions implements sort.Interface. Sorting is defined on the
 // node ID of each partition.
-type sortedSpanPartitions []spanPartition
+type sortedSpanPartitions []SpanPartition
 
 func (s sortedSpanPartitions) Len() int           { return len(s) }
 func (s sortedSpanPartitions) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-func (s sortedSpanPartitions) Less(i, j int) bool { return s[i].node < s[j].node }
+func (s sortedSpanPartitions) Less(i, j int) bool { return s[i].Node < s[j].Node }
 
 // alignInterleavedSpans takes the partitioned spans from both the parent
 // (parentSpans) and (not necessarily direct) child (childSpans), "aligns" them
@@ -612,8 +592,8 @@ func (s sortedSpanPartitions) Less(i, j int) bool { return s[i].node < s[j].node
 // split that overlaps the join span is (re-)mapped to the parent span. Any
 // remaining splits are considered separately with the same logic.
 func alignInterleavedSpans(
-	n *joinNode, parentSpans []spanPartition, childSpans []spanPartition,
-) ([]spanPartition, error) {
+	n *joinNode, parentSpans []SpanPartition, childSpans []SpanPartition,
+) ([]SpanPartition, error) {
 	mappedSpans := make(map[roachpb.NodeID]roachpb.Spans)
 
 	// Map parent spans to their join span.
@@ -633,7 +613,7 @@ func alignInterleavedSpans(
 		// child span, we can make this O(logn) with binary search
 		// after pre-sorting the parent join spans.
 		for _, parentPart := range joinSpans {
-			for _, parentJoinSpan := range parentPart.spans {
+			for _, parentJoinSpan := range parentPart.Spans {
 				if parentJoinSpan.Overlaps(childSpan) {
 					// Initialize the overlap region
 					// as the entire childSpan.
@@ -661,7 +641,7 @@ func alignInterleavedSpans(
 					// Map the overlap region to the
 					// partition/node of the
 					// parentJoinSpan.
-					mappedSpans[parentPart.node] = append(mappedSpans[parentPart.node], overlap)
+					mappedSpans[parentPart.Node] = append(mappedSpans[parentPart.Node], overlap)
 
 					return nonOverlaps
 				}
@@ -685,7 +665,7 @@ func alignInterleavedSpans(
 	// moving on to the next childSpan.
 	spansLeft := make(roachpb.Spans, 0, 2)
 	for _, childPart := range childSpans {
-		for _, childSpan := range childPart.spans {
+		for _, childSpan := range childPart.Spans {
 			spansLeft = append(spansLeft, childSpan)
 			for len(spansLeft) > 0 {
 				// Copy out the last span in spansLeft to
@@ -700,7 +680,7 @@ func alignInterleavedSpans(
 				// necessary which may produce up to two
 				// non-overlapping sub-spans that are
 				// appended to spansLeft.
-				spansLeft = mapAndSplit(childPart.node, spanToMap, spansLeft)
+				spansLeft = mapAndSplit(childPart.Node, spanToMap, spansLeft)
 			}
 		}
 	}
@@ -713,9 +693,9 @@ func alignInterleavedSpans(
 		spans, _ = roachpb.MergeSpans(spans)
 		alignedDescSpans = append(
 			alignedDescSpans,
-			spanPartition{
-				node:  nodeID,
-				spans: spans,
+			SpanPartition{
+				Node:  nodeID,
+				Spans: spans,
 			},
 		)
 	}
@@ -778,17 +758,17 @@ func alignInterleavedSpans(
 // subsequent span on a different node to contain the previous row.
 // The start key will be pushed forward to at least the next row, which
 // maintains the disjoint property.
-func joinSpans(n *joinNode, parentSpans []spanPartition) ([]spanPartition, error) {
-	joinSpans := make([]spanPartition, len(parentSpans))
+func joinSpans(n *joinNode, parentSpans []SpanPartition) ([]SpanPartition, error) {
+	joinSpans := make([]SpanPartition, len(parentSpans))
 
 	parent, child := n.interleavedNodes()
 
 	// Compute the join span for every parent span.
 	for i, parentPart := range parentSpans {
-		joinSpans[i].node = parentPart.node
-		joinSpans[i].spans = make(roachpb.Spans, len(parentPart.spans))
+		joinSpans[i].Node = parentPart.Node
+		joinSpans[i].Spans = make(roachpb.Spans, len(parentPart.Spans))
 
-		for j, parentSpan := range parentPart.spans {
+		for j, parentSpan := range parentPart.Spans {
 			// Step 1: start key.
 			joinSpanStartKey, startTruncated, err := maximalJoinPrefix(parent, child, parentSpan.Key)
 			if err != nil {
@@ -815,7 +795,7 @@ func joinSpans(n *joinNode, parentSpans []spanPartition) ([]spanPartition, error
 			// We don't need to check if joinSpanStartKey <
 			// joinSpanEndKey since the invalid spans will be
 			// ignored during Span.Overlaps.
-			joinSpans[i].spans[j] = roachpb.Span{
+			joinSpans[i].Spans[j] = roachpb.Span{
 				Key:    joinSpanStartKey,
 				EndKey: joinSpanEndKey,
 			}

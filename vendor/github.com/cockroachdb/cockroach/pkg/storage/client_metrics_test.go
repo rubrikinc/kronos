@@ -23,9 +23,13 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 )
@@ -107,8 +111,7 @@ func verifyStats(t *testing.T, mtc *multiTestContext, storeIdxSlice ...int) {
 		checkGauge(t, idString, m.KeyCount, realStats.KeyCount)
 		checkGauge(t, idString, m.ValCount, realStats.ValCount)
 		checkGauge(t, idString, m.IntentCount, realStats.IntentCount)
-		// TODO(mrtracy): Re-enable SysBytes check when #23574 is fixed.
-		// checkGauge(t, idString, m.SysBytes, realStats.SysBytes)
+		checkGauge(t, idString, m.SysBytes, realStats.SysBytes)
 		checkGauge(t, idString, m.SysCount, realStats.SysCount)
 		// "Ages" will be different depending on how much time has passed. Even with
 		// a manual clock, this can be an issue in tests. Therefore, we do not
@@ -135,7 +138,7 @@ func verifyRocksDBStats(t *testing.T, s *storage.Store) {
 		gauge *metric.Gauge
 		min   int64
 	}{
-		{m.RdbBlockCacheHits, 4},
+		{m.RdbBlockCacheHits, 10},
 		{m.RdbBlockCacheMisses, 0},
 		{m.RdbBlockCacheUsage, 0},
 		{m.RdbBlockCachePinnedUsage, 0},
@@ -153,10 +156,92 @@ func verifyRocksDBStats(t *testing.T, s *storage.Store) {
 	}
 }
 
+// TestStoreResolveMetrics verifies that metrics related to intent resolution
+// are tracked properly.
+func TestStoreResolveMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// First prevent rot that would result from adding fields without handling
+	// them everywhere.
+	{
+		act := fmt.Sprintf("%+v", result.Metrics{})
+		exp := "{LeaseRequestSuccess:0 LeaseRequestError:0 LeaseTransferSuccess:0 LeaseTransferError:0 ResolveCommit:0 ResolveAbort:0 ResolvePoison:0}"
+		if act != exp {
+			t.Errorf("need to update this test due to added fields: %v", act)
+		}
+	}
+
+	mtc := &multiTestContext{}
+	defer mtc.Stop()
+	mtc.Start(t, 1)
+
+	ctx := context.Background()
+
+	span := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("b")}
+
+	txn := roachpb.MakeTransaction("foo", span.Key, roachpb.MinUserPriority, enginepb.SERIALIZABLE, hlc.Timestamp{WallTime: 123}, 999)
+
+	const resolveCommitCount = int64(200)
+	const resolveAbortCount = int64(800)
+	const resolvePoisonCount = int64(2400)
+
+	var ba roachpb.BatchRequest
+	{
+		repl := mtc.stores[0].LookupReplica(keys.MustAddr(span.Key))
+		var err error
+		if ba.Replica, err = repl.GetReplicaDescriptor(); err != nil {
+			t.Fatal(err)
+		}
+		ba.RangeID = repl.RangeID
+	}
+
+	add := func(status roachpb.TransactionStatus, poison bool, n int64) {
+		for i := int64(0); i < n; i++ {
+			key := span.Key
+			endKey := span.EndKey
+			if i > n/2 {
+				req := &roachpb.ResolveIntentRangeRequest{
+					IntentTxn: txn.TxnMeta, Status: status, Poison: poison,
+				}
+				req.Key, req.EndKey = key, endKey
+				ba.Add(req)
+				continue
+			}
+			req := &roachpb.ResolveIntentRequest{
+				IntentTxn: txn.TxnMeta, Status: status, Poison: poison,
+			}
+			req.Key = key
+			ba.Add(req)
+		}
+	}
+
+	add(roachpb.COMMITTED, false, resolveCommitCount)
+	add(roachpb.ABORTED, false, resolveAbortCount)
+	add(roachpb.ABORTED, true, resolvePoisonCount)
+
+	if _, pErr := mtc.senders[0].Send(ctx, ba); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	if exp, act := resolveCommitCount, mtc.stores[0].Metrics().ResolveCommitCount.Count(); act < exp || act > exp+50 {
+		t.Errorf("expected around %d intent commits, saw %d", exp, act)
+	}
+	if exp, act := resolveAbortCount, mtc.stores[0].Metrics().ResolveAbortCount.Count(); act < exp || act > exp+50 {
+		t.Errorf("expected around %d intent aborts, saw %d", exp, act)
+	}
+	if exp, act := resolvePoisonCount, mtc.stores[0].Metrics().ResolvePoisonCount.Count(); act < exp || act > exp+50 {
+		t.Errorf("expected arounc %d abort span poisonings, saw %d", exp, act)
+	}
+}
+
 func TestStoreMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	mtc := &multiTestContext{}
+	storeCfg := storage.TestStoreConfig(nil /* clock */)
+	storeCfg.TestingKnobs.DisableMergeQueue = true
+	mtc := &multiTestContext{
+		storeConfig: &storeCfg,
+	}
 	defer mtc.Stop()
 	mtc.Start(t, 3)
 
@@ -177,7 +262,7 @@ func TestStoreMetrics(t *testing.T) {
 
 	// Perform a split, which has special metrics handling.
 	splitArgs := adminSplitArgs(roachpb.Key("m"))
-	if _, err := client.SendWrapped(context.Background(), rg1(mtc.stores[0]), splitArgs); err != nil {
+	if _, err := client.SendWrapped(context.Background(), mtc.stores[0].TestSender(), splitArgs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,7 +273,7 @@ func TestStoreMetrics(t *testing.T) {
 	verifyStats(t, mtc, 0)
 
 	// Replicate the "right" range to the other stores.
-	replica := mtc.stores[0].LookupReplica(roachpb.RKey("z"), nil)
+	replica := mtc.stores[0].LookupReplica(roachpb.RKey("z"))
 	mtc.replicateRange(replica.RangeID, 1, 2)
 
 	// Verify stats on store1 after replication.
@@ -204,8 +289,7 @@ func TestStoreMetrics(t *testing.T) {
 	// Verify all stats on stores after addition.
 	verifyStats(t, mtc, 0, 1, 2)
 
-	// Create a transaction statement that fails, but will add an entry to the
-	// sequence cache. Regression test for #4969.
+	// Create a transaction statement that fails. Regression test for #4969.
 	if err := mtc.dbs[0].Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		b := txn.NewBatch()
 		b.CPut(dataKey, 7, 6)
@@ -214,7 +298,7 @@ func TestStoreMetrics(t *testing.T) {
 		t.Fatal("Expected transaction error, but none received")
 	}
 
-	// Verify stats after sequence cache addition.
+	// Verify stats after addition.
 	verifyStats(t, mtc, 0, 1, 2)
 	checkGauge(t, "store 0", mtc.stores[0].Metrics().ReplicaCount, 2)
 

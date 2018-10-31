@@ -57,9 +57,16 @@ type CommandQueue struct {
 	reads       interval.Tree
 	writes      interval.Tree
 	idAlloc     int64
-	wRg, rwRg   interval.RangeGroup // avoids allocating in getPrereqs
-	oHeap       overlapHeap         // avoids allocating in getPrereqs
-	overlaps    []*cmd              // avoids allocating in getOverlaps
+
+	// avoids allocating in getPrereqs
+	wRg, rwRg interval.RangeGroup
+	oHeap     overlapHeap
+	// avoids allocating in getOverlaps
+	overlaps                    []*cmd
+	readOnly                    bool
+	timestamp                   hlc.Timestamp
+	collectOverlappingReadsRef  interval.Operation
+	collectOverlappingWritesRef interval.Operation
 
 	coveringOptimization bool // if true, use covering span optimization
 
@@ -87,6 +94,10 @@ type cmd struct {
 	// don't need to keep multiple *cmd slices in-sync.
 	prereqs    *[]*cmd
 	prereqsBuf []*cmd
+	// Only initialized if needed and only ever initialized
+	// on a parent cmd. Stores all of the IDs of commands
+	// in the prereq slice to avoid duplicates.
+	prereqIDs map[int64]struct{}
 
 	pending chan struct{} // closed when complete
 }
@@ -137,10 +148,19 @@ func (c *cmd) String() string {
 	return buf.String()
 }
 
+// PrereqLen returns the number of immediate prerequisite command that the
+// command is waiting on.
+func (c *cmd) PrereqLen() int {
+	if c == nil {
+		return 0
+	}
+	return len(*c.prereqs)
+}
+
 // PendingPrereq returns the prerequisite command that should be waited on next,
 // or nil if the receiver has no more prerequisites to wait on.
 func (c *cmd) PendingPrereq() *cmd {
-	if len(*c.prereqs) == 0 {
+	if c.PrereqLen() == 0 {
 		return nil
 	}
 	return (*c.prereqs)[0]
@@ -213,7 +233,26 @@ func (c *cmd) ResolvePendingPrereq() {
 	// dependencies (see rules in command_queue.go) will work as expected with
 	// regard to properly transferring dependencies. This is because these
 	// timestamp rules all exhibit a transitive relationship.
-	*c.prereqs = append(*c.prereqs, *pre.prereqs...)
+	if len(*pre.prereqs) > 0 {
+		// Avoid adding duplicate prereqs into the prereq slice. If we naively
+		// inserted duplicate prereqs into the slice then it could grow
+		// quadratically in cases where multiple prereqs of cmd each share
+		// common prerequisites themselves.
+		if c.prereqIDs == nil {
+			// Lazily compute prereq ID set. This is only necessary during
+			// command cancellation scenario.
+			c.prereqIDs = make(map[int64]struct{}, len(*c.prereqs))
+			for _, pre := range *c.prereqs {
+				c.prereqIDs[pre.id] = struct{}{}
+			}
+		}
+		for _, newPre := range *pre.prereqs {
+			if _, ok := c.prereqIDs[newPre.id]; !ok {
+				*c.prereqs = append(*c.prereqs, newPre)
+				c.prereqIDs[newPre.id] = struct{}{}
+			}
+		}
+	}
 
 	// Truncate the command's prerequisite list so that it no longer includes
 	// the first prerequisite. Before doing so, nil out prefix of slice to allow
@@ -222,6 +261,33 @@ func (c *cmd) ResolvePendingPrereq() {
 	// especially during cascade command cancellation.
 	(*c.prereqs)[0] = nil
 	(*c.prereqs) = (*c.prereqs)[1:]
+
+	// Delete from the prereq ID set (if c.prereqIDs is nil, this is a no-op).
+	delete(c.prereqIDs, pre.id)
+}
+
+// OptimisticallyResolvePrereqs removes all prerequisite in the cmd's prereq
+// slice that have already finished without blocking on pending commands.
+// Prerequisite commands that are still pending or that were canceled are left
+// in the prereq slice.
+func (c *cmd) OptimisticallyResolvePrereqs() {
+	j := 0
+	for i, pre := range *c.prereqs {
+		select {
+		case <-pre.pending:
+			if len(*pre.prereqs) == 0 {
+				// Nil to allow GC.
+				(*c.prereqs)[i] = nil
+				continue
+			}
+			// Command canceled. Don't expand.
+		default:
+			// Command still pending.
+		}
+		(*c.prereqs)[j] = pre
+		j++
+	}
+	(*c.prereqs) = (*c.prereqs)[:j]
 }
 
 // NewCommandQueue returns a new command queue. The boolean specifies whether
@@ -243,6 +309,13 @@ func NewCommandQueue(coveringOptimization bool) *CommandQueue {
 		rwRg:                 interval.NewRangeTree(),
 		coveringOptimization: coveringOptimization,
 	}
+	// We store a reference to each of these methods in fields on the
+	// CommandQueue. This allows us to pass them to Tree.DoMatching
+	// without allocating in getOverlaps. Passing a closure to DoMatching
+	// will allocate as expected, but even passing the method reference
+	// directly allocates.
+	cq.collectOverlappingReadsRef = cq.collectOverlappingReads
+	cq.collectOverlappingWritesRef = cq.collectOverlappingWrites
 	return cq
 }
 
@@ -545,37 +618,44 @@ func (cq *CommandQueue) getPrereqs(
 func (cq *CommandQueue) getOverlaps(
 	readOnly bool, timestamp hlc.Timestamp, rng interval.Range,
 ) []*cmd {
-	if !readOnly {
+	cq.readOnly = readOnly
+	cq.timestamp = timestamp
+	if !cq.readOnly {
 		// Upon a write cmd, flush out cmds from readsBuffer to the read interval
 		// tree.
 		cq.flushReadsBuffer()
-
-		cq.reads.DoMatching(func(i interval.Interface) bool {
-			c := i.(*cmd)
-			// Writes only wait on equal or later reads (we always wait
-			// if the pending read didn't have a timestamp specified).
-			if (c.timestamp == hlc.Timestamp{}) || !c.timestamp.Less(timestamp) {
-				cq.overlaps = append(cq.overlaps, c)
-			}
-			return false
-		}, rng)
+		cq.reads.DoMatching(cq.collectOverlappingReadsRef, rng)
 	}
 	// Both reads and writes must wait on other writes, depending on timestamps.
-	cq.writes.DoMatching(func(i interval.Interface) bool {
-		c := i.(*cmd)
-		// Writes always wait on other writes. Reads must wait on writes
-		// which occur at the same or an earlier timestamp. Note that
-		// timestamps for write commands may be pushed forward by the
-		// timestamp cache. This is fine because it doesn't matter how far
-		// forward the timestamp is pushed if it's already ahead of this read.
-		if !readOnly || (timestamp == hlc.Timestamp{}) || !timestamp.Less(c.timestamp) {
-			cq.overlaps = append(cq.overlaps, c)
-		}
-		return false
-	}, rng)
+	cq.writes.DoMatching(cq.collectOverlappingWritesRef, rng)
 	overlaps := cq.overlaps
 	cq.overlaps = cq.overlaps[:0]
 	return overlaps
+}
+
+// collectOverlappingReads implements the tree.Operation interface.
+func (cq *CommandQueue) collectOverlappingReads(i interval.Interface) bool {
+	c := i.(*cmd)
+	// Writes only wait on equal or later reads (we always wait
+	// if the pending read didn't have a timestamp specified).
+	if (c.timestamp == hlc.Timestamp{}) || !c.timestamp.Less(cq.timestamp) {
+		cq.overlaps = append(cq.overlaps, c)
+	}
+	return false
+}
+
+// collectOverlappingWrites implements the tree.Operation interface.
+func (cq *CommandQueue) collectOverlappingWrites(i interval.Interface) bool {
+	c := i.(*cmd)
+	// Writes always wait on other writes. Reads must wait on writes
+	// which occur at the same or an earlier timestamp. Note that
+	// timestamps for write commands may be pushed forward by the
+	// timestamp cache. This is fine because it doesn't matter how far
+	// forward the timestamp is pushed if it's already ahead of this read.
+	if !cq.readOnly || (cq.timestamp == hlc.Timestamp{}) || !cq.timestamp.Less(c.timestamp) {
+		cq.overlaps = append(cq.overlaps, c)
+	}
+	return false
 }
 
 // overlapHeap is a max-heap ordered by cmd.id.

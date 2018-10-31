@@ -21,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 // expandPlan finalizes type checking of placeholders and expands
@@ -111,16 +112,26 @@ func doExpandPlan(
 		n.sourcePlan, err = doExpandPlan(ctx, p, noParams, n.sourcePlan)
 
 	case *updateNode:
-		n.run.rows, err = doExpandPlan(ctx, p, noParams, n.run.rows)
+		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
 
 	case *insertNode:
-		n.run.rows, err = doExpandPlan(ctx, p, noParams, n.run.rows)
+		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
 
 	case *upsertNode:
-		n.run.rows, err = doExpandPlan(ctx, p, noParams, n.run.rows)
+		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
 
 	case *deleteNode:
-		n.run.rows, err = doExpandPlan(ctx, p, noParams, n.run.rows)
+		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
+
+	case *rowCountNode:
+		var newPlan planNode
+		newPlan, err = doExpandPlan(ctx, p, noParams, n.source)
+		n.source = newPlan.(batchedPlanNode)
+
+	case *serializeNode:
+		var newPlan planNode
+		newPlan, err = doExpandPlan(ctx, p, noParams, n.source)
+		n.source = newPlan.(batchedPlanNode)
 
 	case *explainDistSQLNode:
 		// EXPLAIN only shows the structure of the plan, and wants to do
@@ -128,25 +139,9 @@ func doExpandPlan(
 		explainParams := noParamsBase
 		explainParams.atTop = true
 		n.plan, err = doExpandPlan(ctx, p, explainParams, n.plan)
-		if err != nil {
-			return plan, err
-		}
-
-	case *showTraceNode:
-		// SHOW TRACE only shows the execution trace of the plan, and wants to do
-		// so "as if" plan was at the top level w.r.t spool semantics.
-		showTraceParams := noParamsBase
-		showTraceParams.atTop = true
-		n.plan, err = doExpandPlan(ctx, p, showTraceParams, n.plan)
-		if err != nil {
-			return plan, err
-		}
 
 	case *showTraceReplicaNode:
 		n.plan, err = doExpandPlan(ctx, p, noParams, n.plan)
-		if err != nil {
-			return plan, err
-		}
 
 	case *explainPlanNode:
 		// EXPLAIN only shows the structure of the plan, and wants to do
@@ -184,7 +179,7 @@ func doExpandPlan(
 		n.left, err = doExpandPlan(ctx, p, params, n.left)
 
 	case *filterNode:
-		n.source.plan, err = doExpandPlan(ctx, p, params, n.source.plan)
+		plan, err = expandFilterNode(ctx, p, params, n)
 
 	case *joinNode:
 		n.left.plan, err = doExpandPlan(ctx, p, noParams, n.left.plan)
@@ -242,6 +237,37 @@ func doExpandPlan(
 			}
 		}
 
+		// Project the props of the GROUP BY columns, as they're retained as-is.
+		groupColProjMap := make([]int, len(n.funcs))
+		for i := range n.funcs {
+			if groupingCol, ok := n.aggIsGroupingColumn(i); ok {
+				groupColProjMap[i] = groupingCol
+			} else {
+				groupColProjMap[i] = -1
+			}
+		}
+		childProps := planPhysicalProps(n.plan)
+		n.props = childProps.project(groupColProjMap)
+
+		// The GROUP BY columns form a weak key.
+		var groupColSet util.FastIntSet
+		for i, c := range groupColProjMap {
+			if c == -1 {
+				continue
+			}
+			groupColSet.Add(i)
+		}
+		if !groupColSet.Empty() {
+			n.props.addWeakKey(groupColSet)
+		}
+
+		groupColProps := planPhysicalProps(n.plan)
+		groupColProps = groupColProps.project(n.groupCols)
+		n.orderedGroupCols = make([]int, len(groupColProps.ordering))
+		for i, o := range groupColProps.ordering {
+			n.orderedGroupCols[i] = o.ColIdx
+		}
+
 	case *windowNode:
 		n.plan, err = doExpandPlan(ctx, p, noParams, n.plan)
 
@@ -288,17 +314,32 @@ func doExpandPlan(
 	case *splitNode:
 		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
 
-	case *testingRelocateNode:
+	case *relocateNode:
 		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
+	case *cancelQueriesNode:
+		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
+	case *cancelSessionsNode:
+		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
+	case *controlJobsNode:
+		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
+	case *projectSetNode:
+		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
 
 	case *valuesNode:
 	case *alterIndexNode:
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
+	case *renameColumnNode:
+	case *renameDatabaseNode:
+	case *renameIndexNode:
+	case *renameTableNode:
 	case *scrubNode:
-	case *controlJobNode:
+	case *truncateNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:
@@ -314,7 +355,12 @@ func doExpandPlan(
 	case *zeroNode:
 	case *unaryNode:
 	case *hookFnNode:
-	case *valueGenerator:
+		for i := range n.subplans {
+			n.subplans[i], err = doExpandPlan(ctx, p, noParams, n.subplans[i])
+			if err != nil {
+				break
+			}
+		}
 	case *sequenceSelectNode:
 	case *setVarNode:
 	case *setClusterSettingNode:
@@ -322,6 +368,7 @@ func doExpandPlan(
 	case *showZoneConfigNode:
 	case *showRangesNode:
 	case *showFingerprintsNode:
+	case *showTraceNode:
 	case *scatterNode:
 	case nil:
 
@@ -360,6 +407,24 @@ func elideDoubleSort(parent, source *sortNode) {
 	}
 }
 
+func expandFilterNode(
+	ctx context.Context, p *planner, params expandParameters, n *filterNode,
+) (planNode, error) {
+	var err error
+	n.source.plan, err = doExpandPlan(ctx, p, params, n.source.plan)
+	if err != nil {
+		return n, err
+	}
+
+	// If there's a spool, pull it up.
+	if spool, ok := n.source.plan.(*spoolNode); ok {
+		n.source.plan = spool.source
+		return p.makeSpool(n), nil
+	}
+
+	return n, nil
+}
+
 func expandDistinctNode(
 	ctx context.Context, p *planner, params expandParameters, d *distinctNode,
 ) (planNode, error) {
@@ -369,6 +434,13 @@ func expandDistinctNode(
 	d.plan, err = doExpandPlan(ctx, p, params, d.plan)
 	if err != nil {
 		return d, err
+	}
+
+	// If there's a spool, we'll pull it up before returning below.
+	respool := func(plan planNode) planNode { return plan }
+	if spool, ok := d.plan.(*spoolNode); ok {
+		respool = p.makeSpool
+		d.plan = spool.source
 	}
 
 	// We use the physical properties of the distinctNode but projected
@@ -382,7 +454,7 @@ func expandDistinctNode(
 		// Since distinctNode does not project columns, this is fine
 		// (it has a parent renderNode).
 		if k.SubsetOf(distinctOnPp.notNullCols) {
-			return d.plan, nil
+			return respool(d.plan), nil
 		}
 	}
 
@@ -393,23 +465,23 @@ func expandDistinctNode(
 		// column values again. We can thus clear out our bookkeeping.
 		// This needs to be planColumns(n.plan) and not planColumns(n) since
 		// distinctNode is "distinctifying" on the child plan's output rows.
-		d.columnsInOrder = make([]bool, len(planColumns(d.plan)))
-		for i := range d.columnsInOrder {
+		d.columnsInOrder = util.FastIntSet{}
+		for i, numCols := 0, len(planColumns(d.plan)); i < numCols; i++ {
 			group := distinctOnPp.eqGroups.Find(i)
 			if distinctOnPp.constantCols.Contains(group) {
-				d.columnsInOrder[i] = true
+				d.columnsInOrder.Add(i)
 				continue
 			}
 			for _, g := range distinctOnPp.ordering {
 				if g.ColIdx == group {
-					d.columnsInOrder[i] = true
+					d.columnsInOrder.Add(i)
 					break
 				}
 			}
 		}
 	}
 
-	return d, nil
+	return respool(d), nil
 }
 
 func expandScanNode(
@@ -446,6 +518,13 @@ func expandRenderNode(
 	r.source.plan, err = doExpandPlan(ctx, p, params, r.source.plan)
 	if err != nil {
 		return r, err
+	}
+
+	// If there's a spool, we'll pull it up before returning below.
+	respool := func(plan planNode) planNode { return plan }
+	if spool, ok := r.source.plan.(*spoolNode); ok {
+		respool = p.makeSpool
+		r.source.plan = spool.source
 	}
 
 	// Elide the render node if it renders its source as-is.
@@ -487,12 +566,12 @@ func expandRenderNode(
 					mutSourceCols[i].Name = col.Name
 				}
 			}
-			return r.source.plan, nil
+			return respool(r.source.plan), nil
 		}
 	}
 
 	p.computePhysicalPropsForRender(r, planPhysicalProps(r.source.plan))
-	return r, nil
+	return respool(r), nil
 }
 
 // translateOrdering modifies a desired ordering on the output of the
@@ -534,6 +613,27 @@ func translateOrdering(desiredDown sqlbase.ColumnOrdering, r *renderNode) sqlbas
 	return desiredUp
 }
 
+func translateGroupOrdering(
+	desiredDown sqlbase.ColumnOrdering, g *groupNode,
+) sqlbase.ColumnOrdering {
+	var desiredUp sqlbase.ColumnOrdering
+
+	for _, colOrder := range desiredDown {
+		groupingCol, ok := g.aggIsGroupingColumn(colOrder.ColIdx)
+		if !ok {
+			// We cannot maintain the rest of the ordering since it uses a
+			// non-identity aggregate function.
+			break
+		}
+		// For identity (i.e., GROUP BY) columns, we can propagate the ordering.
+		desiredUp = append(desiredUp, sqlbase.ColumnOrderInfo{
+			ColIdx: groupingCol, Direction: colOrder.Direction,
+		})
+	}
+
+	return desiredUp
+}
+
 // simplifyOrderings reduces the Ordering() guarantee of each node in the plan
 // to that which is actually used by the parent(s). It also performs sortNode
 // elision when possible.
@@ -554,21 +654,24 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 		n.sourcePlan = p.simplifyOrderings(n.sourcePlan, nil)
 
 	case *updateNode:
-		n.run.rows = p.simplifyOrderings(n.run.rows, nil)
+		n.source = p.simplifyOrderings(n.source, nil)
 
 	case *insertNode:
-		n.run.rows = p.simplifyOrderings(n.run.rows, nil)
+		n.source = p.simplifyOrderings(n.source, nil)
 
 	case *upsertNode:
-		n.run.rows = p.simplifyOrderings(n.run.rows, nil)
+		n.source = p.simplifyOrderings(n.source, nil)
 
 	case *deleteNode:
-		n.run.rows = p.simplifyOrderings(n.run.rows, nil)
+		n.source = p.simplifyOrderings(n.source, nil)
+
+	case *rowCountNode:
+		n.source = p.simplifyOrderings(n.source, nil).(batchedPlanNode)
+
+	case *serializeNode:
+		n.source = p.simplifyOrderings(n.source, nil).(batchedPlanNode)
 
 	case *explainDistSQLNode:
-		n.plan = p.simplifyOrderings(n.plan, nil)
-
-	case *showTraceNode:
 		n.plan = p.simplifyOrderings(n.plan, nil)
 
 	case *showTraceReplicaNode:
@@ -579,8 +682,26 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 			n.plan = p.simplifyOrderings(n.plan, nil)
 		}
 
+	case *projectSetNode:
+		// We propagate down any ordering constraint relative to the
+		// source. We don't propagate orderings expressed over the SRF
+		// results.
+		var desiredUp sqlbase.ColumnOrdering
+		for _, colOrder := range usefulOrdering {
+			if colOrder.ColIdx >= n.numColsInSource {
+				break
+			}
+			desiredUp = append(desiredUp, colOrder)
+		}
+		n.source = p.simplifyOrderings(n.source, desiredUp)
+		n.computePhysicalProps()
+
 	case *indexJoinNode:
+		// Passing through usefulOrdering here is fine because indexJoinNodes
+		// produced by the heuristic planner always have the same schema as the
+		// underlying table.
 		n.index.props.trim(usefulOrdering)
+		n.props.trim(usefulOrdering)
 		n.table.props = physicalProps{}
 
 	case *unionNode:
@@ -625,8 +746,10 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 		if n.needOnlyOneRow {
 			n.plan = p.simplifyOrderings(n.plan, n.desiredOrdering)
 		} else {
-			n.plan = p.simplifyOrderings(n.plan, nil)
+			// Keep only the ordering required by the groupNode.
+			n.plan = p.simplifyOrderings(n.plan, translateGroupOrdering(n.props.ordering, n))
 		}
+		n.props.trim(usefulOrdering)
 
 	case *windowNode:
 		n.plan = p.simplifyOrderings(n.plan, nil)
@@ -700,7 +823,16 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 	case *splitNode:
 		n.rows = p.simplifyOrderings(n.rows, nil)
 
-	case *testingRelocateNode:
+	case *relocateNode:
+		n.rows = p.simplifyOrderings(n.rows, nil)
+
+	case *cancelQueriesNode:
+		n.rows = p.simplifyOrderings(n.rows, nil)
+
+	case *cancelSessionsNode:
+		n.rows = p.simplifyOrderings(n.rows, nil)
+
+	case *controlJobsNode:
 		n.rows = p.simplifyOrderings(n.rows, nil)
 
 	case *valuesNode:
@@ -708,9 +840,12 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
+	case *renameColumnNode:
+	case *renameDatabaseNode:
+	case *renameIndexNode:
+	case *renameTableNode:
 	case *scrubNode:
-	case *controlJobNode:
+	case *truncateNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:
@@ -726,7 +861,6 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 	case *zeroNode:
 	case *unaryNode:
 	case *hookFnNode:
-	case *valueGenerator:
 	case *sequenceSelectNode:
 	case *setVarNode:
 	case *setClusterSettingNode:
@@ -734,6 +868,7 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 	case *showZoneConfigNode:
 	case *showRangesNode:
 	case *showFingerprintsNode:
+	case *showTraceNode:
 	case *scatterNode:
 
 	default:

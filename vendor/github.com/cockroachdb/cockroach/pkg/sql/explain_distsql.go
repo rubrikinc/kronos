@@ -18,9 +18,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // explainDistSQLNode is a planNode that wraps a plan and returns
@@ -29,6 +31,13 @@ type explainDistSQLNode struct {
 	optColumnsSlot
 
 	plan planNode
+
+	stmtType tree.StatementType
+
+	// If analyze is set, plan will be executed with tracing enabled and a url
+	// pointing to a visual query plan with statistics will be in the row
+	// returned by the node.
+	analyze bool
 
 	run explainDistSQLRun
 }
@@ -40,33 +49,97 @@ type explainDistSQLRun struct {
 
 	// done is set if Next() was called.
 	done bool
+
+	// executedStatement is set if EXPLAIN ANALYZE was active and finished
+	// executing the query, regardless of query success or failure.
+	executedStatement bool
 }
 
 func (n *explainDistSQLNode) startExec(params runParams) error {
 	// Trigger limit propagation.
-	params.p.setUnlimited(n.plan)
+	params.p.prepareForDistSQLSupportCheck()
 
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
+	recommendation, _ := distSQLPlanner.checkSupportForNode(n.plan)
 
-	auto, err := distSQLPlanner.CheckSupport(n.plan)
-	if err != nil {
-		return err
-	}
+	planCtx := distSQLPlanner.NewPlanningCtx(params.ctx, params.extendedEvalCtx, params.p.txn)
+	planCtx.isLocal = !shouldDistributeGivenRecAndMode(recommendation, params.SessionData().DistSQLMode)
+	planCtx.ignoreClose = true
+	planCtx.planner = params.p
+	planCtx.stmtType = n.stmtType
+	planCtx.validExtendedEvalCtx = true
 
-	planCtx := distSQLPlanner.newPlanningCtx(params.ctx, params.extendedEvalCtx, params.p.txn)
 	plan, err := distSQLPlanner.createPlanForNode(&planCtx, n.plan)
 	if err != nil {
 		return err
 	}
 	distSQLPlanner.FinalizePlan(&planCtx, &plan)
+
+	var spans []tracing.RecordedSpan
+	if n.analyze {
+		if params.SessionData().DistSQLMode == sessiondata.DistSQLOff {
+			return pgerror.NewErrorf(
+				pgerror.CodeObjectNotInPrerequisiteStateError,
+				"cannot run EXPLAIN ANALYZE while distsql is disabled",
+			)
+		}
+		if params.extendedEvalCtx.Tracing.Enabled() {
+			return pgerror.NewErrorf(pgerror.CodeObjectNotInPrerequisiteStateError,
+				"cannot run EXPLAIN ANALYZE while tracing is enabled")
+		}
+		// Start tracing. KV tracing is not enabled because we are only interested
+		// in stats present on the spans. Noop if tracing is already enabled.
+		if err := params.extendedEvalCtx.Tracing.StartTracing(
+			tracing.SnowballRecording,
+			false, /* kvTracingEnabled */
+			false, /* showResults */
+		); err != nil {
+			return err
+		}
+
+		planCtx.ctx = params.extendedEvalCtx.Tracing.ex.ctxHolder.ctx()
+
+		// Discard rows that are returned.
+		rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
+			return nil
+		})
+		execCfg := params.p.ExecCfg()
+		const stmtType = tree.Rows
+		recv := MakeDistSQLReceiver(
+			planCtx.ctx,
+			rw,
+			stmtType,
+			execCfg.RangeDescriptorCache,
+			execCfg.LeaseHolderCache,
+			params.p.txn,
+			func(ts hlc.Timestamp) {
+				_ = execCfg.Clock.Update(ts)
+			},
+			params.extendedEvalCtx.Tracing,
+		)
+		distSQLPlanner.Run(
+			&planCtx, params.p.txn, &plan, recv, params.extendedEvalCtx, nil /* finishedSetupFn */)
+
+		n.run.executedStatement = true
+
+		spans = params.extendedEvalCtx.Tracing.getRecording()
+		if err := params.extendedEvalCtx.Tracing.StopTracing(); err != nil {
+			return err
+		}
+
+		if err := rw.Err(); err != nil {
+			return err
+		}
+	}
+
 	flows := plan.GenerateFlowSpecs(params.extendedEvalCtx.NodeID)
-	planJSON, planURL, err := distsqlrun.GeneratePlanDiagramWithURL(flows)
+	planJSON, planURL, err := distsqlrun.GeneratePlanDiagramURLWithSpans(flows, spans)
 	if err != nil {
 		return err
 	}
 
 	n.run.values = tree.Datums{
-		tree.MakeDBool(tree.DBool(auto)),
+		tree.MakeDBool(tree.DBool(recommendation == shouldDistribute)),
 		tree.NewDString(planURL.String()),
 		tree.NewDString(planJSON),
 	}
@@ -81,11 +154,7 @@ func (n *explainDistSQLNode) Next(runParams) (bool, error) {
 	return true, nil
 }
 
-func (n *explainDistSQLNode) Values() tree.Datums       { return n.run.values }
-func (n *explainDistSQLNode) Close(ctx context.Context) { n.plan.Close(ctx) }
-
-var explainDistSQLColumns = sqlbase.ResultColumns{
-	{Name: "Automatic", Typ: types.Bool},
-	{Name: "URL", Typ: types.String},
-	{Name: "JSON", Typ: types.String, Hidden: true},
+func (n *explainDistSQLNode) Values() tree.Datums { return n.run.values }
+func (n *explainDistSQLNode) Close(ctx context.Context) {
+	n.plan.Close(ctx)
 }

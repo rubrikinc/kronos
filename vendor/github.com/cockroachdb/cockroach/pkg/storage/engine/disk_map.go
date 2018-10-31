@@ -102,6 +102,9 @@ type SortedDiskMap interface {
 	// SortedDiskMapBatchWriter's default capacity with capacityBytes.
 	NewBatchWriterCapacity(capacityBytes int) SortedDiskMapBatchWriter
 
+	// Clear clears the map's data for reuse.
+	Clear() error
+
 	// Close frees up resources held by the map.
 	Close(context.Context)
 }
@@ -225,7 +228,13 @@ func (r *RocksDBMap) NewIterator() SortedDiskMapIterator {
 	// NOTE: prefix is only false because we can't use the normal prefix
 	// extractor. This iterator still only does prefix iteration. See
 	// RocksDBMapIterator.Valid().
-	return &RocksDBMapIterator{iter: r.store.NewIterator(false /* prefix */), makeKey: r.makeKey, prefix: r.prefix}
+	return &RocksDBMapIterator{
+		iter: r.store.NewIterator(IterOptions{
+			UpperBound: roachpb.Key(r.prefix).PrefixEnd(),
+		}),
+		makeKey: r.makeKey,
+		prefix:  r.prefix,
+	}
 }
 
 // NewBatchWriter implements the SortedDiskMap interface.
@@ -247,13 +256,21 @@ func (r *RocksDBMap) NewBatchWriterCapacity(capacityBytes int) SortedDiskMapBatc
 	}
 }
 
-// Close implements the SortedDiskMap interface.
-func (r *RocksDBMap) Close(ctx context.Context) {
+// Clear implements the SortedDiskMap interface.
+func (r *RocksDBMap) Clear() error {
 	if err := r.store.ClearRange(
 		MVCCKey{Key: r.prefix},
 		MVCCKey{Key: roachpb.Key(r.prefix).PrefixEnd()},
 	); err != nil {
-		log.Error(ctx, errors.Wrapf(err, "unable to clear range with prefix %v", r.prefix))
+		return errors.Wrapf(err, "unable to clear range with prefix %v", r.prefix)
+	}
+	return nil
+}
+
+// Close implements the SortedDiskMap interface.
+func (r *RocksDBMap) Close(ctx context.Context) {
+	if err := r.Clear(); err != nil {
+		log.Error(ctx, err)
 	}
 }
 
@@ -323,7 +340,7 @@ func (b *RocksDBMapBatchWriter) Put(k []byte, v []byte) error {
 
 // Flush implements the SortedDiskMapBatchWriter interface.
 func (b *RocksDBMapBatchWriter) Flush() error {
-	if len(b.batch.Repr()) < 1 {
+	if b.batch.Empty() {
 		return nil
 	}
 	if err := b.batch.Commit(false /* syncCommit */); err != nil {

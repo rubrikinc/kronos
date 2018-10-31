@@ -83,11 +83,11 @@ func TestValues(t *testing.T) {
 		return []tree.Datums{datums}
 	}
 
-	makeValues := func(tuples ...*tree.Tuple) *tree.ValuesClause {
-		return &tree.ValuesClause{Tuples: tuples}
+	makeValues := func(tuples ...tree.Exprs) *tree.ValuesClause {
+		return &tree.ValuesClause{Rows: tuples}
 	}
-	makeTuple := func(exprs ...tree.Expr) *tree.Tuple {
-		return &tree.Tuple{Exprs: exprs}
+	makeTuple := func(exprs ...tree.Expr) tree.Exprs {
+		return tree.Exprs(exprs)
 	}
 
 	testCases := []struct {
@@ -234,15 +234,13 @@ func TestGolangQueryArgs(t *testing.T) {
 		{roachpb.RKey("key"), reflect.TypeOf(types.Bytes)},
 	}
 
-	pinfo := &tree.PlaceholderInfo{}
 	for i, tcase := range testCases {
-		golangFillQueryArguments(pinfo, []interface{}{tcase.value})
-		output, valid := pinfo.Type("1", false)
-		if !valid {
-			t.Errorf("case %d failed: argument was invalid", i)
-			continue
+		datums := golangFillQueryArguments(tcase.value)
+		if len(datums) != 1 {
+			t.Fatalf("epected 1 datum, got: %d", len(datums))
 		}
-		if a, e := reflect.TypeOf(output), tcase.expectedType; a != e {
+		d := datums[0]
+		if a, e := reflect.TypeOf(d.ResolvedType()), tcase.expectedType; a != e {
 			t.Errorf("case %d failed: expected type %s, got %s", i, e.String(), a.String())
 		}
 	}

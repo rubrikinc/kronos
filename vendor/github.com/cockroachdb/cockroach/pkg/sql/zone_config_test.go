@@ -88,11 +88,20 @@ func waitForConfigChange(t testing.TB, s *server.TestServer) config.SystemConfig
 func TestGetZoneConfig(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
+	cfg := config.DefaultSystemZoneConfig()
+	cfg.NumReplicas = 1
+	cfg.RangeMinBytes = 1 << 20
+	cfg.RangeMaxBytes = 1 << 20
+	cfg.GC.TTLSeconds = 60
+
+	fnSys := config.TestingSetDefaultSystemZoneConfig(cfg)
+	defer fnSys()
+
 	srv, sqlDB, _ := serverutils.StartServer(t, params)
 	defer srv.Stopper().Stop(context.TODO())
 	s := srv.(*server.TestServer)
 
-	expectedCounter := uint32(keys.MaxReservedDescID)
+	expectedCounter := uint32(keys.MinNonPredefinedUserDescID)
 
 	defaultZoneConfig := config.DefaultZoneConfig()
 	defaultZoneConfig.RangeMinBytes = 1 << 20
@@ -128,7 +137,7 @@ func TestGetZoneConfig(t *testing.T) {
 			// Verify sql.GetZoneConfigInTxn.
 			if err := s.DB().Txn(context.Background(), func(ctx context.Context, txn *client.Txn) error {
 				_, zoneCfg, subzone, err := sql.GetZoneConfigInTxn(ctx, txn,
-					tc.objectID, &sqlbase.IndexDescriptor{}, tc.partitionName)
+					tc.objectID, &sqlbase.IndexDescriptor{}, tc.partitionName, false)
 				if err != nil {
 					return err
 				} else if subzone != nil {
@@ -159,7 +168,6 @@ func TestGetZoneConfig(t *testing.T) {
 	// db1 has tables tb11 and tb12
 	// db2 has tables tb21 and tb22
 
-	expectedCounter++
 	db1 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE DATABASE db1`); err != nil {
 		t.Fatal(err)
@@ -321,7 +329,7 @@ func BenchmarkGetZoneConfig(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := cfg.GetZoneConfigForKey(keys.MakeTablePrefix(keys.MaxReservedDescID + 1))
+		_, err := cfg.GetZoneConfigForKey(keys.MakeTablePrefix(keys.MinUserDescID))
 		if err != nil {
 			b.Fatal(err)
 		}

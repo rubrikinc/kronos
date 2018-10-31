@@ -28,7 +28,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/pkg/errors"
 
@@ -71,12 +70,15 @@ var (
 
 // RKey denotes a Key whose local addressing has been accounted for.
 // A key can be transformed to an RKey by keys.Addr().
+//
+// RKey stands for "resolved key," as in a key whose address has been resolved.
 type RKey Key
 
 // AsRawKey returns the RKey as a Key. This is to be used only in select
 // situations in which an RKey is known to not contain a wrapped locally-
-// addressed Key. Whenever the Key which created the RKey is still available,
-// it should be used instead.
+// addressed Key. That is, it must only be used when the original Key was not a
+// local key. Whenever the Key which created the RKey is still available, it
+// should be used instead.
 func (rk RKey) AsRawKey() Key {
 	return Key(rk)
 }
@@ -653,10 +655,10 @@ func (v Value) PrettyPrint() string {
 	case ValueType_BYTES:
 		var data []byte
 		data, err = v.GetBytes()
-		printable := len(bytes.TrimLeftFunc(data, unicode.IsPrint)) == 0
-		if printable {
+		if encoding.PrintableBytes(data) {
 			buf.WriteString(string(data))
 		} else {
+			buf.WriteString("0x")
 			buf.WriteString(hex.EncodeToString(data))
 		}
 	case ValueType_TIME:
@@ -724,13 +726,36 @@ func MakeTransaction(
 			Isolation: isolation,
 			Timestamp: now,
 			Priority:  MakePriority(userPriority),
-			Sequence:  1,
+			Sequence:  0, // 1-indexed, incremented before each Request
 		},
 		Name:          name,
 		LastHeartbeat: now,
 		OrigTimestamp: now,
 		MaxTimestamp:  maxTS,
 	}
+}
+
+// MakeTxnCoordMeta creates a new transaction coordinator meta for the given
+// transaction.
+func MakeTxnCoordMeta(txn Transaction) TxnCoordMeta {
+	return TxnCoordMeta{Txn: txn, DeprecatedRefreshValid: true}
+}
+
+// StripRootToLeaf strips out all information that is unnecessary to communicate
+// to leaf transactions.
+func (meta *TxnCoordMeta) StripRootToLeaf() *TxnCoordMeta {
+	meta.Intents = nil
+	meta.CommandCount = 0
+	meta.RefreshReads = nil
+	meta.RefreshWrites = nil
+	return meta
+}
+
+// StripLeafToRoot strips out all information that is unnecessary to communicate
+// back to the root transaction.
+func (meta *TxnCoordMeta) StripLeafToRoot() *TxnCoordMeta {
+	meta.OutstandingWrites = nil
+	return meta
 }
 
 // LastActive returns the last timestamp at which client activity definitely
@@ -874,6 +899,9 @@ func (t *Transaction) Restart(
 	t.WriteTooOld = false
 	t.RetryOnPush = false
 	t.Sequence = 0
+	// Reset Writing. Since we're using a new epoch, we don't care about the abort
+	// cache.
+	t.Writing = false
 }
 
 // BumpEpoch increments the transaction's epoch, allowing for an in-place
@@ -1074,9 +1102,7 @@ func PrepareTransactionForRetry(
 		// advanced to at least the error's timestamp?
 		now := clock.Now()
 		newTxnTimestamp := now
-		if newTxnTimestamp.Less(txn.Timestamp) {
-			newTxnTimestamp = txn.Timestamp
-		}
+		newTxnTimestamp.Forward(txn.Timestamp)
 		txn = MakeTransaction(
 			txn.Name,
 			nil, // baseKey
@@ -1131,6 +1157,11 @@ func CanTransactionRetryAtRefreshedTimestamp(
 			return false, nil
 		}
 	case *WriteTooOldError:
+		// TODO(andrei): Chances of success for on write-too-old conditions might be
+		// usually small: if our txn previously read the key that generated this
+		// error, obviously the refresh will fail. It might be worth trying to
+		// detect these cases and save the futile attempt; we'd need to have access
+		// to the key that generated the error.
 		timestamp.Forward(writeTooOldRetryTimestamp(txn, err))
 	case *ReadWithinUncertaintyIntervalError:
 		timestamp.Forward(

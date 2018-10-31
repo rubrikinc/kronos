@@ -90,7 +90,7 @@ var logStatementsExecuteEnabled = settings.RegisterBoolSetting(
 	false,
 )
 
-// maybeLogStatement conditionally records the current statemenbt
+// maybeLogStatement conditionally records the current statement
 // (p.curPlan) to the exec / audit logs.
 func (p *planner) maybeLogStatement(ctx context.Context, lbl string, rows int, err error) {
 	p.maybeLogStatementInternal(
@@ -98,11 +98,7 @@ func (p *planner) maybeLogStatement(ctx context.Context, lbl string, rows int, e
 }
 
 func (p *planner) maybeLogStatementInternal(
-	ctx context.Context,
-	lbl string,
-	rows int,
-	err error,
-	startTime time.Time,
+	ctx context.Context, lbl string, rows int, err error, startTime time.Time,
 ) {
 	// Note: if you find the code below crashing because p.execCfg == nil,
 	// do not add a test "if p.execCfg == nil { do nothing }" !
@@ -123,7 +119,7 @@ func (p *planner) maybeLogStatementInternal(
 
 	// label passed as argument.
 
-	appName := s.ApplicationName()
+	appName := p.EvalContext().SessionData.ApplicationName
 
 	logTrigger := "{}"
 	if auditEventsDetected {

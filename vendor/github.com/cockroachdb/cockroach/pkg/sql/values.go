@@ -16,11 +16,9 @@ package sql
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 
-	"github.com/pkg/errors"
-
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -47,27 +45,47 @@ type valuesNode struct {
 
 // Values implements the VALUES clause.
 func (p *planner) Values(
-	ctx context.Context, n *tree.ValuesClause, desiredTypes []types.T,
+	ctx context.Context, origN tree.Statement, desiredTypes []types.T,
 ) (planNode, error) {
 	v := &valuesNode{
 		specifiedInQuery: true,
 		isConst:          true,
 	}
-	if len(n.Tuples) == 0 {
+
+	// If we have names, extract them.
+	var n *tree.ValuesClause
+	switch t := origN.(type) {
+	case *tree.ValuesClauseWithNames:
+		n = &t.ValuesClause
+	case *tree.ValuesClause:
+		n = t
+	default:
+		return nil, pgerror.NewAssertionErrorf("unhandled case in values: %T %v", origN, origN)
+	}
+
+	if len(n.Rows) == 0 {
 		return v, nil
 	}
 
-	numCols := len(n.Tuples[0].Exprs)
+	numCols := len(n.Rows[0])
 
-	v.tuples = make([][]tree.TypedExpr, 0, len(n.Tuples))
-	tupleBuf := make([]tree.TypedExpr, len(n.Tuples)*numCols)
+	v.tuples = make([][]tree.TypedExpr, 0, len(n.Rows))
+	tupleBuf := make([]tree.TypedExpr, len(n.Rows)*numCols)
 
 	v.columns = make(sqlbase.ResultColumns, 0, numCols)
 
 	lastKnownSubqueryIndex := len(p.curPlan.subqueryPlans)
 
-	for num, tuple := range n.Tuples {
-		if a, e := len(tuple.Exprs), numCols; a != e {
+	// We need to save and restore the previous value of the field in
+	// semaCtx in case we are recursively called within a subquery
+	// context.
+	defer p.semaCtx.Properties.Restore(p.semaCtx.Properties)
+
+	// Ensure there are no special functions in the clause.
+	p.semaCtx.Properties.Require("VALUES", tree.RejectSpecial)
+
+	for num, tuple := range n.Rows {
+		if a, e := len(tuple), numCols; a != e {
 			return nil, newValuesListLenErr(e, a)
 		}
 
@@ -75,17 +93,13 @@ func (p *planner) Values(
 		tupleRow := tupleBuf[:numCols:numCols]
 		tupleBuf = tupleBuf[numCols:]
 
-		for i, expr := range tuple.Exprs {
-			if err := p.txCtx.AssertNoAggregationOrWindowing(
-				expr, "VALUES", p.SessionData().SearchPath,
-			); err != nil {
-				return nil, err
-			}
-
+		for i, expr := range tuple {
 			desired := types.Any
 			if len(desiredTypes) > i {
 				desired = desiredTypes[i]
 			}
+
+			// Clear the properties so we can check them below.
 			typedExpr, err := p.analyzeExpr(ctx, expr, nil, tree.IndexedVarHelper{}, desired, false, "")
 			if err != nil {
 				return nil, err
@@ -97,7 +111,8 @@ func (p *planner) Values(
 			} else if v.columns[i].Typ == types.Unknown {
 				v.columns[i].Typ = typ
 			} else if typ != types.Unknown && !typ.Equivalent(v.columns[i].Typ) {
-				return nil, fmt.Errorf("VALUES list type mismatch, %s for %s", typ, v.columns[i].Typ)
+				return nil, pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+					"VALUES types %s and %s cannot be matched", typ, v.columns[i].Typ)
 			}
 
 			tupleRow[i] = typedExpr
@@ -142,7 +157,7 @@ func (n *valuesNode) startExec(params runParams) error {
 
 	// This node is coming from a SQL query (as opposed to sortNode and
 	// others that create a valuesNode internally for storing results
-	// from other planNodes), so its expressions need evaluting.
+	// from other planNodes), so its expressions need evaluating.
 	// This may run subqueries.
 	n.rows = sqlbase.NewRowContainer(
 		params.extendedEvalCtx.Mon.MakeBoundAccount(),
@@ -201,6 +216,8 @@ func (n *valuesNode) Close(ctx context.Context) {
 }
 
 func newValuesListLenErr(exp, got int) error {
-	return errors.Errorf("VALUES lists must all be the same length, expected %d columns, found %d",
+	return pgerror.NewErrorf(
+		pgerror.CodeSyntaxError,
+		"VALUES lists must all be the same length, expected %d columns, found %d",
 		exp, got)
 }

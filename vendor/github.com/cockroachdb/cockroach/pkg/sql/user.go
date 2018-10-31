@@ -19,9 +19,9 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // GetUserHashedPassword returns the hashedPassword for the given username if
@@ -35,36 +35,25 @@ func GetUserHashedPassword(
 		return true, nil, nil
 	}
 
-	var hashedPassword []byte
-	var exists bool
-	err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		p, cleanup := newInternalPlanner(
-			"get-pwd", txn, security.RootUser, metrics, execCfg)
-		defer cleanup()
-		const getHashedPassword = `SELECT "hashedPassword" FROM system.users ` +
-			`WHERE username=$1 AND "isRole" = false`
-		values, err := p.queryRow(ctx, getHashedPassword, normalizedUsername)
-		if err != nil {
-			return errors.Errorf("error looking up user %s", normalizedUsername)
-		}
-		if len(values) == 0 {
-			return nil
-		}
-		exists = true
-		hashedPassword = []byte(*(values[0].(*tree.DBytes)))
-		return nil
-	})
-
-	return exists, hashedPassword, err
+	const getHashedPassword = `SELECT "hashedPassword" FROM system.users ` +
+		`WHERE username=$1 AND "isRole" = false`
+	values, err := execCfg.InternalExecutor.QueryRow(
+		ctx, "get-hashed-pwd", nil /* txn */, getHashedPassword, normalizedUsername)
+	if err != nil {
+		return false, nil, errors.Wrapf(err, "error looking up user %s", normalizedUsername)
+	}
+	if values == nil {
+		return false, nil, nil
+	}
+	hashedPassword := []byte(*(values[0].(*tree.DBytes)))
+	return true, hashedPassword, nil
 }
 
 // The map value is true if the map key is a role, false if it is a user.
 func (p *planner) GetAllUsersAndRoles(ctx context.Context) (map[string]bool, error) {
 	query := `SELECT username,"isRole"  FROM system.users`
-	newPlanner, cleanup := newInternalPlanner(
-		"get-all-users-and-roles", p.txn, security.RootUser, p.extendedEvalCtx.MemMetrics, p.ExecCfg())
-	defer cleanup()
-	rows, _ /* cols */, err := newPlanner.queryRows(ctx, query)
+	rows, _ /* cols */, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+		ctx, "read-users", p.txn, query)
 	if err != nil {
 		return nil, err
 	}
@@ -78,31 +67,20 @@ func (p *planner) GetAllUsersAndRoles(ctx context.Context) (map[string]bool, err
 	return users, nil
 }
 
-// Returns true is the requested username is a role, false if it is a user.
-// Returns error if it does not exist.
-func existingUserIsRole(
-	ctx context.Context, ie InternalExecutor, opName string, txn *client.Txn, username string,
-) (bool, error) {
-	values, err := ie.QueryRowInTransaction(
-		ctx,
-		opName,
-		txn,
-		`SELECT "isRole" FROM system.users WHERE username=$1`,
-		username)
-	if err != nil {
-		return false, errors.Errorf("error looking up user %s", username)
-	}
-	if len(values) == 0 {
-		return false, errors.Errorf("no user or role named %s", username)
-	}
-
-	isRole := bool(*(values[0]).(*tree.DBool))
-	return isRole, nil
-}
-
 var roleMembersTableName = tree.MakeTableName("system", "role_members")
 
-// BumpRoleMembershipTableVersion increases the table version for the role membership table.
+// BumpRoleMembershipTableVersion increases the table version for the
+// role membership table.
 func (p *planner) BumpRoleMembershipTableVersion(ctx context.Context) error {
-	return p.bumpTableVersion(ctx, &roleMembersTableName)
+	var tableDesc *TableDescriptor
+	var err error
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
+		tableDesc, _, err = p.PhysicalSchemaAccessor().GetObjectDesc(&roleMembersTableName,
+			p.ObjectLookupFlags(ctx, true /*required*/))
+	})
+	if err != nil {
+		return err
+	}
+
+	return p.writeSchemaChange(ctx, tableDesc, sqlbase.InvalidMutationID)
 }

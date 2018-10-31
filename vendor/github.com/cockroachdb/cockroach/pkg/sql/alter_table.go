@@ -17,20 +17,31 @@ package sql
 import (
 	"bytes"
 	"context"
+	gojson "encoding/json"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachange"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
+	"golang.org/x/text/language"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 type alterTableNode struct {
 	n         *tree.AlterTable
 	tableDesc *sqlbase.TableDescriptor
+	// statsData is populated with data for "alter table inject statistics"
+	// commands - the JSON stats expressions.
+	// It is parallel with n.Cmds (for the inject stats commands).
+	statsData map[int]tree.TypedExpr
 }
 
 // AlterTable applies a schema change on a table.
@@ -43,12 +54,7 @@ func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode,
 		return nil, err
 	}
 
-	var tableDesc *TableDescriptor
-	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
-	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
-		tableDesc, err = ResolveExistingObject(ctx, p, tn, !n.IfExists, requireTableDesc)
-	})
+	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, tn, !n.IfExists, requireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +65,28 @@ func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode,
 	if err := p.CheckPrivilege(ctx, tableDesc, privilege.CREATE); err != nil {
 		return nil, err
 	}
-	return &alterTableNode{n: n, tableDesc: tableDesc}, nil
+
+	// See if there's any "inject statistics" in the query and type check the
+	// expressions.
+	statsData := make(map[int]tree.TypedExpr)
+	for i, cmd := range n.Cmds {
+		injectStats, ok := cmd.(*tree.AlterTableInjectStats)
+		if !ok {
+			continue
+		}
+		typedExpr, err := p.analyzeExpr(
+			ctx, injectStats.Stats,
+			nil, /* sources - no name resolution */
+			tree.IndexedVarHelper{},
+			types.JSON, true, /* requireType */
+			"INJECT STATISTICS" /* typingContext */)
+		if err != nil {
+			return nil, err
+		}
+		statsData[i] = typedExpr
+	}
+
+	return &alterTableNode{n: n, tableDesc: tableDesc, statsData: statsData}, nil
 }
 
 func (n *alterTableNode) startExec(params runParams) error {
@@ -71,7 +98,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 	var droppedViews []string
 	tn := n.n.Table.TableName()
 
-	for _, cmd := range n.n.Cmds {
+	for i, cmd := range n.n.Cmds {
 		switch t := cmd.(type) {
 		case *tree.AlterTableAddColumn:
 			d := t.ColumnDef
@@ -83,10 +110,18 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return pgerror.Unimplemented(
 					"alter add fk", "adding a REFERENCES constraint via ALTER not supported")
 			}
-			if d.Computed.Computed {
-				return pgerror.Unimplemented(
-					"alter add computed", "adding a computed column via ALTER not supported")
+
+			newDef, seqDbDesc, seqName, seqOpts, err := params.p.processSerialInColumnDef(params.ctx, d, tn)
+			if err != nil {
+				return err
 			}
+			if seqName != nil {
+				if err := doCreateSequence(params, n.n.String(), seqDbDesc, seqName, seqOpts); err != nil {
+					return err
+				}
+			}
+			d = newDef
+
 			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, &params.p.semaCtx, params.EvalContext())
 			if err != nil {
 				return err
@@ -94,20 +129,14 @@ func (n *alterTableNode) startExec(params runParams) error {
 			// If the new column has a DEFAULT expression that uses a sequence, add references between
 			// its descriptor and this column descriptor.
 			if d.HasDefaultExpr() {
-				var changedSeqDescs []*TableDescriptor
-				// DDL statements use uncached descriptors, and can view newly added things.
-				// TODO(vivek): check if the cache can be used.
-				params.p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
-					changedSeqDescs, err = maybeAddSequenceDependencies(params.p, n.tableDesc, col, expr, params.EvalContext())
-				})
+				changedSeqDescs, err := maybeAddSequenceDependencies(params.p, n.tableDesc, col, expr, params.EvalContext())
 				if err != nil {
 					return err
 				}
 				for _, changedSeqDesc := range changedSeqDescs {
-					if err := params.p.writeTableDesc(params.ctx, changedSeqDesc); err != nil {
+					if err := params.p.writeSchemaChange(params.ctx, changedSeqDesc, sqlbase.InvalidMutationID); err != nil {
 						return err
 					}
-					params.p.notifySchemaChange(changedSeqDesc, sqlbase.InvalidMutationID)
 				}
 			}
 
@@ -193,7 +222,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				if err != nil {
 					return err
 				}
-				ck, err := makeCheckConstraint(params.ctx,
+				ck, err := MakeCheckConstraint(params.ctx,
 					*n.tableDesc, d, inuseNames, &params.p.semaCtx, params.EvalContext(), *tableName)
 				if err != nil {
 					return err
@@ -223,7 +252,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				// on tables that were just added. See the comment at the start of
 				// the global-scope resolveFK().
 				// TODO(vivek): check if the cache can be used.
-				params.p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+				params.p.runWithOptions(resolveFlags{skipCache: true}, func() {
 					err = params.p.resolveFK(params.ctx, n.tableDesc, d, affected, sqlbase.ConstraintValidity_Unvalidated)
 				})
 				if err != nil {
@@ -231,7 +260,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 				}
 				descriptorChanged = true
 				for _, updated := range affected {
-					if err := params.p.saveNonmutationAndNotify(params.ctx, updated); err != nil {
+					if err := params.p.writeSchemaChange(params.ctx, updated, sqlbase.InvalidMutationID); err != nil {
 						return err
 					}
 				}
@@ -540,8 +569,17 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
+		case *tree.AlterTableInjectStats:
+			sd, ok := n.statsData[i]
+			if !ok {
+				return pgerror.NewAssertionErrorf("missing stats data")
+			}
+			if err := injectTableStats(params, n.tableDesc, sd); err != nil {
+				return err
+			}
+
 		default:
-			return fmt.Errorf("unsupported alter command: %T", cmd)
+			return pgerror.NewAssertionErrorf("unsupported alter command: %T", cmd)
 		}
 	}
 	// Were some changes made?
@@ -561,25 +599,23 @@ func (n *alterTableNode) startExec(params runParams) error {
 	}
 
 	mutationID := sqlbase.InvalidMutationID
-	var err error
 	if addedMutations {
+		var err error
 		mutationID, err = params.p.createSchemaChangeJob(params.ctx, n.tableDesc,
 			tree.AsStringWithFlags(n.n, tree.FmtAlwaysQualifyTableNames))
-	} else {
-		err = n.tableDesc.SetUpVersion()
-	}
-	if err != nil {
-		return err
+		if err != nil {
+			return err
+		}
 	}
 
-	if err := params.p.writeTableDesc(params.ctx, n.tableDesc); err != nil {
+	if err := params.p.writeSchemaChange(params.ctx, n.tableDesc, mutationID); err != nil {
 		return err
 	}
 
 	// Record this table alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
+	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
 		params.ctx,
 		params.p.txn,
 		EventLogAlterTable,
@@ -593,13 +629,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			CascadeDroppedViews []string
 		}{n.n.Table.TableName().FQString(), n.n.String(),
 			params.SessionData().User, uint32(mutationID), droppedViews},
-	); err != nil {
-		return err
-	}
-
-	params.p.notifySchemaChange(n.tableDesc, mutationID)
-
-	return nil
+	)
 }
 
 func (p *planner) setAuditMode(
@@ -633,6 +663,60 @@ func applyColumnMutation(
 	params runParams,
 ) error {
 	switch t := mut.(type) {
+	case *tree.AlterTableAlterColumnType:
+		// Convert the parsed type into one of the basic datum types.
+		datum := coltypes.CastTargetToDatumType(t.ToType)
+
+		// Special handling for STRING COLLATE xy to verify that we recognize the language.
+		if t.Collation != "" {
+			if types.IsStringType(datum) {
+				if _, err := language.Parse(t.Collation); err != nil {
+					return pgerror.NewErrorf(pgerror.CodeSyntaxError, `invalid locale %s`, t.Collation)
+				}
+				datum = types.TCollatedString{Locale: t.Collation}
+			} else {
+				return pgerror.NewError(pgerror.CodeSyntaxError, "COLLATE can only be used with string types")
+			}
+		}
+
+		// First pass at converting the datum type to the SQL column type.
+		nextType, err := sqlbase.DatumTypeToColumnType(datum)
+		if err != nil {
+			return err
+		}
+
+		// Finish populating width, precision, etc. from parsed data.
+		nextType, err = sqlbase.PopulateTypeAttrs(nextType, t.ToType)
+		if err != nil {
+			return err
+		}
+
+		// No-op if the types are Equal.  We don't use Equivalent here
+		// because the user may want to change the visible type of the
+		// column without changing the underlying semantic type.
+		if col.Type.Equal(nextType) {
+			return nil
+		}
+
+		kind, err := schemachange.ClassifyConversion(&col.Type, &nextType)
+		if err != nil {
+			return err
+		}
+
+		switch kind {
+		case schemachange.ColumnConversionDangerous, schemachange.ColumnConversionImpossible:
+			// We're not going to make it impossible for the user to perform
+			// this conversion, but we do want them to explicit about
+			// what they're going for.
+			return pgerror.NewErrorf(pgerror.CodeCannotCoerceError,
+				"the requested type conversion (%s -> %s) requires an explicit USING expression",
+				col.Type.SQLString(), nextType.SQLString())
+		case schemachange.ColumnConversionTrivial:
+			col.Type = nextType
+		default:
+			return pgerror.Unimplemented("alter column type", "type conversion not yet implemented")
+		}
+
 	case *tree.AlterTableSetDefault:
 		if len(col.UsesSequenceIds) > 0 {
 			if err := removeSequenceDependencies(tableDesc, col, params); err != nil {
@@ -644,7 +728,7 @@ func applyColumnMutation(
 		} else {
 			colDatumType := col.Type.ToDatumType()
 			expr, err := sqlbase.SanitizeVarFreeExpr(
-				t.Default, colDatumType, "DEFAULT", &params.p.semaCtx, params.EvalContext(),
+				t.Default, colDatumType, "DEFAULT", &params.p.semaCtx, params.EvalContext(), true, /* allowImpure */
 			)
 			if err != nil {
 				return err
@@ -653,26 +737,22 @@ func applyColumnMutation(
 			col.DefaultExpr = &s
 
 			// Add references to the sequence descriptors this column is now using.
-
-			// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
-			// TODO(vivek): check if the cache can be used.
-			var changedSeqDescs []*TableDescriptor
-			params.p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
-				changedSeqDescs, err = maybeAddSequenceDependencies(params.p, tableDesc, col, expr, params.EvalContext())
-			})
+			changedSeqDescs, err := maybeAddSequenceDependencies(params.p, tableDesc, col, expr, params.EvalContext())
 			if err != nil {
 				return err
 			}
 			for _, changedSeqDesc := range changedSeqDescs {
-				if err := params.p.writeTableDesc(params.ctx, changedSeqDesc); err != nil {
+				if err := params.p.writeSchemaChange(params.ctx, changedSeqDesc, sqlbase.InvalidMutationID); err != nil {
 					return err
 				}
-				params.p.notifySchemaChange(changedSeqDesc, sqlbase.InvalidMutationID)
 			}
 		}
 
 	case *tree.AlterTableDropNotNull:
 		col.Nullable = true
+
+	case *tree.AlterTableDropStored:
+		col.ComputeExpr = nil
 	}
 	return nil
 }
@@ -688,4 +768,101 @@ func labeledRowValues(cols []sqlbase.ColumnDescriptor, values tree.Datums) strin
 		s.WriteString(values[i].String())
 	}
 	return s.String()
+}
+
+// injectTableStats implements the INJECT STATISTICS command, which deletes any
+// existing statistics on the table and replaces them with the statistics in the
+// given json object (in the same format as the result of SHOW STATISTICS USING
+// JSON). This is useful for reproducing planning issues without importing the
+// data.
+func injectTableStats(
+	params runParams, desc *sqlbase.TableDescriptor, statsExpr tree.TypedExpr,
+) error {
+	val, err := statsExpr.Eval(params.EvalContext())
+	if err != nil {
+		return err
+	}
+	if val == tree.DNull {
+		return fmt.Errorf("statistics cannot be NULL")
+	}
+	jsonStr := val.(*tree.DJSON).JSON.String()
+	var jsonStats []stats.JSONStatistic
+	if err := gojson.Unmarshal([]byte(jsonStr), &jsonStats); err != nil {
+		return err
+	}
+
+	// First, delete all statistics for the table.
+	if _ /* rows */, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		params.ctx,
+		"delete-stats",
+		params.EvalContext().Txn,
+		`DELETE FROM system.table_statistics WHERE "tableID" = $1`, desc.ID,
+	); err != nil {
+		return errors.Wrapf(err, "failed to delete old stats")
+	}
+
+	// Insert each statistic.
+	for i := range jsonStats {
+		s := &jsonStats[i]
+		h, err := s.GetHistogram(params.EvalContext())
+		if err != nil {
+			return err
+		}
+		// histogram will be passed to the INSERT statement; we want it to be a
+		// nil interface{} if we don't generate a histogram.
+		var histogram interface{}
+		if h != nil {
+			histogram, err = protoutil.Marshal(h)
+			if err != nil {
+				return err
+			}
+		}
+
+		columnIDs := tree.NewDArray(types.Int)
+		for _, colName := range s.Columns {
+			colDesc, _, err := desc.FindColumnByName(tree.Name(colName))
+			if err != nil {
+				return err
+			}
+			if err := columnIDs.Append(tree.NewDInt(tree.DInt(colDesc.ID))); err != nil {
+				return err
+			}
+		}
+		var name interface{}
+		if s.Name != "" {
+			name = s.Name
+		}
+		if _ /* rows */, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+			params.ctx,
+			"insert-stats",
+			params.EvalContext().Txn,
+			`INSERT INTO system.table_statistics (
+					"tableID",
+					"name",
+					"columnIDs",
+					"createdAt",
+					"rowCount",
+					"distinctCount",
+					"nullCount",
+					histogram
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			desc.ID,
+			name,
+			columnIDs,
+			s.CreatedAt,
+			s.RowCount,
+			s.DistinctCount,
+			s.NullCount,
+			histogram,
+		); err != nil {
+			return errors.Wrapf(err, "failed to insert stats")
+		}
+	}
+
+	// Invalidate the local cache synchronously; this guarantees that the next
+	// statement in the same session won't use a stale cache (whereas the gossip
+	// update is handled asynchronously).
+	params.extendedEvalCtx.ExecCfg.TableStatsCache.InvalidateTableStats(params.ctx, desc.ID)
+
+	return stats.GossipTableStatAdded(params.extendedEvalCtx.ExecCfg.Gossip, desc.ID)
 }

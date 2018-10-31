@@ -17,6 +17,8 @@ package sql_test
 import (
 	"context"
 	gosql "database/sql"
+	"fmt"
+	"math/rand"
 	"testing"
 
 	"github.com/lib/pq"
@@ -306,9 +308,6 @@ func TestShowTablesAfterRecreateDatabase(t *testing.T) {
 			},
 			AsyncExecNotification: asyncSchemaChangerDisabled,
 		},
-		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
-			DisableMigrations: true,
-		},
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
@@ -354,7 +353,7 @@ func TestDropIndex(t *testing.T) {
 	defer s.Stopper().Stop(context.TODO())
 
 	numRows := 2*chunkSize + 1
-	if err := tests.CreateKVTable(sqlDB, numRows); err != nil {
+	if err := tests.CreateKVTable(sqlDB, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
@@ -392,7 +391,7 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	// Create a test table with a secondary index.
-	if err := tests.CreateKVTable(sqlDB.DB, numRows); err != nil {
+	if err := tests.CreateKVTable(sqlDB.DB, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
@@ -489,24 +488,17 @@ func TestDropIndexInterleaved(t *testing.T) {
 func TestDropTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			// Disable the asynchronous path so that the table data left
-			// behind is not cleaned up.
-			AsyncExecNotification: asyncSchemaChangerDisabled,
-		},
-	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
 	numRows := 2*sql.TableTruncateChunkSize + 1
-	if err := tests.CreateKVTable(sqlDB, numRows); err != nil {
+	if err := tests.CreateKVTable(sqlDB, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
 
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	nameKey := sqlbase.MakeNameMetadataKey(keys.MaxReservedDescID+1, "kv")
+	nameKey := sqlbase.MakeNameMetadataKey(keys.MinNonPredefinedUserDescID, "kv")
 	gr, err := kvDB.Get(ctx, nameKey)
 
 	if err != nil {
@@ -553,7 +545,7 @@ func TestDropTable(t *testing.T) {
 	}
 
 	// Can create a table with the same name.
-	if err := tests.CreateKVTable(sqlDB, numRows); err != nil {
+	if err := tests.CreateKVTable(sqlDB, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
 
@@ -583,54 +575,94 @@ func TestDropTableDeleteData(t *testing.T) {
 	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
-	numRows := 2*sql.TableTruncateChunkSize + 1
-	if err := tests.CreateKVTable(sqlDB, numRows); err != nil {
-		t.Fatal(err)
-	}
-
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	nameKey := sqlbase.MakeNameMetadataKey(keys.MaxReservedDescID+1, "kv")
-	gr, err := kvDB.Get(ctx, nameKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !gr.Exists() {
-		t.Fatalf("Name entry %q does not exist", nameKey)
-	}
-
-	tableSpan := tableDesc.TableSpan()
-	tests.CheckKeyCount(t, kvDB, tableSpan, 3*numRows)
-	if _, err := sqlDB.Exec(`DROP TABLE t.kv`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Data still exists.
-	if err := descExists(sqlDB, true, tableDesc.ID); err != nil {
-		t.Fatal(err)
-	}
-	tests.CheckKeyCount(t, kvDB, tableSpan, 3*numRows)
-
-	// Push a new zone config for the table with TTL=0 so the data
-	// is deleted immediately.
-	cfg := config.DefaultZoneConfig()
-	cfg.GC.TTLSeconds = 0
-	buf, err := protoutil.Marshal(&cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, tableDesc.ID, buf); err != nil {
-		t.Fatal(err)
-	}
-
-	testutils.SucceedsSoon(t, func() error {
-		if err := descExists(sqlDB, false, tableDesc.ID); err != nil {
-			return err
+	const numRows = 2*sql.TableTruncateChunkSize + 1
+	const numKeys = 3 * numRows
+	const numTables = 5
+	var descs []*sqlbase.TableDescriptor
+	for i := 0; i < numTables; i++ {
+		tableName := fmt.Sprintf("test%d", i)
+		if err := tests.CreateKVTable(sqlDB, tableName, numRows); err != nil {
+			t.Fatal(err)
 		}
 
-		return zoneExists(sqlDB, nil, tableDesc.ID)
-	})
+		descs = append(descs, sqlbase.GetTableDescriptor(kvDB, "t", tableName))
 
-	tests.CheckKeyCount(t, kvDB, tableSpan, 0)
+		nameKey := sqlbase.MakeNameMetadataKey(keys.MinNonPredefinedUserDescID, tableName)
+		gr, err := kvDB.Get(ctx, nameKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !gr.Exists() {
+			t.Fatalf("Name entry %q does not exist", nameKey)
+		}
+
+		tableSpan := descs[i].TableSpan()
+		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
+
+		if _, err := sqlDB.Exec(fmt.Sprintf(`DROP TABLE t.%s`, tableName)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Data hasn't been GC-ed.
+	for i := 0; i < numTables; i++ {
+		if err := descExists(sqlDB, true, descs[i].ID); err != nil {
+			t.Fatal(err)
+		}
+		tableSpan := descs[i].TableSpan()
+		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
+	}
+
+	// The closure pushes a zone config reducing the TTL to 0 for descriptor i.
+	pushZoneCfg := func(i int) {
+		cfg := config.DefaultZoneConfig()
+		cfg.GC.TTLSeconds = 0
+		buf, err := protoutil.Marshal(&cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, descs[i].ID, buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	checkTableGCed := func(i int) {
+		testutils.SucceedsSoon(t, func() error {
+			if err := descExists(sqlDB, false, descs[i].ID); err != nil {
+				return err
+			}
+
+			return zoneExists(sqlDB, nil, descs[i].ID)
+		})
+		tableSpan := descs[i].TableSpan()
+		tests.CheckKeyCount(t, kvDB, tableSpan, 0)
+	}
+
+	// Push a new zone config for a few tables with TTL=0 so the data
+	// is deleted immediately.
+	barrier := rand.Intn(numTables)
+	for i := 0; i < barrier; i++ {
+		pushZoneCfg(i)
+	}
+
+	// Check GC worked!
+	for i := 0; i < numTables; i++ {
+		if i < barrier {
+			checkTableGCed(i)
+		} else {
+			// Data still present for tables past barrier.
+			tableSpan := descs[i].TableSpan()
+			tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
+		}
+	}
+
+	// Push the rest of the zone configs and check all the data gets GC-ed.
+	for i := barrier; i < numTables; i++ {
+		pushZoneCfg(i)
+	}
+	for i := barrier; i < numTables; i++ {
+		checkTableGCed(i)
+	}
 }
 
 func writeTableDesc(ctx context.Context, db *client.DB, tableDesc *sqlbase.TableDescriptor) error {
@@ -638,6 +670,7 @@ func writeTableDesc(ctx context.Context, db *client.DB, tableDesc *sqlbase.Table
 		if err := txn.SetSystemConfigTrigger(); err != nil {
 			return err
 		}
+		tableDesc.ModificationTime = txn.CommitTimestamp()
 		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(tableDesc.ID), sqlbase.WrapDescriptor(tableDesc))
 	})
 }
@@ -679,11 +712,12 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	sqlutils.CreateTable(t, sqlDB.DB, "t", "a INT", numRows, sqlutils.ToRowFn(sqlutils.RowIdxFn))
 
 	// Set TTL so the data is deleted immediately.
-	sqlDB.Exec(t, `ALTER TABLE test.t EXPERIMENTAL CONFIGURE ZONE '{gc: {ttlseconds: 1}}'`)
+	sqlDB.Exec(t, `ALTER TABLE test.t CONFIGURE ZONE USING gc.ttlseconds = 1`)
 
 	// Give the table an old format version.
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 	tableDesc.FormatVersion = sqlbase.FamilyFormatVersion
+	tableDesc.Version++
 	if err := writeTableDesc(ctx, kvDB, tableDesc); err != nil {
 		t.Fatal(err)
 	}
@@ -700,7 +734,7 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 		t.Fatalf("expected descriptor to be in DROP state, but was in %s", tableDesc.State)
 	}
 	tableDesc.FormatVersion = sqlbase.InterleavedFormatVersion
-	tableDesc.UpVersion = true
+	tableDesc.Version++
 	if err := writeTableDesc(ctx, kvDB, tableDesc); err != nil {
 		t.Fatal(err)
 	}
@@ -791,6 +825,37 @@ CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
 
 }
 
+// Tests DROP DATABASE after DROP TABLE just before the table name has been
+// recycle.
+func TestDropDatabaseAfterDropTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// Disable schema change execution so that the dropped table name
+	// doesn't get recycled.
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
+				tscc.ClearSchemaChangers()
+			},
+			AsyncExecNotification: asyncSchemaChangerDisabled,
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if err := tests.CreateKVTable(sqlDB, "kv", 100); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.Exec(`DROP TABLE t.kv`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.Exec(`DROP DATABASE t`); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDropAndCreateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
@@ -817,7 +882,6 @@ func TestDropAndCreateTable(t *testing.T) {
 
 func TestDropAndCreateDatabase(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip(`#22256`)
 
 	ctx := context.Background()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{UseDatabase: `test`})
@@ -845,9 +909,6 @@ func TestCommandsWhileTableBeingDropped(t *testing.T) {
 				tscc.ClearSchemaChangers()
 			},
 			AsyncExecNotification: asyncSchemaChangerDisabled,
-		},
-		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
-			DisableMigrations: true,
 		},
 	}
 	s, db, _ := serverutils.StartServer(t, params)
@@ -886,4 +947,57 @@ CREATE TABLE test.t(a INT PRIMARY KEY);
 	if _, err := db.Exec(`DROP TABLE test.t`); !testutils.IsError(err, `relation "test.t" does not exist`) {
 		t.Fatal(err)
 	}
+}
+
+// Tests name reuse if a DROP VIEW|TABLE succeeds but fails
+// before running the schema changer. Tests name GC via the
+// asynchrous schema change path.
+func TestDropNameReuse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			// Block schema changes through synchronous path.
+			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
+				tscc.ClearSchemaChangers()
+			},
+			AsyncExecQuickly: true,
+		},
+		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
+			DisableBackfillMigrations: true,
+		},
+	}
+
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	sql := `
+CREATE DATABASE test;
+CREATE TABLE test.t(a INT PRIMARY KEY);
+CREATE VIEW test.acol(a) AS SELECT a FROM test.t;
+`
+	if _, err := db.Exec(sql); err != nil {
+		t.Fatal(err)
+	}
+
+	// DROP the view.
+	if _, err := db.Exec(`DROP VIEW test.acol`); err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.SucceedsSoon(t, func() error {
+		_, err := db.Exec(`CREATE TABLE test.acol(a INT PRIMARY KEY);`)
+		return err
+	})
+
+	// DROP the table.
+	if _, err := db.Exec(`DROP TABLE test.t`); err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.SucceedsSoon(t, func() error {
+		_, err := db.Exec(`CREATE TABLE test.t(a INT PRIMARY KEY);`)
+		return err
+	})
 }

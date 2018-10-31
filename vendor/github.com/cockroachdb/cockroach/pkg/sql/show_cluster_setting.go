@@ -18,11 +18,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
-
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -30,6 +28,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 func (p *planner) showStateMachineSetting(
@@ -42,8 +43,16 @@ func (p *planner) showStateMachineSetting(
 	// immediately while at the same time guaranteeing that a node reporting a certain version has
 	// also processed the corresponding Gossip update (which is important as only then does the node
 	// update its persisted state; see #22796).
-	if err := retry.ForDuration(10*time.Second, func() error {
-		datums, err := p.queryRow(ctx, "SELECT value FROM system.settings WHERE name = $1", name)
+	retryCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	tBegin := timeutil.Now()
+	// The (slight ab)use of WithMaxAttempts achieves convenient context cancellation.
+	if err := retry.WithMaxAttempts(retryCtx, retry.Options{}, math.MaxInt32, func() error {
+		datums, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+			ctx, "read-setting",
+			p.txn,
+			"SELECT value FROM system.settings WHERE name = $1", name,
+		)
 		if err != nil {
 			return err
 		}
@@ -62,7 +71,7 @@ func (p *planner) showStateMachineSetting(
 		// value, and the corresponding sql migration that makes sure
 		// the above select finds something usually runs pretty quickly
 		// when the cluster is bootstrapped.
-		kvRawVal, obj, err := s.Validate(&st.SV, prevRawVal, nil)
+		kvRawVal, kvObj, err := s.Validate(&st.SV, prevRawVal, nil)
 		if err != nil {
 			return errors.Errorf("unable to read existing value: %s", err)
 		}
@@ -70,11 +79,16 @@ func (p *planner) showStateMachineSetting(
 		// NB: if there is no persisted cluster version yet, this will match
 		// kvRawVal (which is taken from `st.SV` in this case too).
 		gossipRawVal := []byte(s.Get(&st.SV))
+
+		_, gossipObj, err := s.Validate(&st.SV, gossipRawVal, nil)
+		if err != nil {
+			gossipObj = fmt.Sprintf("<error: %s>", err)
+		}
 		if !bytes.Equal(gossipRawVal, kvRawVal) {
-			return errors.Errorf("gossip and KV store disagree about value")
+			return errors.Errorf("value differs between gossip (%v) and KV (%v); try again later (%v after %s)", gossipObj, kvObj, retryCtx.Err(), timeutil.Since(tBegin))
 		}
 
-		d = tree.NewDString(obj.(fmt.Stringer).String())
+		d = tree.NewDString(kvObj.(fmt.Stringer).String())
 		return nil
 	}); err != nil {
 		return nil, err
@@ -94,8 +108,12 @@ func (p *planner) ShowClusterSetting(
 	name := strings.ToLower(n.Name)
 
 	if name == "all" {
-		return p.delegateQuery(ctx, "SHOW CLUSTER SETTINGS",
-			"TABLE crdb_internal.cluster_settings", nil, nil)
+		return p.delegateQuery(ctx, "SHOW CLUSTER SETTINGS", `
+SELECT variable,
+       value,
+       type AS setting_type,
+       description
+  FROM crdb_internal.cluster_settings`, nil, nil)
 	}
 
 	st := p.ExecCfg().Settings
@@ -124,7 +142,7 @@ func (p *planner) ShowClusterSetting(
 		name:    "SHOW CLUSTER SETTING " + name,
 		columns: columns,
 		constructor: func(ctx context.Context, p *planner) (planNode, error) {
-			d := tree.DNull
+			var d tree.Datum
 			switch s := val.(type) {
 			case *settings.IntSetting:
 				d = tree.NewDInt(tree.DInt(s.Get(&st.SV)))
@@ -146,6 +164,8 @@ func (p *planner) ShowClusterSetting(
 				d = tree.NewDInt(tree.DInt(s.Get(&st.SV)))
 			case *settings.ByteSizeSetting:
 				d = tree.NewDString(s.String(&st.SV))
+			default:
+				return nil, errors.Errorf("unknown setting type for %s: %s", name, val.Typ())
 			}
 
 			v := p.newContainerValuesNode(columns, 0)

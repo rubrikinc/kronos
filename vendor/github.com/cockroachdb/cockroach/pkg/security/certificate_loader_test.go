@@ -19,9 +19,11 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"io/ioutil"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,7 +34,63 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
+
+func TestCertNomenclature(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// We're just testing nomenclature parsing, all files exist and contain a valid PEM block.
+
+	testCases := []struct {
+		filename      string
+		expectedError string
+		usage         security.PemUsage
+		name          string
+	}{
+		// Test valid names.
+		{"ca.crt", "", security.CAPem, ""},
+		{"ca-client.crt", "", security.ClientCAPem, ""},
+		{"ca-ui.crt", "", security.UICAPem, ""},
+		{"node.crt", "", security.NodePem, ""},
+		{"ui.crt", "", security.UIPem, ""},
+		{"client.root.crt", "", security.ClientPem, "root"},
+		{"client.foo-bar.crt", "", security.ClientPem, "foo-bar"},
+		{"client....foo.bar.baz.how.many.dots.do.you.need...really....crt", "", security.ClientPem, "...foo.bar.baz.how.many.dots.do.you.need...really..."},
+
+		// Bad names. This function is only called on filenames ending with '.crt'.
+		{"crt", "not enough parts found", 0, ""},
+		{".crt", "unknown prefix", 0, ""},
+		{"ca2.crt", "unknown prefix \"ca2\"", 0, ""},
+		{"ca-client.foo.crt", "client CA certificate filename should match ca-client.crt", 0, ""},
+		{"ca-ui.foo.crt", "UI CA certificate filename should match ca-ui.crt", 0, ""},
+		{"ca.client.crt", "CA certificate filename should match ca.crt", 0, ""},
+		{"ui2.crt", "unknown prefix \"ui2\"", 0, ""},
+		{"ui.blah.crt", "UI certificate filename should match ui.crt", 0, ""},
+		{"node2.crt", "unknown prefix \"node2\"", 0, ""},
+		{"node.foo.crt", "node certificate filename should match node.crt", 0, ""},
+		{"client2.crt", "unknown prefix \"client2\"", 0, ""},
+		{"client.crt", "client certificate filename should match client.<user>.crt", 0, ""},
+		{"root.crt", "unknown prefix \"root\"", 0, ""},
+	}
+
+	for i, tc := range testCases {
+		ci, err := security.CertInfoFromFilename(tc.filename)
+		if !testutils.IsError(err, tc.expectedError) {
+			t.Errorf("#%d: expected error %v, got %v", i, tc.expectedError, err)
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		if ci.FileUsage != tc.usage {
+			t.Errorf("#%d: expected file usage %v, got %v", i, tc.usage, ci.FileUsage)
+		}
+		if ci.Name != tc.name {
+			t.Errorf("#%d: expected name %v, got %v", i, tc.name, ci.Name)
+		}
+	}
+}
 
 func TestLoadEmbeddedCerts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -72,37 +130,51 @@ func countLoadedCertificates(certsDir string) (int, error) {
 	return len(cl.Certificates()), nil
 }
 
-// Generate a valid x509 CA certificate. Returns the x509 certificate and the
-// PEM-encoded contents (suitable to write to a .crt file).
-func makeTestCACert() (*x509.Certificate, []byte, error) {
+// Generate a x509 cert with specific fields.
+func makeTestCert(
+	t *testing.T, commonName string, keyUsage x509.KeyUsage, extUsages []x509.ExtKeyUsage,
+) []byte {
+	// Make smallest rsa key possible: not saved.
 	key, err := rsa.GenerateKey(rand.Reader, 512)
 	if err != nil {
-		return nil, nil, err
+		t.Fatalf("error on GenerateKey for CN=%s: %v", commonName, err)
 	}
 
-	certBytes, err := security.GenerateCA(key, time.Hour*48)
-	if err != nil {
-		return nil, nil, err
+	// Specify the smallest possible set of fields.
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: commonName,
+		},
+		NotBefore: timeutil.Now().Add(-time.Hour),
+		NotAfter:  timeutil.Now().Add(time.Hour),
+		KeyUsage:  keyUsage,
 	}
 
-	x509Cert, err := x509.ParseCertificate(certBytes)
+	template.ExtKeyUsage = extUsages
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, template, key.Public(), key)
 	if err != nil {
-		return nil, nil, err
+		t.Fatalf("error on CreateCertificate for CN=%s: %v", commonName, err)
 	}
 
 	certBlock := &pem.Block{Type: "CERTIFICATE", Bytes: certBytes}
-	return x509Cert, pem.EncodeToMemory(certBlock), nil
+	return pem.EncodeToMemory(certBlock)
 }
 
 func TestNamingScheme(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// Make a valid x509 certificate. We don't use it here, but we do need something that
-	// parses as a valid pem-encoded x509 certificate.
-	x509Cert, certContents, err := makeTestCACert()
-	if err != nil {
-		t.Fatal(err)
-	}
+	fullKeyUsage := x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature
+	// Build a few certificates. These are barebones since we only need to check our custom validation,
+	// not chain verification.
+	caCert := makeTestCert(t, "", 0, nil)
+
+	goodNodeCert := makeTestCert(t, "node", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth})
+	badUserNodeCert := makeTestCert(t, "notnode", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth})
+
+	goodRootCert := makeTestCert(t, "root", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	notRootCert := makeTestCert(t, "notroot", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 
 	// Do not use embedded certs.
 	security.ResetAssetLoader()
@@ -168,12 +240,12 @@ func TestNamingScheme(t *testing.T) {
 		{
 			// Test proper names, but no key files, only the CA cert should be loaded without error.
 			files: []testFile{
-				{"ca.crt", 0777, certContents},
-				{"node.crt", 0777, certContents},
-				{"client.root.crt", 0777, certContents},
+				{"ca.crt", 0777, caCert},
+				{"node.crt", 0777, goodNodeCert},
+				{"client.root.crt", 0777, goodRootCert},
 			},
 			certs: []security.CertInfo{
-				{FileUsage: security.CAPem, Filename: "ca.crt", FileContents: certContents},
+				{FileUsage: security.CAPem, Filename: "ca.crt", FileContents: caCert},
 				{FileUsage: security.ClientPem, Filename: "client.root.crt", Name: "root",
 					Error: errors.New(".* no such file or directory")},
 				{FileUsage: security.NodePem, Filename: "node.crt",
@@ -184,15 +256,15 @@ func TestNamingScheme(t *testing.T) {
 			// Key files, but wrong permissions.
 			// We don't load CA keys here, so permissions for them don't matter.
 			files: []testFile{
-				{"ca.crt", 0777, certContents},
+				{"ca.crt", 0777, caCert},
 				{"ca.key", 0777, []byte{}},
-				{"node.crt", 0777, certContents},
+				{"node.crt", 0777, goodNodeCert},
 				{"node.key", 0704, []byte{}},
-				{"client.root.crt", 0777, certContents},
+				{"client.root.crt", 0777, goodRootCert},
 				{"client.root.key", 0740, []byte{}},
 			},
 			certs: []security.CertInfo{
-				{FileUsage: security.CAPem, Filename: "ca.crt", FileContents: certContents},
+				{FileUsage: security.CAPem, Filename: "ca.crt", FileContents: caCert},
 				{FileUsage: security.ClientPem, Filename: "client.root.crt", Name: "root",
 					Error: errors.New(".* exceeds -rwx------")},
 				{FileUsage: security.NodePem, Filename: "node.crt",
@@ -207,52 +279,67 @@ func TestNamingScheme(t *testing.T) {
 				{"ca.key", 0777, []byte{}},
 				{"node.crt", 0777, []byte("foo")},
 				{"node.key", 0700, []byte{}},
-				{"client.root.crt", 0777, append(certContents, []byte("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----")...)},
+				{"client.root.crt", 0777, append(goodRootCert, []byte("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----")...)},
 				{"client.root.key", 0700, []byte{}},
 			},
 			certs: []security.CertInfo{
 				{FileUsage: security.CAPem, Filename: "ca.crt",
 					Error: errors.New("empty certificate file: ca.crt")},
 				{FileUsage: security.ClientPem, Filename: "client.root.crt", Name: "root",
-					Error: errors.New("failed to parse certificate at position 1 in file client.root.crt")},
+					Error: errors.New("failed to parse certificate 1 in file client.root.crt")},
 				{FileUsage: security.NodePem, Filename: "node.crt",
 					Error: errors.New("no certificates found in node.crt")},
 			},
 		},
 		{
+			// Bad CommonName: this is checked later in the CertificateManager.
+			files: []testFile{
+				{"node.crt", 0777, badUserNodeCert},
+				{"node.key", 0700, []byte("node.key")},
+				{"client.root.crt", 0777, notRootCert},
+				{"client.root.key", 0700, []byte{}},
+			},
+			certs: []security.CertInfo{
+				{FileUsage: security.ClientPem, Filename: "client.root.crt", Name: "root",
+					Error: errors.New("client certificate has Subject \"CN=notroot\", expected \"CN=root")},
+				{FileUsage: security.NodePem, Filename: "node.crt", KeyFilename: "node.key",
+					FileContents: badUserNodeCert, KeyFileContents: []byte("node.key")},
+			},
+		},
+		{
 			// Everything loads.
 			files: []testFile{
-				{"ca.crt", 0777, certContents},
+				{"ca.crt", 0777, caCert},
 				{"ca.key", 0700, []byte("ca.key")},
-				{"node.crt", 0777, certContents},
+				{"node.crt", 0777, goodNodeCert},
 				{"node.key", 0700, []byte("node.key")},
-				{"client.root.crt", 0777, certContents},
+				{"client.root.crt", 0777, goodRootCert},
 				{"client.root.key", 0700, []byte("client.root.key")},
 			},
 			certs: []security.CertInfo{
-				{FileUsage: security.CAPem, Filename: "ca.crt", FileContents: certContents},
+				{FileUsage: security.CAPem, Filename: "ca.crt", FileContents: caCert},
 				{FileUsage: security.ClientPem, Filename: "client.root.crt", KeyFilename: "client.root.key",
-					Name: "root", FileContents: certContents, KeyFileContents: []byte("client.root.key")},
+					Name: "root", FileContents: goodRootCert, KeyFileContents: []byte("client.root.key")},
 				{FileUsage: security.NodePem, Filename: "node.crt", KeyFilename: "node.key",
-					FileContents: certContents, KeyFileContents: []byte("node.key")},
+					FileContents: goodNodeCert, KeyFileContents: []byte("node.key")},
 			},
 		},
 		{
 			// Bad key permissions, but skip permissions checks.
 			files: []testFile{
-				{"ca.crt", 0777, certContents},
+				{"ca.crt", 0777, caCert},
 				{"ca.key", 0777, []byte("ca.key")},
-				{"node.crt", 0777, certContents},
+				{"node.crt", 0777, goodNodeCert},
 				{"node.key", 0777, []byte("node.key")},
-				{"client.root.crt", 0777, certContents},
+				{"client.root.crt", 0777, goodRootCert},
 				{"client.root.key", 0777, []byte("client.root.key")},
 			},
 			certs: []security.CertInfo{
-				{FileUsage: security.CAPem, Filename: "ca.crt", FileContents: certContents},
+				{FileUsage: security.CAPem, Filename: "ca.crt", FileContents: caCert},
 				{FileUsage: security.ClientPem, Filename: "client.root.crt", KeyFilename: "client.root.key",
-					Name: "root", FileContents: certContents, KeyFileContents: []byte("client.root.key")},
+					Name: "root", FileContents: goodRootCert, KeyFileContents: []byte("client.root.key")},
 				{FileUsage: security.NodePem, Filename: "node.crt", KeyFilename: "node.key",
-					FileContents: certContents, KeyFileContents: []byte("node.key")},
+					FileContents: goodNodeCert, KeyFileContents: []byte("node.key")},
 			},
 			skipChecks: true,
 		},
@@ -296,7 +383,7 @@ func TestNamingScheme(t *testing.T) {
 				}
 			} else {
 				if !testutils.IsError(actual.Error, expected.Error.Error()) {
-					t.Errorf("#%d: mismatched error, expected: %+v, got %+v", testNum, expected, actual)
+					t.Errorf("#%d: mismatched error, expected: %+v, got %+v", testNum, expected.Error, actual.Error)
 				}
 				continue
 			}
@@ -316,14 +403,6 @@ func TestNamingScheme(t *testing.T) {
 				}
 				if a, e := len(actual.ParsedCertificates), 1; a != e {
 					t.Errorf("#%d: expected %d certificates, found: %d", testNum, e, a)
-					continue
-				}
-				if a, e := actual.ParsedCertificates[0], x509Cert; !bytes.Equal(a.Raw, e.Raw) {
-					t.Errorf("#%d: mismatched certificate: %+v vs %+v", testNum, a, e)
-					continue
-				}
-				if a, e := actual.ExpirationTime, x509Cert.NotAfter; a != e {
-					t.Errorf("#%d: mismatched expiration: %s vs %s", testNum, a, e)
 					continue
 				}
 			}

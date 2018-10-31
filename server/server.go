@@ -311,7 +311,6 @@ func (k *Server) trySyncWithOracle(ctx context.Context, oracle *kronospb.NodeAdd
 // appropriate delta.
 // After initialization, KronosTime of this server would be valid.
 func (k *Server) initialize(ctx context.Context, tickCh <-chan time.Time, tickCallback func()) {
-	ctx = log.WithLogTag(ctx, "initialize", nil)
 	// becomeOracleTickThreshold is the number of ticks after which this node
 	// is eligible to become an oracle.
 	// It is preferred if an initialized node of the cluster becomes the oracle to
@@ -439,7 +438,7 @@ func (k *Server) initialize(ctx context.Context, tickCh <-chan time.Time, tickCa
 // 3. Sync time with the oracle
 // tickCallback is called after processing each tick
 func (k *Server) ManageOracle(tickCh <-chan time.Time, tickCallback func()) {
-	ctx := log.WithLogTag(context.Background(), "manage-oracle", nil)
+	ctx := context.Background()
 	if tickCallback == nil {
 		tickCallback = func() {}
 	}

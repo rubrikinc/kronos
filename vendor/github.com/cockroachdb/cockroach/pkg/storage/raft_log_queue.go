@@ -19,14 +19,13 @@ import (
 	"sort"
 	"time"
 
-	"github.com/coreos/etcd/raft"
 	"github.com/pkg/errors"
+	"go.etcd.io/etcd/raft"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -44,10 +43,10 @@ const (
 	// when Raft log truncation usually occurs when using the number of entries
 	// as the sole criteria.
 	RaftLogQueueStaleSize = 64 << 10
+	// Allow a limited number of Raft log truncations to be processed
+	// concurrently.
+	raftLogQueueConcurrency = 4
 )
-
-// raftLogMaxSize limits the maximum size of the Raft log.
-var raftLogMaxSize = envutil.EnvOrDefaultInt64("COCKROACH_RAFT_LOG_MAX_SIZE", 4<<20 /* 4 MB */)
 
 // raftLogQueue manages a queue of replicas slated to have their raft logs
 // truncated by removing unneeded entries.
@@ -65,6 +64,7 @@ func newRaftLogQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *raftLo
 		"raftlog", rlq, store, gossip,
 		queueConfig{
 			maxSize:              defaultQueueMaxSize,
+			maxConcurrency:       raftLogQueueConcurrency,
 			needsLease:           false,
 			needsSystemConfig:    false,
 			acceptsUnsplitRanges: true,
@@ -114,8 +114,8 @@ func getTruncatableIndexes(ctx context.Context, r *Replica) (uint64, uint64, int
 	if targetSize > r.mu.maxBytes {
 		targetSize = r.mu.maxBytes
 	}
-	if targetSize > raftLogMaxSize {
-		targetSize = raftLogMaxSize
+	if targetSize > r.store.cfg.RaftLogTruncationThreshold {
+		targetSize = r.store.cfg.RaftLogTruncationThreshold
 	}
 	firstIndex, err := r.raftFirstIndexLocked()
 	pendingSnapshotIndex := r.mu.pendingSnapshotIndex
@@ -257,9 +257,9 @@ func (rlq *raftLogQueue) process(ctx context.Context, r *Replica, _ config.Syste
 		}
 		b := &client.Batch{}
 		b.AddRawRequest(&roachpb.TruncateLogRequest{
-			Span:    roachpb.Span{Key: r.Desc().StartKey.AsRawKey()},
-			Index:   oldestIndex,
-			RangeID: r.RangeID,
+			RequestHeader: roachpb.RequestHeader{Key: r.Desc().StartKey.AsRawKey()},
+			Index:         oldestIndex,
+			RangeID:       r.RangeID,
 		})
 		if err := rlq.db.Run(ctx, b); err != nil {
 			return err
@@ -275,7 +275,7 @@ func (*raftLogQueue) timer(_ time.Duration) time.Duration {
 }
 
 // purgatoryChan returns nil.
-func (*raftLogQueue) purgatoryChan() <-chan struct{} {
+func (*raftLogQueue) purgatoryChan() <-chan time.Time {
 	return nil
 }
 

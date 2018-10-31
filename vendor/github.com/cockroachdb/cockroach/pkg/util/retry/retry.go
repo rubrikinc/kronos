@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 // Options provides reusable configuration of Retry objects.
@@ -150,7 +151,12 @@ func (r *Retry) NextCh() <-chan time.Time {
 }
 
 // WithMaxAttempts is a helper that runs fn N times and collects the last err.
+// It guarantees fn will run at least once. Otherwise, an error will be returned.
 func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) error {
+	if n <= 0 {
+		return errors.Errorf("max attempts should not be 0 or below, got: %d", n)
+	}
+
 	opts.MaxRetries = n - 1
 	var err error
 	for r := StartWithCtx(ctx, opts); r.Next(); {
@@ -159,6 +165,9 @@ func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) 
 			return nil
 		}
 	}
+	if err == nil {
+		err = errors.Wrap(ctx.Err(), "did not run function")
+	}
 	return err
 }
 
@@ -166,6 +175,12 @@ func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) 
 // without error, or the given duration has elapsed. The function is invoked
 // immediately at first and then successively with an exponential backoff
 // starting at 1ns and ending at the specified duration.
+//
+// This function is DEPRECATED! Please use one of the other functions in this
+// package that takes context cancellation into account.
+//
+// TODO(benesch): remove this function and port its callers to a context-
+// sensitive API.
 func ForDuration(duration time.Duration, fn func() error) error {
 	deadline := timeutil.Now().Add(duration)
 	var lastErr error

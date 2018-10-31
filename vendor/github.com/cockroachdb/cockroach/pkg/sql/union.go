@@ -20,6 +20,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -90,31 +91,6 @@ type unionNode struct {
 func (p *planner) Union(
 	ctx context.Context, n *tree.UnionClause, desiredTypes []types.T,
 ) (planNode, error) {
-	var emitAll = false
-	var emit unionNodeEmit
-	switch n.Type {
-	case tree.UnionOp:
-		if n.All {
-			emitAll = true
-		} else {
-			emit = make(unionNodeEmitDistinct)
-		}
-	case tree.IntersectOp:
-		if n.All {
-			emit = make(intersectNodeEmitAll)
-		} else {
-			emit = make(intersectNodeEmitDistinct)
-		}
-	case tree.ExceptOp:
-		if n.All {
-			emit = make(exceptNodeEmitAll)
-		} else {
-			emit = make(exceptNodeEmitDistinct)
-		}
-	default:
-		return nil, errors.Errorf("%v is not supported", n.Type)
-	}
-
 	left, err := p.newPlan(ctx, n.Left, desiredTypes)
 	if err != nil {
 		return nil, err
@@ -124,11 +100,45 @@ func (p *planner) Union(
 		return nil, err
 	}
 
+	return p.newUnionNode(n.Type, n.All, left, right)
+}
+
+func (p *planner) newUnionNode(
+	typ tree.UnionType, all bool, left, right planNode,
+) (planNode, error) {
+	var emitAll = false
+	var emit unionNodeEmit
+	switch typ {
+	case tree.UnionOp:
+		if all {
+			emitAll = true
+		} else {
+			emit = make(unionNodeEmitDistinct)
+		}
+	case tree.IntersectOp:
+		if all {
+			emit = make(intersectNodeEmitAll)
+		} else {
+			emit = make(intersectNodeEmitDistinct)
+		}
+	case tree.ExceptOp:
+		if all {
+			emit = make(exceptNodeEmitAll)
+		} else {
+			emit = make(exceptNodeEmitDistinct)
+		}
+	default:
+		return nil, errors.Errorf("%v is not supported", typ)
+	}
+
 	leftColumns := planColumns(left)
 	rightColumns := planColumns(right)
 	if len(leftColumns) != len(rightColumns) {
-		return nil, fmt.Errorf("each %v query must have the same number of columns: %d vs %d",
-			n.Type, len(leftColumns), len(rightColumns))
+		return nil, pgerror.NewErrorf(
+			pgerror.CodeSyntaxError,
+			"each %v query must have the same number of columns: %d vs %d",
+			typ, len(leftColumns), len(rightColumns),
+		)
 	}
 	unionColumns := append(sqlbase.ResultColumns(nil), leftColumns...)
 	for i := 0; i < len(unionColumns); i++ {
@@ -138,10 +148,11 @@ func (p *planner) Union(
 		// but Postgres is more lenient:
 		// http://www.postgresql.org/docs/9.5/static/typeconv-union-case.html.
 		if !(l.Typ.Equivalent(r.Typ) || l.Typ == types.Unknown || r.Typ == types.Unknown) {
-			return nil, fmt.Errorf("%v types %s and %s cannot be matched", n.Type, l.Typ, r.Typ)
+			return nil, pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+				"%v types %s and %s cannot be matched", typ, l.Typ, r.Typ)
 		}
 		if l.Hidden != r.Hidden {
-			return nil, fmt.Errorf("%v types cannot be matched", n.Type)
+			return nil, fmt.Errorf("%v types cannot be matched", typ)
 		}
 		if l.Typ == types.Unknown {
 			unionColumns[i].Typ = r.Typ
@@ -149,7 +160,7 @@ func (p *planner) Union(
 	}
 
 	inverted := false
-	if n.Type != tree.ExceptOp {
+	if typ != tree.ExceptOp {
 		// The logic below reads the rows from the right operand first,
 		// because for EXCEPT in particular this is what we need to match.
 		// However for the other operators (UNION, INTERSECT) it is
@@ -166,8 +177,8 @@ func (p *planner) Union(
 		inverted:  inverted,
 		emitAll:   emitAll,
 		emit:      emit,
-		unionType: n.Type,
-		all:       n.All,
+		unionType: typ,
+		all:       all,
 	}
 	return node, nil
 }
@@ -225,7 +236,8 @@ func (n *unionNode) readRight(params runParams) (bool, error) {
 			return true, nil
 		}
 		n.run.scratch = n.run.scratch[:0]
-		if n.run.scratch, err = sqlbase.EncodeDatums(n.run.scratch, n.right.Values()); err != nil {
+		if n.run.scratch, err = sqlbase.EncodeDatumsKeyAscending(
+			n.run.scratch, n.right.Values()); err != nil {
 			return false, err
 		}
 		// TODO(dan): Sending the entire encodeDTuple to be stored in the map would
@@ -251,7 +263,8 @@ func (n *unionNode) readLeft(params runParams) (bool, error) {
 			return true, nil
 		}
 		n.run.scratch = n.run.scratch[:0]
-		if n.run.scratch, err = sqlbase.EncodeDatums(n.run.scratch, n.left.Values()); err != nil {
+		if n.run.scratch, err = sqlbase.EncodeDatumsKeyAscending(
+			n.run.scratch, n.left.Values()); err != nil {
 			return false, err
 		}
 		if n.emit.emitLeft(n.run.scratch) {

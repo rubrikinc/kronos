@@ -23,6 +23,8 @@ import (
 	"golang.org/x/net/trace"
 
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	proto "github.com/gogo/protobuf/proto"
+	"github.com/gogo/protobuf/types"
 	opentracing "github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/pkg/errors"
@@ -50,6 +52,22 @@ type spanContext struct {
 
 	// The span's associated baggage.
 	Baggage map[string]string
+}
+
+const (
+	// TagPrefix is prefixed to all tags that should be output in SHOW TRACE.
+	TagPrefix = "cockroach."
+	// StatTagPrefix is prefixed to all stats output in span tags.
+	StatTagPrefix = TagPrefix + "stat."
+)
+
+// SpanStats are stats that can be added to a span.
+type SpanStats interface {
+	proto.Message
+	// Stats returns the stats that the object represents as a map from stat name
+	// to value to be added to span tags. The keys will be prefixed with
+	// StatTagPrefix.
+	Stats() map[string]string
 }
 
 var _ opentracing.SpanContext = &spanContext{}
@@ -108,6 +126,8 @@ type span struct {
 		// those that were set before recording started)?
 		tags opentracing.Tags
 
+		stats SpanStats
+
 		// The span's associated baggage.
 		Baggage map[string]string
 	}
@@ -150,7 +170,7 @@ func (s *span) enableRecording(group *spanGroup, recType RecordingType) {
 // will be part of the same recording.
 //
 // Recording is not supported by noop spans; to ensure a real span is always
-// created, use the Force option to StartSpan.
+// created, use the Recordable option to StartSpan.
 //
 // If recording was already started on this span (either directly or because a
 // parent span is recording), the old recording is lost.
@@ -159,7 +179,7 @@ func StartRecording(os opentracing.Span, recType RecordingType) {
 		panic("StartRecording called with NoRecording")
 	}
 	if _, noop := os.(*noopSpan); noop {
-		panic("StartRecording called on NoopSpan; use the Force option for StartSpan")
+		panic("StartRecording called on NoopSpan; use the Recordable option for StartSpan")
 	}
 	os.(*span).enableRecording(new(spanGroup), recType)
 }
@@ -259,6 +279,18 @@ func IsNoopContext(spanCtx opentracing.SpanContext) bool {
 	return noop
 }
 
+// SetSpanStats sets the stats on a span. stats.Stats() will also be added to
+// the span tags.
+func SetSpanStats(os opentracing.Span, stats SpanStats) {
+	s := os.(*span)
+	s.mu.Lock()
+	s.mu.stats = stats
+	for name, value := range stats.Stats() {
+		s.setTagInner(StatTagPrefix+name, value, true /* locked */)
+	}
+	s.mu.Unlock()
+}
+
 // Finish is part of the opentracing.Span interface.
 func (s *span) Finish() {
 	s.FinishWithOptions(opentracing.FinishOptions{})
@@ -330,17 +362,16 @@ func (s *span) setTagInner(key string, value interface{}, locked bool) opentraci
 	if s.netTr != nil {
 		s.netTr.LazyPrintf("%s:%v", key, value)
 	}
-	if s.isRecording() {
-		if !locked {
-			s.mu.Lock()
-		}
-		if s.mu.tags == nil {
-			s.mu.tags = make(opentracing.Tags)
-		}
-		s.mu.tags[key] = value
-		if !locked {
-			s.mu.Unlock()
-		}
+	// The internal tags will be used if we start a recording on this span.
+	if !locked {
+		s.mu.Lock()
+	}
+	if s.mu.tags == nil {
+		s.mu.tags = make(opentracing.Tags)
+	}
+	s.mu.tags[key] = value
+	if !locked {
+		s.mu.Unlock()
 	}
 	return s
 }
@@ -493,6 +524,14 @@ func (ss *spanGroup) getSpans() []RecordedSpan {
 			rs.Duration = time.Nanosecond
 		}
 
+		if s.mu.stats != nil {
+			stats, err := types.MarshalAny(s.mu.stats)
+			if err != nil {
+				panic(err)
+			}
+			rs.Stats = stats
+		}
+
 		if len(s.mu.Baggage) > 0 {
 			rs.Baggage = make(map[string]string)
 			for k, v := range s.mu.Baggage {
@@ -550,7 +589,7 @@ func (n *noopSpan) Log(data opentracing.LogData)                           {}
 
 func (n *noopSpan) SetBaggageItem(key, val string) opentracing.Span {
 	if key == Snowball {
-		panic("attempting to set Snowball on a noop span; use the Force option to StartSpan")
+		panic("attempting to set Snowball on a noop span; use the Recordable option to StartSpan")
 	}
 	return n
 }

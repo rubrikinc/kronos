@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"time"
 	"unicode"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/pkg/errors"
@@ -212,8 +213,7 @@ func DecodeUint64Descending(b []byte) ([]byte, uint64, error) {
 }
 
 const (
-	maxVarintSize        = 9
-	maxBinaryUvarintSize = binary.MaxVarintLen64
+	maxVarintSize = 9
 )
 
 // EncodeVarintAscending encodes the int64 value using a variable length
@@ -1037,27 +1037,31 @@ func DecodeDurationDescending(b []byte) ([]byte, duration.Duration, error) {
 type Type int
 
 // Type values.
-// TODO(dan): Make this into a proto enum.
+// TODO(dan, arjun): Make this into a proto enum.
+// The 'Type' annotations are necessary for producing stringer-generated values.
 const (
-	Unknown Type = iota
-	Null
-	NotNull
-	Int
-	Float
-	Decimal
-	Bytes
-	BytesDesc // Bytes encoded descendingly
-	Time
-	Duration
-	True
-	False
-	UUID
-	Array
-	IPAddr
-	// Do not change SentinelType from 15. This value is specifically used for bit
-	// manipulation in EncodeValueTag.
-	SentinelType Type = 15 // Used in the Value encoding.
-	JSON
+	Unknown   Type = 0
+	Null      Type = 1
+	NotNull   Type = 2
+	Int       Type = 3
+	Float     Type = 4
+	Decimal   Type = 5
+	Bytes     Type = 6
+	BytesDesc Type = 7 // Bytes encoded descendingly
+	Time      Type = 8
+	Duration  Type = 9
+	True      Type = 10
+	False     Type = 11
+	UUID      Type = 12
+	Array     Type = 13
+	IPAddr    Type = 14
+	// SentinelType is used for bit manipulation to check if the encoded type
+	// value requires more than 4 bits, and thus will be encoded in two bytes. It
+	// is not used as a type value, and thus intentionally overlaps with the
+	// subsequent type value. The 'Type' annotation is intentionally omitted here.
+	SentinelType      = 15
+	JSON         Type = 15
+	Tuple        Type = 16
 )
 
 // PeekType peeks at the type of the value encoded at the start of b.
@@ -1230,7 +1234,7 @@ func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bo
 //  - For non-table keys, we never have NotNull.
 //  - For table keys, we always explicitly pass in Ascending and Descending for
 //    all key values, including NotNulls. The only case we do not pass in
-//    direction is during a SHOW TESTING_RANGE ON TABLE parent and there exists
+//    direction is during a SHOW EXPERIMENTAL_RANGES ON TABLE parent and there exists
 //    an interleaved split key. Note that interleaved keys cannot have NotNull
 //    values except for the interleaved sentinel.
 //
@@ -1238,7 +1242,7 @@ func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bo
 // non-table keys encode values with Ascending.
 //
 // The only case where we end up defaulting direction for table keys is for
-// interleaved split keys in SHOW TESTING_RANGE ON TABLE parent. Since
+// interleaved split keys in SHOW EXPERIMENTAL_RANGES ON TABLE parent. Since
 // interleaved prefixes are defined on the primary key (and primary key values
 // are always encoded Ascending), this will always print out the correct key
 // even if we don't have directions for the child index's columns.
@@ -1972,6 +1976,20 @@ func PeekValueLengthWithOffsetsAndType(b []byte, dataOffset int, typ Type) (leng
 	case Bytes, Array, JSON:
 		_, n, i, err := DecodeNonsortingUvarint(b)
 		return dataOffset + n + int(i), err
+	case Tuple:
+		rem, l, numTuples, err := DecodeNonsortingUvarint(b)
+		if err != nil {
+			return 0, errors.Wrapf(err, "cannot decode tuple header: ")
+		}
+		for i := 0; i < int(numTuples); i++ {
+			_, entryLen, err := PeekValueLength(rem)
+			if err != nil {
+				return 0, errors.Wrapf(err, "cannot peek tuple entry %d", i)
+			}
+			l += entryLen
+			rem = rem[entryLen:]
+		}
+		return dataOffset + l, nil
 	case Decimal:
 		_, n, i, err := DecodeNonsortingStdlibUvarint(b)
 		return dataOffset + n + int(i), err
@@ -1996,36 +2014,14 @@ func PeekValueLengthWithOffsetsAndType(b []byte, dataOffset int, typ Type) (leng
 	}
 }
 
-// UpperBoundValueEncodingSize returns the maximum encoded size of the given
-// datum type using the "value" encoding, including the tag. If the size is
-// unbounded, false is returned.
-func UpperBoundValueEncodingSize(colID uint32, typ Type, size int) (int, bool) {
-	encodedTag := EncodeValueTag(nil, colID, typ)
-	switch typ {
-	case Null, True, False:
-		// The data is encoded in the type.
-		return len(encodedTag), true
-	case Int:
-		return len(encodedTag) + maxVarintSize, true
-	case Float:
-		return len(encodedTag) + uint64AscendingEncodedLength, true
-	case Bytes:
-		if size > 0 {
-			return len(encodedTag) + maxVarintSize + size, true
-		}
-		return 0, false
-	case Decimal:
-		if size > 0 {
-			return len(encodedTag) + maxBinaryUvarintSize + upperBoundNonsortingDecimalUnscaledSize(size), true
-		}
-		return 0, false
-	case Time:
-		return len(encodedTag) + 2*maxVarintSize, true
-	case Duration:
-		return len(encodedTag) + 3*maxVarintSize, true
-	default:
-		panic(fmt.Errorf("unknown type: %s", typ))
-	}
+// PrintableBytes returns true iff the given byte array is a valid
+// UTF-8 sequence and it is printable.
+func PrintableBytes(b []byte) bool {
+	return len(bytes.TrimLeftFunc(b, isValidAndPrintableRune)) == 0
+}
+
+func isValidAndPrintableRune(r rune) bool {
+	return r != utf8.RuneError && unicode.IsPrint(r)
 }
 
 // PrettyPrintValueEncoded returns a string representation of the first
@@ -2073,11 +2069,14 @@ func PrettyPrintValueEncoded(b []byte) ([]byte, string, error) {
 		if err != nil {
 			return b, "", err
 		}
-		printable := len(bytes.TrimLeftFunc(data, unicode.IsPrint)) == 0
-		if printable {
+		if PrintableBytes(data) {
 			return b, string(data), nil
 		}
-		return b, hex.EncodeToString(data), nil
+		// The following code extends hex.EncodeToString().
+		dst := make([]byte, 2+hex.EncodedLen(len(data)))
+		dst[0], dst[1] = '0', 'x'
+		hex.Encode(dst[2:], data)
+		return b, string(dst), nil
 	case Time:
 		var t time.Time
 		b, t, err = DecodeTimeValue(b)

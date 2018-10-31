@@ -17,11 +17,11 @@ package pgwire
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/lib/pq/oid"
 	"github.com/pkg/errors"
@@ -47,7 +47,8 @@ const (
 type commandResult struct {
 	// conn is the parent connection of this commandResult.
 	conn *conn
-	loc  *time.Location
+	// conv indicates the conversion settings for SQL values.
+	conv sessiondata.DataConversionConfig
 	// pos identifies the position of the command within the connection.
 	pos sql.CmdPos
 
@@ -82,7 +83,7 @@ func (c *conn) makeCommandResult(
 	pos sql.CmdPos,
 	stmt tree.Statement,
 	formatCodes []pgwirebase.FormatCode,
-	loc *time.Location,
+	conv sessiondata.DataConversionConfig,
 ) commandResult {
 	return commandResult{
 		conn:           c,
@@ -90,9 +91,9 @@ func (c *conn) makeCommandResult(
 		descOpt:        descOpt,
 		stmtType:       stmt.StatementType(),
 		formatCodes:    formatCodes,
-		loc:            loc,
 		typ:            commandComplete,
 		cmdCompleteTag: stmt.StatementTag(),
+		conv:           conv,
 	}
 }
 
@@ -209,7 +210,7 @@ func (r *commandResult) AddRow(ctx context.Context, row tree.Datums) error {
 	}
 	r.rowsAffected++
 
-	r.conn.bufferRow(ctx, row, r.formatCodes, r.loc)
+	r.conn.bufferRow(ctx, row, r.formatCodes, r.conv)
 	_ /* flushed */, err := r.conn.maybeFlush(r.pos)
 	return err
 }

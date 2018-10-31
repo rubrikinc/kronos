@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -52,14 +54,23 @@ const (
 // Fully-qualified names for metrics.
 var (
 	MetaConns = metric.Metadata{
-		Name: "sql.conns",
-		Help: "Number of active sql connections"}
+		Name:        "sql.conns",
+		Help:        "Number of active sql connections",
+		Measurement: "Connections",
+		Unit:        metric.Unit_COUNT,
+	}
 	MetaBytesIn = metric.Metadata{
-		Name: "sql.bytesin",
-		Help: "Number of sql bytes received"}
+		Name:        "sql.bytesin",
+		Help:        "Number of sql bytes received",
+		Measurement: "SQL Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
 	MetaBytesOut = metric.Metadata{
-		Name: "sql.bytesout",
-		Help: "Number of sql bytes sent"}
+		Name:        "sql.bytesout",
+		Help:        "Number of sql bytes sent",
+		Measurement: "SQL Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
 )
 
 const (
@@ -92,7 +103,6 @@ type cancelChanMap map[chan struct{}]context.CancelFunc
 type Server struct {
 	AmbientCtx log.AmbientContext
 	cfg        *base.Config
-	executor   *sql.Executor
 	SQLServer  *sql.Server
 	execCfg    *sql.ExecutorConfig
 
@@ -121,20 +131,17 @@ type ServerMetrics struct {
 	Conns          *metric.Gauge
 	ConnMemMetrics sql.MemoryMetrics
 	SQLMemMetrics  sql.MemoryMetrics
-
-	internalMemMetrics *sql.MemoryMetrics
 }
 
 func makeServerMetrics(
-	internalMemMetrics *sql.MemoryMetrics, histogramWindow time.Duration,
+	sqlMemMetrics sql.MemoryMetrics, histogramWindow time.Duration,
 ) ServerMetrics {
 	return ServerMetrics{
-		BytesInCount:       metric.NewCounter(MetaBytesIn),
-		BytesOutCount:      metric.NewCounter(MetaBytesOut),
-		Conns:              metric.NewGauge(MetaConns),
-		ConnMemMetrics:     sql.MakeMemMetrics("conns", histogramWindow),
-		SQLMemMetrics:      sql.MakeMemMetrics("client", histogramWindow),
-		internalMemMetrics: internalMemMetrics,
+		BytesInCount:   metric.NewCounter(MetaBytesIn),
+		BytesOutCount:  metric.NewCounter(MetaBytesOut),
+		Conns:          metric.NewGauge(MetaConns),
+		ConnMemMetrics: sql.MakeMemMetrics("conns", histogramWindow),
+		SQLMemMetrics:  sqlMemMetrics,
 	}
 }
 
@@ -155,8 +162,7 @@ func MakeServer(
 	ambientCtx log.AmbientContext,
 	cfg *base.Config,
 	st *cluster.Settings,
-	executor *sql.Executor,
-	internalMemMetrics *sql.MemoryMetrics,
+	sqlMemMetrics sql.MemoryMetrics,
 	parentMemoryMonitor *mon.BytesMonitor,
 	histogramWindow time.Duration,
 	executorConfig *sql.ExecutorConfig,
@@ -165,8 +171,7 @@ func MakeServer(
 		AmbientCtx: ambientCtx,
 		cfg:        cfg,
 		execCfg:    executorConfig,
-		executor:   executor,
-		metrics:    makeServerMetrics(internalMemMetrics, histogramWindow),
+		metrics:    makeServerMetrics(sqlMemMetrics, histogramWindow),
 	}
 	server.sqlMemoryPool = mon.MakeMonitor("sql",
 		mon.MemoryResource,
@@ -342,132 +347,9 @@ func (s *Server) drainImpl(drainWait time.Duration, cancelWait time.Duration) er
 	return nil
 }
 
-// ServeConn serves a single connection, driving the handshake process
-// and delegating to the appropriate connection type.
+// ServeConn serves a single connection, driving the handshake process and
+// delegating to the appropriate connection type.
 func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
-	s.mu.Lock()
-	draining := s.mu.draining
-	if !draining {
-		var cancel context.CancelFunc
-		ctx, cancel = contextutil.WithCancel(ctx)
-		done := make(chan struct{})
-		s.mu.connCancelMap[done] = cancel
-		defer func() {
-			cancel()
-			close(done)
-			s.mu.Lock()
-			delete(s.mu.connCancelMap, done)
-			s.mu.Unlock()
-		}()
-	}
-	s.mu.Unlock()
-
-	// If the Server is draining, we will use the connection only to send an
-	// error, so we don't count it in the stats. This makes sense since
-	// DrainClient() waits for that number to drop to zero,
-	// so we don't want it to oscillate unnecessarily.
-	if !draining {
-		s.metrics.Conns.Inc(1)
-		defer s.metrics.Conns.Dec(1)
-	}
-
-	var buf pgwirebase.ReadBuffer
-	n, err := buf.ReadUntypedMsg(conn)
-	if err != nil {
-		return err
-	}
-	s.metrics.BytesInCount.Inc(int64(n))
-	version, err := buf.GetUint32()
-	if err != nil {
-		return err
-	}
-	errSSLRequired := false
-	if version == versionSSL {
-		if len(buf.Msg) > 0 {
-			return errors.Errorf("unexpected data after SSLRequest: %q", buf.Msg)
-		}
-
-		if s.cfg.Insecure {
-			if _, err := conn.Write(sslUnsupported); err != nil {
-				return err
-			}
-		} else {
-			if _, err := conn.Write(sslSupported); err != nil {
-				return err
-			}
-			tlsConfig, err := s.cfg.GetServerTLSConfig()
-			if err != nil {
-				return err
-			}
-			conn = tls.Server(conn, tlsConfig)
-		}
-
-		n, err := buf.ReadUntypedMsg(conn)
-		if err != nil {
-			return err
-		}
-		s.metrics.BytesInCount.Inc(int64(n))
-		version, err = buf.GetUint32()
-		if err != nil {
-			return err
-		}
-	} else if !s.cfg.Insecure {
-		errSSLRequired = true
-	}
-
-	if version == version30 {
-		// We make a connection before anything. If there is an error
-		// parsing the connection arguments, the connection will only be
-		// used to send a report of that error.
-		v3conn := makeV3Conn(conn, &s.metrics, &s.sqlMemoryPool, s.executor)
-		defer v3conn.finish(ctx)
-
-		if v3conn.sessionArgs, err = parseOptions(ctx, buf.Msg); err != nil {
-			return v3conn.sendError(pgerror.NewError(pgerror.CodeProtocolViolationError, err.Error()))
-		}
-
-		if errSSLRequired {
-			return v3conn.sendError(pgerror.NewError(pgerror.CodeProtocolViolationError, ErrSSLRequired))
-		}
-		if draining {
-			return v3conn.sendError(newAdminShutdownErr(errors.New(ErrDraining)))
-		}
-
-		v3conn.sessionArgs.User = tree.Name(v3conn.sessionArgs.User).Normalize()
-		if err := v3conn.handleAuthentication(ctx, s.cfg.Insecure); err != nil {
-			return v3conn.sendError(pgerror.NewError(pgerror.CodeInvalidPasswordError, err.Error()))
-		}
-
-		// Reserve some memory for this connection using the server's
-		// monitor. This reduces pressure on the shared pool because the
-		// server monitor allocates in chunks from the shared pool and
-		// these chunks should be larger than baseSQLMemoryBudget.
-		//
-		// We only reserve memory to the connection monitor after
-		// authentication has completed successfully, so as to prevent a DoS
-		// attack: many open-but-unauthenticated connections that exhaust
-		// the memory available to connections already open.
-		acc := s.connMonitor.MakeBoundAccount()
-		if err := acc.Grow(ctx, baseSQLMemoryBudget); err != nil {
-			return errors.Errorf("unable to pre-allocate %d bytes for this connection: %v",
-				baseSQLMemoryBudget, err)
-		}
-
-		err := v3conn.serve(ctx, s.IsDraining, acc)
-		// If the error that closed the connection is related to an
-		// administrative shutdown, relay that information to the client.
-		if pgErr, ok := pgerror.GetPGCause(err); ok && pgErr.Code == pgerror.CodeAdminShutdownError {
-			return v3conn.sendError(err)
-		}
-		return err
-	}
-
-	return errors.Errorf("unknown protocol version %d", version)
-}
-
-// ServeConn2 serves a single connection, driving the handshake process
-// and delegating to the appropriate connection type.
-func (s *Server) ServeConn2(ctx context.Context, conn net.Conn) error {
 	s.mu.Lock()
 	draining := s.mu.draining
 	if !draining {
@@ -557,7 +439,7 @@ func (s *Server) ServeConn2(ctx context.Context, conn net.Conn) error {
 
 	var sArgs sql.SessionArgs
 	if sArgs, err = parseOptions(ctx, buf.Msg); err != nil {
-		return sendErr(pgerror.NewError(pgerror.CodeProtocolViolationError, err.Error()))
+		return sendErr(err)
 	}
 	sArgs.User = tree.Name(sArgs.User).Normalize()
 
@@ -572,4 +454,53 @@ func (s *Server) ServeConn2(ctx context.Context, conn net.Conn) error {
 	}
 	return serveConn(ctx, conn, sArgs, &s.metrics, reserved, s.SQLServer,
 		s.IsDraining, s.execCfg, s.stopper, s.cfg.Insecure)
+}
+
+func parseOptions(ctx context.Context, data []byte) (sql.SessionArgs, error) {
+	args := sql.SessionArgs{SessionDefaults: make(map[string]string)}
+	buf := pgwirebase.ReadBuffer{Msg: data}
+	for {
+		key, err := buf.GetString()
+		if err != nil {
+			return sql.SessionArgs{}, pgerror.NewErrorf(pgerror.CodeProtocolViolationError,
+				"error reading option key: %s", err)
+		}
+		if len(key) == 0 {
+			break
+		}
+		value, err := buf.GetString()
+		if err != nil {
+			return sql.SessionArgs{}, pgerror.NewErrorf(pgerror.CodeProtocolViolationError,
+				"error reading option value: %s", err)
+		}
+		key = strings.ToLower(key)
+		switch key {
+		case "user":
+			args.User = value
+		default:
+			exists, configurable := sql.IsSessionVariableConfigurable(key)
+			if exists && configurable {
+				args.SessionDefaults[key] = value
+			} else {
+				if !exists {
+					log.Warningf(ctx, "unknown configuration parameter: %q", key)
+				} else {
+					return sql.SessionArgs{}, pgerror.NewErrorf(pgerror.CodeCantChangeRuntimeParamError,
+						"parameter %q cannot be changed", key)
+				}
+			}
+		}
+	}
+
+	if _, ok := args.SessionDefaults["database"]; !ok {
+		// CockroachDB-specific behavior: if no database is specified,
+		// default to "defaultdb". In PostgreSQL this would be "postgres".
+		args.SessionDefaults["database"] = sessiondata.DefaultDatabaseName
+	}
+
+	return args, nil
+}
+
+func newAdminShutdownErr(err error) error {
+	return pgerror.NewErrorf(pgerror.CodeAdminShutdownError, err.Error())
 }

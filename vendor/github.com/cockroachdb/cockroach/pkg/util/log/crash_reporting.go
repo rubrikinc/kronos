@@ -17,12 +17,12 @@ package log
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
-	"syscall"
 	"time"
 
 	raven "github.com/getsentry/raven-go"
@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -98,6 +99,23 @@ func RecoverAndReportPanic(ctx context.Context, sv *settings.Values) {
 		// so ReportPanic should pop four frames.
 		ReportPanic(ctx, sv, r, 4)
 		panic(r)
+	}
+}
+
+// RecoverAndReportNonfatalPanic is an alternative RecoverAndReportPanic that
+// does not re-panic in Release builds.
+func RecoverAndReportNonfatalPanic(ctx context.Context, sv *settings.Values) {
+	if r := recover(); r != nil {
+		// The call stack here is usually:
+		// - ReportPanic
+		// - RecoverAndReport
+		// - panic.go
+		// - panic()
+		// so ReportPanic should pop four frames.
+		ReportPanic(ctx, sv, r, 4)
+		if !build.IsRelease() || PanicOnAssertions.Get(sv) {
+			panic(r)
+		}
 	}
 }
 
@@ -238,7 +256,7 @@ func SetupCrashReporter(ctx context.Context, cmd string) {
 
 var crdbPaths = []string{
 	"github.com/cockroachdb/cockroach",
-	"github.com/coreos/etcd/raft",
+	"go.etcd.io/etcd/raft",
 }
 
 func uptimeTag(now time.Time) string {
@@ -274,7 +292,7 @@ func (e *safeError) Error() string {
 // anonymized reporting.
 func Redact(r interface{}) string {
 	typAnd := func(i interface{}, text string) string {
-		typ := util.ErrorSource(i)
+		typ := ErrorSource(i)
 		if typ == "" {
 			typ = fmt.Sprintf("%T", i)
 		}
@@ -307,7 +325,7 @@ func Redact(r interface{}) string {
 		switch t := r.(error).(type) {
 		case runtime.Error:
 			return typAnd(t, t.Error())
-		case syscall.Errno:
+		case sysutil.Errno:
 			return typAnd(t, t.Error())
 		case *os.SyscallError:
 			s := Redact(t.Err)
@@ -324,6 +342,14 @@ func Redact(r interface{}) string {
 			t = &cpy
 
 			t.Old, t.New = "<redacted>", "<redacted>"
+			return typAnd(t, t.Error())
+		case *net.OpError:
+			// It hardly matters, but avoid mutating the original.
+			cpy := *t
+			t = &cpy
+			t.Source = &util.UnresolvedAddr{NetworkField: "tcp", AddressField: "redacted"}
+			t.Addr = &util.UnresolvedAddr{NetworkField: "tcp", AddressField: "redacted"}
+			t.Err = errors.New(Redact(t.Err))
 			return typAnd(t, t.Error())
 		default:
 		}
@@ -491,4 +517,19 @@ var tagFns []tagFn
 // This is intended to be called by other packages at init time.
 func RegisterTagFn(key string, value func(context.Context) string) {
 	tagFns = append(tagFns, tagFn{key, value})
+}
+
+// ErrorSource attempts to return the file:line where `i` was created if `i` has
+// that information (i.e. if it is an errors.withStack). Returns "" otherwise.
+func ErrorSource(i interface{}) string {
+	type stackTracer interface {
+		StackTrace() errors.StackTrace
+	}
+	if e, ok := i.(stackTracer); ok {
+		tr := e.StackTrace()
+		if len(tr) > 0 {
+			return fmt.Sprintf("%v", tr[0]) // prints file:line
+		}
+	}
+	return ""
 }

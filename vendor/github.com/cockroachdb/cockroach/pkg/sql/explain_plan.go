@@ -19,8 +19,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 )
@@ -41,40 +41,16 @@ type explainPlanNode struct {
 	// optimized indicates whether to invoke setNeededColumns() on the sub-node.
 	optimized bool
 
+	// optimizeSubqueries indicates whether to invoke optimizeSubquery and
+	// setUnlimited on the subqueries.
+	optimizeSubqueries bool
+
 	run explainPlanRun
-}
-
-var explainPlanColumns = sqlbase.ResultColumns{
-	// Tree shows the node type with the tree structure.
-	{Name: "Tree", Typ: types.String},
-	// Field is the part of the node that a row of output pertains to.
-	{Name: "Field", Typ: types.String},
-	// Description contains details about the field.
-	{Name: "Description", Typ: types.String},
-}
-
-var explainPlanVerboseColumns = sqlbase.ResultColumns{
-	// Tree shows the node type with the tree structure.
-	{Name: "Tree", Typ: types.String},
-	// Level is the depth of the node in the tree. Hidden by default; can be
-	// retrieved using:
-	//   SELECT "Level" FROM [ EXPLAIN (VERBOSE) ... ].
-	{Name: "Level", Typ: types.Int, Hidden: true},
-	// Type is the node type. Hidden by default.
-	{Name: "Type", Typ: types.String, Hidden: true},
-	// Field is the part of the node that a row of output pertains to.
-	{Name: "Field", Typ: types.String},
-	// Description contains details about the field.
-	{Name: "Description", Typ: types.String},
-	// Columns is the type signature of the data source.
-	{Name: "Columns", Typ: types.String},
-	// Ordering indicates the known ordering of the data from this source.
-	{Name: "Ordering", Typ: types.String},
 }
 
 // newExplainPlanNode instantiates a planNode that runs an EXPLAIN query.
 func (p *planner) makeExplainPlanNode(
-	ctx context.Context, flags explainFlags, expanded, optimized bool, origStmt tree.Statement,
+	ctx context.Context, opts *tree.ExplainOptions, origStmt tree.Statement,
 ) (planNode, error) {
 	// Build the plan for the query being explained.  We want to capture
 	// all the analyzed sub-queries in the explain node, so we are going
@@ -86,19 +62,38 @@ func (p *planner) makeExplainPlanNode(
 	if err != nil {
 		return nil, err
 	}
-	return p.makeExplainPlanNodeWithPlan(ctx, flags, expanded, optimized, plan)
+	return p.makeExplainPlanNodeWithPlan(
+		ctx, opts, true /* optimizeSubqueries */, plan, p.curPlan.subqueryPlans,
+	)
 }
 
-// newExplainPlanNodeWithPlan instantiates a planNode that EXPLAINs an
+// makeExplainPlanNodeWithPlan instantiates a planNode that EXPLAINs an
 // underlying plan.
 func (p *planner) makeExplainPlanNodeWithPlan(
-	ctx context.Context, flags explainFlags, expanded, optimized bool, plan planNode,
+	ctx context.Context,
+	opts *tree.ExplainOptions,
+	optimizeSubqueries bool,
+	plan planNode,
+	subqueryPlans []subquery,
 ) (planNode, error) {
-	columns := explainPlanColumns
-
-	if flags.showMetadata {
-		columns = explainPlanVerboseColumns
+	flags := explainFlags{
+		symbolicVars: opts.Flags.Contains(tree.ExplainFlagSymVars),
 	}
+	if opts.Flags.Contains(tree.ExplainFlagVerbose) {
+		flags.showMetadata = true
+		flags.qualifyNames = true
+	}
+	if opts.Flags.Contains(tree.ExplainFlagTypes) {
+		flags.showMetadata = true
+		flags.showTypes = true
+	}
+
+	columns := sqlbase.ExplainPlanColumns
+	if flags.showMetadata {
+		columns = sqlbase.ExplainPlanVerboseColumns
+	}
+	// Make a copy (to allow changes through planMutableColumns).
+	columns = append(sqlbase.ResultColumns(nil), columns...)
 
 	e := explainer{explainFlags: flags}
 
@@ -123,11 +118,12 @@ func (p *planner) makeExplainPlanNodeWithPlan(
 	}
 
 	node := &explainPlanNode{
-		explainer:     e,
-		expanded:      expanded,
-		optimized:     optimized,
-		plan:          plan,
-		subqueryPlans: p.curPlan.subqueryPlans,
+		explainer:          e,
+		expanded:           !opts.Flags.Contains(tree.ExplainFlagNoExpand),
+		optimized:          !opts.Flags.Contains(tree.ExplainFlagNoOptimize),
+		optimizeSubqueries: optimizeSubqueries,
+		plan:               plan,
+		subqueryPlans:      subqueryPlans,
 		run: explainPlanRun{
 			results: p.newContainerValuesNode(columns, 0),
 		},
@@ -142,18 +138,20 @@ type explainPlanRun struct {
 }
 
 func (e *explainPlanNode) startExec(params runParams) error {
-	// The sub-plan's subqueries have been captured local to the EXPLAIN
-	// node so that they would not be automatically started for
-	// execution by planTop.start(). But this also means they were not
-	// yet processed by makePlan()/optimizePlan(). Do it here.
-	for i := range e.subqueryPlans {
-		if err := params.p.optimizeSubquery(params.ctx, &e.subqueryPlans[i]); err != nil {
-			return err
-		}
+	if e.optimizeSubqueries {
+		// The sub-plan's subqueries have been captured local to the EXPLAIN
+		// node so that they would not be automatically started for
+		// execution by planTop.start(). But this also means they were not
+		// yet processed by makePlan()/optimizePlan(). Do it here.
+		for i := range e.subqueryPlans {
+			if err := params.p.optimizeSubquery(params.ctx, &e.subqueryPlans[i]); err != nil {
+				return err
+			}
 
-		// Trigger limit propagation. This would be done otherwise when
-		// starting the plan. However we do not want to start the plan.
-		params.p.setUnlimited(e.subqueryPlans[i].plan)
+			// Trigger limit propagation. This would be done otherwise when
+			// starting the plan. However we do not want to start the plan.
+			params.p.setUnlimited(e.subqueryPlans[i].plan)
+		}
 	}
 
 	return params.p.populateExplain(params.ctx, &e.explainer, e.run.results, e.plan, e.subqueryPlans)
@@ -184,10 +182,6 @@ type explainFlags struct {
 	// schema signature and ordering information of the intermediate
 	// nodes.
 	showMetadata bool
-
-	// showExprs indicates whether the plan prints expressions
-	// embedded inside the node.
-	showExprs bool
 
 	// qualifyNames determines whether column names in expressions
 	// should be fully qualified during pretty-printing.
@@ -299,12 +293,14 @@ func (e *explainer) populateEntries(ctx context.Context, plan planNode, subquery
 	for i := range subqueryPlans {
 		_, _ = e.enterNode(ctx, "subquery", plan)
 		e.attr("subquery", "id", fmt.Sprintf("@S%d", i+1))
-		e.attr("subquery", "sql", subqueryPlans[i].subquery.String())
-		e.attr("subquery", "exec mode", execModeNames[subqueryPlans[i].execMode])
+		// This field contains the original subquery (which could have been modified
+		// by optimizer transformations).
+		e.attr("subquery", "original sql", subqueryPlans[i].subquery.String())
+		e.attr("subquery", "exec mode", distsqlrun.SubqueryExecModeNames[subqueryPlans[i].execMode])
 		if subqueryPlans[i].plan != nil {
 			_ = walkPlan(ctx, subqueryPlans[i].plan, observer)
 		} else if subqueryPlans[i].started {
-			e.expr("subquery", "result", -1, subqueryPlans[i].result)
+			e.expr(observeAlways, "subquery", "result", -1, subqueryPlans[i].result)
 		}
 		_ = e.leaveNode("subquery", subqueryPlans[i].plan)
 	}
@@ -319,7 +315,6 @@ func planToString(ctx context.Context, plan planNode, subqueryPlans []subquery) 
 	e := explainer{
 		explainFlags: explainFlags{
 			showMetadata: true,
-			showExprs:    true,
 			showTypes:    true,
 		},
 		fmtFlags: tree.FmtExpr(tree.FmtSymbolicSubqueries, true, true, true),
@@ -355,8 +350,11 @@ func (e *explainer) observer() planObserver {
 }
 
 // expr implements the planObserver interface.
-func (e *explainer) expr(nodeName, fieldName string, n int, expr tree.Expr) {
-	if e.showExprs && expr != nil {
+func (e *explainer) expr(v observeVerbosity, nodeName, fieldName string, n int, expr tree.Expr) {
+	if expr != nil {
+		if !e.showMetadata && v == observeMetadata {
+			return
+		}
 		if nodeName == "join" {
 			qualifySave := e.fmtFlags
 			e.fmtFlags.SetFlags(tree.FmtShowTableAliases)

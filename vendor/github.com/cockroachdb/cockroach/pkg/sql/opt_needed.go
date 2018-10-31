@@ -34,9 +34,6 @@ func setNeededColumns(plan planNode, needed []bool) {
 	case *explainDistSQLNode:
 		setNeededColumns(n.plan, allColumns(n.plan))
 
-	case *showTraceNode:
-		setNeededColumns(n.plan, allColumns(n.plan))
-
 	case *showTraceReplicaNode:
 		setNeededColumns(n.plan, allColumns(n.plan))
 
@@ -55,12 +52,18 @@ func setNeededColumns(plan planNode, needed []bool) {
 		// Currently all the needed result columns are provided by the
 		// table sub-source; from the index sub-source we only need the PK
 		// columns sufficient to configure the table sub-source.
+
+		// The columns in the underlying indexes will always line up with the
+		// columns in the indexJoinNode, since this plan was produced by the
+		// heuristic planner.
+
 		// TODO(radu/knz): see the comments at the start of index_join.go,
 		// perhaps this can be optimized to utilize the column values
 		// already provided by the index instead of re-retrieving them
 		// using the table scanNode.
 		setNeededColumns(n.table, needed)
 		setNeededColumns(n.index, n.primaryKeyColumns)
+		markOmitted(n.resultColumns, needed)
 
 	case *unionNode:
 		if !n.emitAll {
@@ -86,6 +89,39 @@ func setNeededColumns(plan planNode, needed []bool) {
 
 	case *valuesNode:
 		markOmitted(n.columns, needed)
+
+	case *projectSetNode:
+		// Optimization: remove the source columns that are not needed.
+		// Be careful not to remove actual SRFs: even if the SRF is not
+		// needed we must still execute it so that the number of
+		// rows is preserved.
+		// Non-SRF expressions can be omitted.
+		n.ivarHelper.Reset()
+		curCol := n.numColsInSource
+		for i := range n.exprs {
+			if n.funcs[i] == nil && !needed[curCol] {
+				// This is just a scalar expression and it's not
+				// needed. Remove it. This may drop some references to the
+				// source.
+				n.exprs[i] = tree.DNull
+			}
+			// Either a scalar expression or SRF; in any case we need to
+			// rebind ivars to repopulate the helper.
+			n.exprs[i] = n.ivarHelper.Rebind(n.exprs[i], false, true)
+			if n.funcs[i] != nil {
+				// If it was a SRF, the rebind operation may have rewritten
+				// the expr. So update the func too.
+				n.funcs[i] = n.exprs[i].(*tree.FuncExpr)
+			}
+			curCol += n.numColsPerGen[i]
+		}
+		sourceNeeded := make([]bool, n.numColsInSource)
+		for i := range sourceNeeded {
+			sourceNeeded[i] = needed[i] || n.ivarHelper.IndexedVarUsed(i)
+		}
+		setNeededColumns(n.source, sourceNeeded)
+		markOmitted(n.columns[:n.numColsInSource], sourceNeeded[:n.numColsInSource])
+		markOmitted(n.columns[n.numColsInSource:], needed[n.numColsInSource:])
 
 	case *delayedNode:
 		if n.plan != nil {
@@ -171,42 +207,57 @@ func setNeededColumns(plan planNode, needed []bool) {
 		setNeededColumns(n.plan, allColumns(n.plan))
 
 	case *deleteNode:
-		// TODO(knz): This can be optimized by omitting the columns that
-		// are not part of the primary key, do not participate in
-		// foreign key relations and that are not needed for RETURNING.
-		setNeededColumns(n.run.rows, allColumns(n.run.rows))
+		setNeededColumns(n.source, allColumns(n.source))
 
 	case *updateNode:
-		// TODO(knz): This can be optimized by omitting the columns that
-		// are not part of the primary key, do not participate in
-		// foreign key relations and that are not needed for RETURNING.
-		setNeededColumns(n.run.rows, allColumns(n.run.rows))
+		setNeededColumns(n.source, allColumns(n.source))
 
 	case *insertNode:
 		// TODO(knz): This can be optimized by omitting the columns that
 		// are not part of the primary key, do not participate in
 		// foreign key relations and that are not needed for RETURNING.
-		setNeededColumns(n.run.rows, allColumns(n.run.rows))
+		setNeededColumns(n.source, allColumns(n.source))
 
 	case *upsertNode:
 		// TODO(knz): This can be optimized by omitting the columns that
-		// are not part of the primary key, do not participate in
-		// foreign key relations and that are not needed for RETURNING.
-		setNeededColumns(n.run.rows, allColumns(n.run.rows))
+		// are not part of the primary key or the conflicting index, do
+		// not participate in foreign key relations and that are not
+		// needed for RETURNING.
+		setNeededColumns(n.source, allColumns(n.source))
 
 	case *splitNode:
 		setNeededColumns(n.rows, allColumns(n.rows))
 
-	case *testingRelocateNode:
+	case *relocateNode:
+		setNeededColumns(n.rows, allColumns(n.rows))
+
+	case *rowCountNode:
+		// The sub-node is a DELETE, INSERT, UPDATE etc. and will decide which columns it needs.
+		setNeededColumns(n.source, nil)
+
+	case *serializeNode:
+		// The sub-node is a DELETE, INSERT, UPDATE etc. and will decide which columns it needs.
+		setNeededColumns(n.source, nil)
+
+	case *cancelQueriesNode:
+		setNeededColumns(n.rows, allColumns(n.rows))
+
+	case *cancelSessionsNode:
+		setNeededColumns(n.rows, allColumns(n.rows))
+
+	case *controlJobsNode:
 		setNeededColumns(n.rows, allColumns(n.rows))
 
 	case *alterIndexNode:
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
-	case *controlJobNode:
+	case *renameColumnNode:
+	case *renameDatabaseNode:
+	case *renameIndexNode:
+	case *renameTableNode:
 	case *scrubNode:
+	case *truncateNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:
@@ -222,7 +273,6 @@ func setNeededColumns(plan planNode, needed []bool) {
 	case *zeroNode:
 	case *unaryNode:
 	case *hookFnNode:
-	case *valueGenerator:
 	case *sequenceSelectNode:
 	case *setVarNode:
 	case *setClusterSettingNode:
@@ -230,6 +280,7 @@ func setNeededColumns(plan planNode, needed []bool) {
 	case *showZoneConfigNode:
 	case *showRangesNode:
 	case *showFingerprintsNode:
+	case *showTraceNode:
 	case *scatterNode:
 
 	default:

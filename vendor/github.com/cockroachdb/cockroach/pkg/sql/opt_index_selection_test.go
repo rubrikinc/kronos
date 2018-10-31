@@ -23,7 +23,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -81,31 +84,37 @@ func makeSpans(
 	desc *sqlbase.TableDescriptor,
 	index *sqlbase.IndexDescriptor,
 	sel *renderNode,
-) (logicalSpans opt.LogicalSpans, spans roachpb.Spans) {
+) (_ *constraint.Constraint, spans roachpb.Spans) {
 	expr := parseAndNormalizeExpr(t, p, sql, sel)
 
 	c := &indexInfo{
 		desc:  desc,
 		index: index,
 	}
-	optExpr, err := opt.BuildScalarExpr(expr, p.EvalContext())
+	var o xform.Optimizer
+	o.Init(p.EvalContext())
+	for _, c := range desc.Columns {
+		o.Memo().Metadata().AddColumn(c.Name, c.Type.ToDatumType())
+	}
+	semaCtx := tree.MakeSemaContext(false /* privileged */)
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	bld := optbuilder.NewScalar(context.Background(), &semaCtx, &evalCtx, o.Factory())
+	bld.AllowUnsupportedExpr = true
+	err := bld.Build(expr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = c.makeIndexConstraints(optExpr, p.EvalContext())
+	filterExpr := o.Memo().Root()
+	err = c.makeIndexConstraints(&o, filterExpr, p.EvalContext())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	logicalSpans, ok := c.ic.Spans()
-	spans, err = spansFromLogicalSpans(desc, index, logicalSpans, ok)
+	spans, err = spansFromConstraint(desc, index, c.ic.Constraint())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok {
-		logicalSpans = opt.LogicalSpans{opt.MakeFullSpan()}
-	}
-	return logicalSpans, spans
+	return c.ic.Constraint(), spans
 }
 
 func TestMakeSpans(t *testing.T) {
@@ -327,8 +336,8 @@ func TestExactPrefix(t *testing.T) {
 			defer p.extendedEvalCtx.Stop(context.Background())
 			sel := makeSelectNode(t, p)
 			desc, index := makeTestIndexFromStr(t, d.columns)
-			logicalSpans, _ := makeSpans(t, p, d.expr, desc, index, sel)
-			prefix := opt.ExactPrefix(logicalSpans, p.EvalContext())
+			c, _ := makeSpans(t, p, d.expr, desc, index, sel)
+			prefix := c.ExactPrefix(p.EvalContext())
 			if d.expected != prefix {
 				t.Errorf("%s: expected %d, but found %d", d.expr, d.expected, prefix)
 			}

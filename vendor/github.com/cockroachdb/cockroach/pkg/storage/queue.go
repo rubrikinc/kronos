@@ -177,11 +177,11 @@ type queueImpl interface {
 	// yet, this can be 0.
 	timer(time.Duration) time.Duration
 
-	// purgatoryChan returns a channel that is signaled when it's time
-	// to retry replicas which have been relegated to purgatory due to
-	// failures. If purgatoryChan returns nil, failing replicas are not
-	// sent to purgatory.
-	purgatoryChan() <-chan struct{}
+	// purgatoryChan returns a channel that is signaled with the current
+	// time when it's time to retry replicas which have been relegated to
+	// purgatory due to failures. If purgatoryChan returns nil, failing
+	// replicas are not sent to purgatory.
+	purgatoryChan() <-chan time.Time
 }
 
 type queueConfig struct {
@@ -253,10 +253,10 @@ type baseQueue struct {
 	processSem chan struct{}
 	processDur int64 // accessed atomically
 	mu         struct {
-		syncutil.Mutex                                  // Protects all variables in the mu struct
-		replicas       map[roachpb.RangeID]*replicaItem // Map from RangeID to replicaItem
-		priorityQ      priorityQueue                    // The priority queue
-		purgatory      map[roachpb.RangeID]error        // Map of replicas to processing errors
+		syncutil.Mutex                                    // Protects all variables in the mu struct
+		replicas       map[roachpb.RangeID]*replicaItem   // Map from RangeID to replicaItem
+		priorityQ      priorityQueue                      // The priority queue
+		purgatory      map[roachpb.RangeID]purgatoryError // Map of replicas to processing errors
 		stopped        bool
 		// Some tests in this package disable queues.
 		disabled bool
@@ -303,6 +303,16 @@ func newBaseQueue(
 	return &bq
 }
 
+// Name returns the name of the queue.
+func (bq *baseQueue) Name() string {
+	return bq.name
+}
+
+// NeedsLease returns whether the queue requires a replica to be leaseholder.
+func (bq *baseQueue) NeedsLease() bool {
+	return bq.needsLease
+}
+
 // Length returns the current size of the queue.
 func (bq *baseQueue) Length() int {
 	bq.mu.Lock()
@@ -312,6 +322,11 @@ func (bq *baseQueue) Length() int {
 
 // PurgatoryLength returns the current size of purgatory.
 func (bq *baseQueue) PurgatoryLength() int {
+	// Lock processing while measuring the purgatory length. This ensures that
+	// no purgatory replicas are concurrently being processed, during which time
+	// they are removed from bq.mu.purgatory even though they may be re-added.
+	defer bq.lockProcessing()()
+
 	bq.mu.Lock()
 	defer bq.mu.Unlock()
 	return len(bq.mu.purgatory)
@@ -522,12 +537,18 @@ func (bq *baseQueue) addInternalLocked(
 }
 
 // MaybeAddCallback adds a callback to be called when the specified range
-// finishes processing if the range is in the queue. If the range is not
-// in the queue (either waiting or processing), the method returns false.
+// finishes processing if the range is in the queue. If the range is in
+// purgatory, the callback is called immediately with the purgatory error. If
+// the range is not in the queue (either waiting or processing), the method
+// returns false.
 func (bq *baseQueue) MaybeAddCallback(rangeID roachpb.RangeID, cb processCallback) bool {
 	bq.mu.Lock()
 	defer bq.mu.Unlock()
 
+	if purgatoryErr, ok := bq.mu.purgatory[rangeID]; ok {
+		cb(purgatoryErr)
+		return true
+	}
 	if item, ok := bq.mu.replicas[rangeID]; ok {
 		item.registerCallback(cb)
 		return true
@@ -624,7 +645,12 @@ func (bq *baseQueue) processLoop(stopper *stop.Stopper) {
 				} else {
 					// lastDur will be 0 after the first processing attempt.
 					lastDur := bq.lastProcessDuration()
-					nextTime = time.After(bq.impl.timer(lastDur))
+					switch t := bq.impl.timer(lastDur); t {
+					case 0:
+						nextTime = immediately
+					default:
+						nextTime = time.After(t)
+					}
 				}
 			}
 		}
@@ -736,12 +762,6 @@ func (bq *baseQueue) processReplica(queueCtx context.Context, repl *Replica) err
 func (bq *baseQueue) finishProcessingReplica(
 	ctx context.Context, stopper *stop.Stopper, repl *Replica, err error,
 ) {
-	if err != nil {
-		// Increment failures metric here to capture all error returns from
-		// process().
-		bq.failures.Inc(1)
-	}
-
 	bq.mu.Lock()
 	defer bq.mu.Unlock()
 
@@ -755,32 +775,44 @@ func (bq *baseQueue) finishProcessingReplica(
 		cb(err)
 	}
 
+	// Handle failures.
+	if err != nil {
+		// Increment failures metric to capture all error.
+		bq.failures.Inc(1)
+
+		// Determine whether a failure is a purgatory error. If it is, add
+		// the failing replica to purgatory. Note that even if the item was
+		// scheduled to be requeued, we ignore this if we add the replica to
+		// purgatory.
+		if purgErr, ok := errors.Cause(err).(purgatoryError); ok {
+			bq.addToPurgatoryLocked(ctx, stopper, repl, purgErr)
+			return
+		}
+
+		// If not a purgatory error, log.
+		log.Error(ctx, err)
+	}
+
+	// Maybe add replica back into queue, if requested.
 	if item.requeue {
-		// Maybe add replica back into queue.
 		bq.maybeAddLocked(ctx, repl, bq.store.Clock().Now())
-	} else if err != nil {
-		// Maybe add failing replica to purgatory if the queue supports it.
-		bq.maybeAddToPurgatoryLocked(ctx, stopper, repl, err)
 	}
 }
 
-// maybeAddToPurgatoryLocked possibly adds the specified replica
-// to the purgatory queue, which holds replicas which have failed
-// processing. To be added, the failing error must implement
-// purgatoryError and the queue implementation must have its own
-// mechanism for signaling re-processing of replicas held in
-// purgatory.
-func (bq *baseQueue) maybeAddToPurgatoryLocked(
-	ctx context.Context, stopper *stop.Stopper, repl *Replica, triggeringErr error,
+// addToPurgatoryLocked adds the specified replica to the purgatory queue, which
+// holds replicas which have failed processing.
+func (bq *baseQueue) addToPurgatoryLocked(
+	ctx context.Context, stopper *stop.Stopper, repl *Replica, purgErr purgatoryError,
 ) {
-	// Check whether the failure is a purgatory error and whether the queue supports it.
-	if _, ok := errors.Cause(triggeringErr).(purgatoryError); !ok || bq.impl.purgatoryChan() == nil {
-		log.Error(ctx, triggeringErr)
+	// Check whether the queue supports purgatory errors. If not then something
+	// went wrong because a purgatory error should not have ended up here.
+	if bq.impl.purgatoryChan() == nil {
+		log.Errorf(ctx, "queue does not support purgatory errors, but saw %v", purgErr)
 		return
 	}
 
 	if log.V(1) {
-		log.Info(ctx, errors.Wrap(triggeringErr, "purgatory"))
+		log.Info(ctx, errors.Wrap(purgErr, "purgatory"))
 	}
 
 	item := &replicaItem{value: repl.RangeID}
@@ -792,13 +824,13 @@ func (bq *baseQueue) maybeAddToPurgatoryLocked(
 
 	// If purgatory already exists, just add to the map and we're done.
 	if bq.mu.purgatory != nil {
-		bq.mu.purgatory[repl.RangeID] = triggeringErr
+		bq.mu.purgatory[repl.RangeID] = purgErr
 		return
 	}
 
 	// Otherwise, create purgatory and start processing.
-	bq.mu.purgatory = map[roachpb.RangeID]error{
-		repl.RangeID: triggeringErr,
+	bq.mu.purgatory = map[roachpb.RangeID]purgatoryError{
+		repl.RangeID: purgErr,
 	}
 
 	workerCtx := bq.AnnotateCtx(context.Background())
@@ -826,7 +858,6 @@ func (bq *baseQueue) maybeAddToPurgatoryLocked(
 					for _, id := range ranges {
 						repl, err := bq.store.GetReplica(id)
 						if err != nil {
-							log.Errorf(ctx, "range %s no longer exists on store: %s", id, err)
 							continue
 						}
 						annotatedCtx := repl.AnnotateCtx(ctx)

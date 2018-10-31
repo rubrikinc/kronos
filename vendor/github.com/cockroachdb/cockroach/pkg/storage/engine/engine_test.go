@@ -36,6 +36,7 @@ import (
 func ensureRangeEqual(
 	t *testing.T, sortedKeys []string, keyMap map[string][]byte, keyvals []MVCCKeyValue,
 ) {
+	t.Helper()
 	if len(keyvals) != len(sortedKeys) {
 		t.Errorf("length mismatch. expected %s, got %s", sortedKeys, keyvals)
 	}
@@ -133,7 +134,7 @@ func TestEngineBatchStaleCachedIterator(t *testing.T) {
 		{
 			batch := eng.NewBatch()
 			defer batch.Close()
-			iter := batch.NewIterator(false)
+			iter := batch.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
 			key := MVCCKey{Key: roachpb.Key("b")}
 
 			if err := batch.Put(key, []byte("foo")); err != nil {
@@ -296,7 +297,7 @@ func TestEngineBatch(t *testing.T) {
 				t.Errorf("%d: expected %s, but got %s", i, expectedValue, actualValue)
 			}
 			// Try using an iterator to get the value from the batch.
-			iter := b.NewIterator(false)
+			iter := b.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
 			iter.Seek(key)
 			if ok, err := iter.Valid(); !ok {
 				if currentBatch[len(currentBatch)-1].value != nil {
@@ -421,22 +422,22 @@ func TestEngineMerge(t *testing.T) {
 			{
 				mvccKey("timeseriesmerged"),
 				[][]byte{
-					timeSeries(testtime, 1000, []tsSample{
+					timeSeriesRow(testtime, 1000, []tsSample{
 						{1, 1, 5, 5, 5},
 					}...),
-					timeSeries(testtime, 1000, []tsSample{
+					timeSeriesRow(testtime, 1000, []tsSample{
 						{2, 1, 5, 5, 5},
 						{1, 2, 10, 7, 3},
 					}...),
-					timeSeries(testtime, 1000, []tsSample{
+					timeSeriesRow(testtime, 1000, []tsSample{
 						{10, 1, 5, 5, 5},
 					}...),
-					timeSeries(testtime, 1000, []tsSample{
+					timeSeriesRow(testtime, 1000, []tsSample{
 						{5, 1, 5, 5, 5},
 						{3, 1, 5, 5, 5},
 					}...),
 				},
-				timeSeries(testtime, 1000, []tsSample{
+				timeSeriesRow(testtime, 1000, []tsSample{
 					{1, 2, 10, 7, 3},
 					{2, 1, 5, 5, 5},
 					{3, 1, 5, 5, 5},
@@ -629,7 +630,7 @@ func TestEngineDeleteRangeBatch(t *testing.T) {
 func TestEngineDeleteIterRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testEngineDeleteRange(t, func(engine Engine, start, end MVCCKey) error {
-		iter := engine.NewIterator(false)
+		iter := engine.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
 		defer iter.Close()
 		return engine.ClearIterRange(iter, start, end)
 	})
@@ -760,7 +761,7 @@ func TestSnapshotMethods(t *testing.T) {
 		}
 
 		// Verify NewIterator still iterates over original snapshot.
-		iter := snap.NewIterator(false)
+		iter := snap.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
 		iter.Seek(newKey)
 		if ok, err := iter.Valid(); err != nil {
 			t.Fatal(err)

@@ -314,9 +314,10 @@ func TestParallelizeQueueAddAfterError(t *testing.T) {
 
 func planQuery(t *testing.T, s serverutils.TestServerInterface, sql string) (*planner, func()) {
 	kvDB := s.DB()
-	txn := client.NewTxn(kvDB, s.NodeID(), client.RootTxn)
+	txn := client.NewTxn(context.TODO(), kvDB, s.NodeID(), client.RootTxn)
+	execCfg := s.ExecutorConfig().(ExecutorConfig)
 	p, cleanup := newInternalPlanner(
-		"plan", txn, security.RootUser, &MemoryMetrics{}, &s.Executor().(*Executor).cfg)
+		"plan", txn, security.RootUser, &MemoryMetrics{}, &execCfg)
 	p.extendedEvalCtx.Tables.leaseMgr = s.LeaseManager().(*LeaseManager)
 	// HACK: we're mutating the SessionData directly, without going through the
 	// SessionDataMutator. We're not really supposed to do that, but were we to go
@@ -492,6 +493,50 @@ func TestSpanBasedDependencyAnalyzer(t *testing.T) {
 						q1, q2, exp, indep)
 				}
 			})
+		}
+	}
+}
+
+// Smoke test for parallel writes. Checks that parallel statements commit fine.
+func TestParallelWrites(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	// Create three tables because spanBasedDependencyAnalyzer currently
+	// considers all writes to the same table to be dependent.
+	//
+	// TODO(nvanbenschoten): once #14953 is addressed, we can get rid of the
+	// extra tables.
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test  (k INT PRIMARY KEY);
+CREATE TABLE t.test2  (k INT PRIMARY KEY);
+CREATE TABLE t.test3  (k INT PRIMARY KEY);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 100; i++ {
+		if _, err := sqlDB.Exec(fmt.Sprintf(`
+BEGIN;
+INSERT INTO t.test(k)  VALUES (%d) RETURNING NOTHING;
+INSERT INTO t.test2(k) VALUES (%d) RETURNING NOTHING;
+INSERT INTO t.test3(k) VALUES (%d) RETURNING NOTHING;
+END;
+`, i, i, i)); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, table := range []string{"t.test", "t.test2", "t.test3"} {
+			var count int
+			if err := sqlDB.QueryRow(fmt.Sprintf("SELECT count(*) FROM %s", table)).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != i+1 {
+				t.Fatalf("Expected %d rows, got %d", i+1, count)
+			}
 		}
 	}
 }

@@ -17,6 +17,10 @@ package pgerror
 import (
 	"bytes"
 	"fmt"
+	"runtime"
+	"strings"
+
+	"github.com/lib/pq"
 
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/pkg/errors"
@@ -26,6 +30,34 @@ var _ error = &Error{}
 
 func (pg *Error) Error() string {
 	return pg.Message
+}
+
+// FullError can be used when the hint and/or detail are to be tested.
+func FullError(err error) string {
+	var errString string
+	if pqErr, ok := err.(*pq.Error); ok {
+		errString = formatMsgHintDetail("pq: ", pqErr.Message, pqErr.Hint, pqErr.Detail)
+	} else if pg, ok := GetPGCause(err); ok {
+		errString = formatMsgHintDetail("", err.Error(), pg.Hint, pg.Detail)
+	} else {
+		errString = err.Error()
+	}
+	return errString
+}
+
+func formatMsgHintDetail(prefix, msg, hint, detail string) string {
+	var b strings.Builder
+	b.WriteString(prefix)
+	b.WriteString(msg)
+	if hint != "" {
+		b.WriteString("\nHINT: ")
+		b.WriteString(hint)
+	}
+	if detail != "" {
+		b.WriteString("\nDETAIL: ")
+		b.WriteString(detail)
+	}
+	return b.String()
 }
 
 // NewErrorWithDepthf creates an Error and extracts the context
@@ -101,6 +133,51 @@ func GetPGCause(err error) (*Error, bool) {
 	}
 }
 
+const assertionErrorHint = `You have encountered an unexpected error inside CockroachDB.
+
+Please check https://github.com/cockroachdb/cockroach/issues to check
+whether this problem is already tracked. If you cannot find it there,
+please report the error with details at:
+
+    https://github.com/cockroachdb/cockroach/issues/new/choose
+
+If you would rather not post publicly, please contact us directly at:
+
+    support@cockroachlabs.com
+
+The Cockroach Labs team appreciates your feedback.
+`
+
+// NewAssertionErrorf creates an internal error.
+func NewAssertionErrorf(format string, args ...interface{}) error {
+	err := NewErrorWithDepthf(1, CodeInternalError, "internal error: "+format, args...)
+	err.InternalCommand = captureTrace()
+	err.Detail = err.InternalCommand
+	err.Hint = assertionErrorHint
+	return err
+}
+
+func captureTrace() string {
+	var pc [50]uintptr
+	n := runtime.Callers(3, pc[:])
+	frames := runtime.CallersFrames(pc[:n])
+	var buf bytes.Buffer
+	sep := ""
+	for {
+		frame, more := frames.Next()
+		if !more {
+			break
+		}
+		file := frame.File
+		if index := strings.LastIndexByte(file, '/'); index >= 0 {
+			file = file[index+1:]
+		}
+		fmt.Fprintf(&buf, "%s%s:%d", sep, file, frame.Line)
+		sep = ","
+	}
+	return buf.String()
+}
+
 // UnimplementedWithIssueErrorf constructs an error with the formatted message
 // and a link to the passed issue. Recorded as "#<issue>" in tracking.
 func UnimplementedWithIssueErrorf(issue int, format string, args ...interface{}) error {
@@ -117,17 +194,33 @@ func UnimplementedWithIssueError(issue int, msg string) error {
 	return err.SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
 }
 
+const unimplementedErrorHint = `This feature is not yet implemented in CockroachDB.
+
+Please check https://github.com/cockroachdb/cockroach/issues to check
+whether this feature is already tracked. If you cannot find it there,
+please report this error with reproduction steps at:
+
+    https://github.com/cockroachdb/cockroach/issues/new/choose
+
+If you would rather not post publicly, please contact us directly at:
+
+    support@cockroachlabs.com
+
+The Cockroach Labs team appreciates your feedback.
+`
+
 // Unimplemented constructs an unimplemented feature error.
 //
 // `feature` is used for tracking, and is not included when the error printed.
-func Unimplemented(feature, msg string) *Error {
-	return UnimplementedWithDepth(1, feature, msg)
+func Unimplemented(feature, msg string, args ...interface{}) *Error {
+	return UnimplementedWithDepth(1, feature, msg, args...)
 }
 
 // UnimplementedWithDepth constructs an implemented feature error,
 // tracking the context at the specified depth.
-func UnimplementedWithDepth(depth int, feature, msg string) *Error {
-	err := NewErrorWithDepthf(depth+1, CodeFeatureNotSupportedError, "%s", msg)
+func UnimplementedWithDepth(depth int, feature, msg string, args ...interface{}) *Error {
+	err := NewErrorWithDepthf(depth+1, CodeFeatureNotSupportedError, msg, args...)
 	err.InternalCommand = feature
+	err.Hint = unimplementedErrorHint
 	return err
 }

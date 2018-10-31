@@ -17,8 +17,6 @@ package sql
 import (
 	"context"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -47,12 +45,12 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 		return nil, errEmptyDatabaseName
 	}
 
+	if string(n.Name) == p.SessionData().Database && p.SessionData().SafeUpdates {
+		return nil, pgerror.NewDangerousStatementErrorf("DROP DATABASE on current database")
+	}
+
 	// Check that the database exists.
-	var dbDesc *DatabaseDescriptor
-	var err error
-	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		dbDesc, err = ResolveDatabase(ctx, p, string(n.Name), !n.IfExists)
-	})
+	dbDesc, err := p.ResolveUncachedDatabaseByName(ctx, string(n.Name), !n.IfExists)
 	if err != nil {
 		return nil, err
 	}
@@ -86,16 +84,14 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 		}
 	}
 
-	td := make([]toDelete, len(tbNames))
+	td := make([]toDelete, 0, len(tbNames))
 	for i := range tbNames {
-		tbDesc, err := p.prepareDrop(ctx, &tbNames[i], true /*required*/, anyDescType)
+		tbDesc, err := p.prepareDrop(ctx, &tbNames[i], false /*required*/, anyDescType)
 		if err != nil {
 			return nil, err
 		}
 		if tbDesc == nil {
-			// Database claims to have this table, but it does not exist.
-			return nil, errors.Errorf("table %q was described by database %q, but does not exist",
-				tree.ErrString(&tbNames[i]), n.Name)
+			continue
 		}
 		// Recursively check permissions on all dependent views, since some may
 		// be in different databases.
@@ -104,7 +100,7 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 				return nil, err
 			}
 		}
-		td[i] = toDelete{&tbNames[i], tbDesc}
+		td = append(td, toDelete{&tbNames[i], tbDesc})
 	}
 
 	td, err = p.filterCascadedTables(ctx, td)
@@ -168,10 +164,10 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		int32(n.dbDesc.ID),
 		int32(params.extendedEvalCtx.NodeID),
 		struct {
-			DatabaseName          string
-			Statement             string
-			User                  string
-			DroppedTablesAndViews []string
+			DatabaseName         string
+			Statement            string
+			User                 string
+			DroppedSchemaObjects []string
 		}{n.n.Name.String(), n.n.String(), p.SessionData().User, tbNameStrings},
 	)
 }

@@ -64,6 +64,11 @@ func (p *planner) changePrivileges(
 	if err != nil {
 		return nil, err
 	}
+
+	// We're allowed to grant/revoke privileges to/from the "public" role even though
+	// it does not exist: add it to the list of all users and roles.
+	users[sqlbase.PublicRole] = true // isRole
+
 	for _, grantee := range grantees {
 		if _, ok := users[string(grantee)]; !ok {
 			return nil, errors.Errorf("user or role %s does not exist", &grantee)
@@ -73,7 +78,7 @@ func (p *planner) changePrivileges(
 	var descriptors []sqlbase.DescriptorProto
 	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
 	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{skipCache: true, allowAdding: true}, func() {
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		descriptors, err = getDescriptorsFromTargetList(ctx, p, targets)
 	})
 	if err != nil {
@@ -82,6 +87,7 @@ func (p *planner) changePrivileges(
 
 	// First, update the descriptors. We want to catch all errors before
 	// we update them in KV below.
+	b := p.txn.NewBatch()
 	for _, descriptor := range descriptors {
 		if err := p.CheckPrivilege(ctx, descriptor, privilege.GRANT); err != nil {
 			return nil, err
@@ -102,24 +108,20 @@ func (p *planner) changePrivileges(
 			if err := d.Validate(); err != nil {
 				return nil, err
 			}
+			descKey := sqlbase.MakeDescMetadataKey(descriptor.GetID())
+			b.Put(descKey, sqlbase.WrapDescriptor(descriptor))
 
 		case *sqlbase.TableDescriptor:
-			if err := d.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
-				return nil, err
+			if !d.Dropped() {
+				if err := p.writeSchemaChangeToBatch(
+					ctx, d, sqlbase.InvalidMutationID, b); err != nil {
+					return nil, err
+				}
 			}
-			if err := d.SetUpVersion(); err != nil {
-				return nil, err
-			}
-			p.notifySchemaChange(d, sqlbase.InvalidMutationID)
 		}
 	}
 
 	// Now update the descriptors transactionally.
-	b := p.txn.NewBatch()
-	for _, descriptor := range descriptors {
-		descKey := sqlbase.MakeDescMetadataKey(descriptor.GetID())
-		b.Put(descKey, sqlbase.WrapDescriptor(descriptor))
-	}
 	if err := p.txn.Run(ctx, b); err != nil {
 		return nil, err
 	}

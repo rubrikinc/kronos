@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
@@ -43,6 +44,7 @@ import (
 // in code. This means that they are accessed separately from standard descriptors.
 type virtualSchema struct {
 	name           string
+	allTableNames  map[string]struct{}
 	tables         []virtualSchemaTable
 	tableValidator func(*sqlbase.TableDescriptor) error // optional
 	// Some virtual tables can be used if there is no current database set; others can't.
@@ -84,6 +86,7 @@ type virtualSchemaEntry struct {
 	desc              *sqlbase.DatabaseDescriptor
 	tables            map[string]virtualTableEntry
 	orderedTableNames []string
+	allTableNames     map[string]struct{}
 }
 
 type virtualTableEntry struct {
@@ -102,9 +105,7 @@ var errInvalidDbPrefix = pgerror.NewError(pgerror.CodeUndefinedObjectError,
 // valuesNode for the virtual table. We use deferred construction here
 // so as to avoid populating a RowContainer during query preparation,
 // where we can't guarantee it will be Close()d in case of error.
-func (e virtualTableEntry) getPlanInfo(
-	ctx context.Context,
-) (sqlbase.ResultColumns, virtualTableConstructor) {
+func (e virtualTableEntry) getPlanInfo() (sqlbase.ResultColumns, virtualTableConstructor) {
 	var columns sqlbase.ResultColumns
 	for _, col := range e.desc.Columns {
 		columns = append(columns, sqlbase.ResultColumn{
@@ -194,6 +195,7 @@ func NewVirtualSchemaHolder(
 			desc:              dbDesc,
 			tables:            tables,
 			orderedTableNames: orderedTableNames,
+			allTableNames:     schema.allTableNames,
 		}
 		vs.orderedNames[i] = dbName
 	}
@@ -201,18 +203,17 @@ func NewVirtualSchemaHolder(
 	return vs, nil
 }
 
-// Virtual databases and tables each have an empty set of privileges. In practice,
-// all users have SELECT privileges on the database/tables, but this is handled
-// separately from normal SELECT privileges, because the virtual schemas need more
-// fine-grained access control. For instance, information_schema will only expose
-// rows to a given user which that user has access to.
-var emptyPrivileges = &sqlbase.PrivilegeDescriptor{}
+// Virtual databases and tables each have SELECT privileges for "public", which includes
+// all users. However, virtual schemas have more fine-grained access control.
+// For instance, information_schema will only expose rows to a given user which that
+// user has access to.
+var publicSelectPrivileges = sqlbase.NewPrivilegeDescriptor(sqlbase.PublicRole, privilege.List{privilege.SELECT})
 
 func initVirtualDatabaseDesc(name string) *sqlbase.DatabaseDescriptor {
 	return &sqlbase.DatabaseDescriptor{
 		Name:       name,
 		ID:         keys.VirtualDescriptorID,
-		Privileges: emptyPrivileges,
+		Privileges: publicSelectPrivileges,
 	}
 }
 
@@ -233,6 +234,8 @@ func initVirtualTableDesc(
 		}
 	}
 
+	// Virtual tables never use SERIAL so we need not process SERIAL
+	// types here.
 	return MakeTableDesc(
 		ctx,
 		nil, /* txn */
@@ -242,7 +245,7 @@ func initVirtualTableDesc(
 		0, /* parentID */
 		keys.VirtualDescriptorID,
 		hlc.Timestamp{}, /* creationTime */
-		emptyPrivileges,
+		publicSelectPrivileges,
 		nil, /* affected */
 		nil, /* semaCtx */
 		nil, /* evalCtx */
@@ -273,8 +276,13 @@ func (vs *VirtualSchemaHolder) getVirtualSchemaEntry(name string) (virtualSchema
 // getVirtualTableEntry is part of the VirtualTabler interface.
 func (vs *VirtualSchemaHolder) getVirtualTableEntry(tn *tree.TableName) (virtualTableEntry, error) {
 	if db, ok := vs.getVirtualSchemaEntry(tn.Schema()); ok {
-		if t, ok := db.tables[tn.Table()]; ok {
+		tableName := tn.Table()
+		if t, ok := db.tables[tableName]; ok {
 			return t, nil
+		}
+		if _, ok := db.allTableNames[tableName]; ok {
+			return virtualTableEntry{}, pgerror.Unimplemented(tn.Schema()+"."+tableName,
+				"virtual schema table not implemented: %s.%s", tn.Schema(), tableName)
 		}
 		return virtualTableEntry{}, sqlbase.NewUndefinedRelationError(tn)
 	}

@@ -16,13 +16,14 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -36,20 +37,11 @@ import (
 //
 
 var (
-	errEmptyDatabaseName = errors.New("empty database name")
-	errNoDatabase        = errors.New("no database specified")
-	errNoTable           = errors.New("no table specified")
-	errNoMatch           = errors.New("no object matched")
+	errEmptyDatabaseName = pgerror.NewError(pgerror.CodeSyntaxError, "empty database name")
+	errNoDatabase        = pgerror.NewError(pgerror.CodeInvalidNameError, "no database specified")
+	errNoTable           = pgerror.NewError(pgerror.CodeInvalidNameError, "no table specified")
+	errNoMatch           = pgerror.NewError(pgerror.CodeUndefinedObjectError, "no object matched")
 )
-
-type descriptorAlreadyExistsErr struct {
-	desc sqlbase.DescriptorProto
-	name string
-}
-
-func (d descriptorAlreadyExistsErr) Error() string {
-	return fmt.Sprintf("%s %q already exists", d.desc.TypeName(), d.name)
-}
 
 // GenerateUniqueDescID returns the next available Descriptor ID and increments
 // the counter. The incrementing is non-transactional, and the counter could be
@@ -63,17 +55,16 @@ func GenerateUniqueDescID(ctx context.Context, db *client.DB) (sqlbase.ID, error
 	return sqlbase.ID(newVal - 1), nil
 }
 
-// createDescriptor takes a Table or Database descriptor and creates it if
-// needed, incrementing the descriptor counter. Returns true if the descriptor
+// createdatabase takes Database descriptor and creates it if needed,
+// incrementing the descriptor counter. Returns true if the descriptor
 // is actually created, false if it already existed, or an error if one was
 // encountered. The ifNotExists flag is used to declare if the "already existed"
 // state should be an error (false) or a no-op (true).
-func (p *planner) createDescriptor(
-	ctx context.Context,
-	plainKey sqlbase.DescriptorKey,
-	descriptor sqlbase.DescriptorProto,
-	ifNotExists bool,
+// createDatabase implements the DatabaseDescEditor interface.
+func (p *planner) createDatabase(
+	ctx context.Context, desc *sqlbase.DatabaseDescriptor, ifNotExists bool,
 ) (bool, error) {
+	plainKey := databaseKey{desc.Name}
 	idKey := plainKey.Key()
 
 	if exists, err := descExists(ctx, p.txn, idKey); err == nil && exists {
@@ -81,15 +72,7 @@ func (p *planner) createDescriptor(
 			// Noop.
 			return false, nil
 		}
-		// Key exists, but we don't want it to: error out.
-		switch descriptor.TypeName() {
-		case "database":
-			return false, sqlbase.NewDatabaseAlreadyExistsError(plainKey.Name())
-		case "table", "view":
-			return false, sqlbase.NewRelationAlreadyExistsError(plainKey.Name())
-		default:
-			return false, descriptorAlreadyExistsErr{descriptor, plainKey.Name()}
-		}
+		return false, sqlbase.NewDatabaseAlreadyExistsError(plainKey.Name())
 	} else if err != nil {
 		return false, err
 	}
@@ -99,7 +82,7 @@ func (p *planner) createDescriptor(
 		return false, err
 	}
 
-	return true, p.createDescriptorWithID(ctx, idKey, id, descriptor)
+	return true, p.createDescriptorWithID(ctx, idKey, id, desc, nil)
 }
 
 func descExists(ctx context.Context, txn *client.Txn, idKey roachpb.Key) (bool, error) {
@@ -112,7 +95,11 @@ func descExists(ctx context.Context, txn *client.Txn, idKey roachpb.Key) (bool, 
 }
 
 func (p *planner) createDescriptorWithID(
-	ctx context.Context, idKey roachpb.Key, id sqlbase.ID, descriptor sqlbase.DescriptorProto,
+	ctx context.Context,
+	idKey roachpb.Key,
+	id sqlbase.ID,
+	descriptor sqlbase.DescriptorProto,
+	st *cluster.Settings,
 ) error {
 	descriptor.SetID(id)
 	// TODO(pmattis): The error currently returned below is likely going to be
@@ -136,11 +123,21 @@ func (p *planner) createDescriptorWithID(
 	b.CPut(idKey, descID, nil)
 	b.CPut(descKey, descDesc, nil)
 
-	if desc, ok := descriptor.(*sqlbase.TableDescriptor); ok {
+	desc, ok := descriptor.(*sqlbase.TableDescriptor)
+	if ok {
+		if err := desc.ValidateTable(st); err != nil {
+			return err
+		}
 		p.Tables().addUncommittedTable(*desc)
 	}
 
-	return p.txn.Run(ctx, b)
+	if err := p.txn.Run(ctx, b); err != nil {
+		return err
+	}
+	if ok && desc.Adding() {
+		p.queueSchemaChange(desc, sqlbase.InvalidMutationID)
+	}
+	return nil
 }
 
 // getDescriptor looks up the descriptor for `plainKey`, validates it,

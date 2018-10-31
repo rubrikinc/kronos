@@ -34,12 +34,7 @@ func (p *planner) AlterSequence(ctx context.Context, n *tree.AlterSequence) (pla
 		return nil, err
 	}
 
-	var seqDesc *TableDescriptor
-	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
-	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
-		seqDesc, err = ResolveExistingObject(ctx, p, tn, !n.IfExists, requireSequenceDesc)
-	})
+	seqDesc, err := p.ResolveMutableTableDescriptor(ctx, tn, !n.IfExists, requireSequenceDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -62,14 +57,14 @@ func (n *alterSequenceNode) startExec(params runParams) error {
 		return err
 	}
 
-	if err := params.p.writeTableDesc(params.ctx, n.seqDesc); err != nil {
+	if err := params.p.writeSchemaChange(params.ctx, n.seqDesc, sqlbase.InvalidMutationID); err != nil {
 		return err
 	}
 
 	// Record this sequence alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
+	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
 		params.ctx,
 		params.p.txn,
 		EventLogAlterSequence,
@@ -80,13 +75,7 @@ func (n *alterSequenceNode) startExec(params runParams) error {
 			Statement    string
 			User         string
 		}{n.n.Name.TableName().FQString(), n.n.String(), params.SessionData().User},
-	); err != nil {
-		return err
-	}
-
-	params.p.notifySchemaChange(n.seqDesc, sqlbase.InvalidMutationID)
-
-	return nil
+	)
 }
 
 func (n *alterSequenceNode) Next(runParams) (bool, error) { return false, nil }

@@ -17,7 +17,7 @@ package log
 import (
 	"context"
 	"fmt"
-	"os"
+	"strings"
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
@@ -45,7 +45,9 @@ var secondaryLogRegistry struct {
 // The given directory name can be either nil or empty, in which case
 // the global logger's own dirName is used; or non-nil and non-empty,
 // in which case it specifies the directory for that new logger.
-func NewSecondaryLogger(dirName *DirName, fileNamePrefix string, enableGc, forceSyncWrites bool) *SecondaryLogger {
+func NewSecondaryLogger(
+	dirName *DirName, fileNamePrefix string, enableGc, forceSyncWrites bool,
+) *SecondaryLogger {
 	logging.mu.Lock()
 	defer logging.mu.Unlock()
 	var dir string
@@ -65,7 +67,6 @@ func NewSecondaryLogger(dirName *DirName, fileNamePrefix string, enableGc, force
 			syncWrites:       forceSyncWrites || logging.syncWrites,
 			gcNotify:         make(chan struct{}, 1),
 			disableDaemons:   logging.disableDaemons,
-			exitFunc:         os.Exit,
 		},
 		forceSyncWrites: forceSyncWrites,
 	}
@@ -86,7 +87,7 @@ func NewSecondaryLogger(dirName *DirName, fileNamePrefix string, enableGc, force
 // Logf logs an event on a secondary logger.
 func (l *SecondaryLogger) Logf(ctx context.Context, format string, args ...interface{}) {
 	file, line, _ := caller.Lookup(1)
-	var buf msgBuf
+	var buf strings.Builder
 	formatTags(ctx, &buf)
 
 	// Add a counter. This is important for auditing.

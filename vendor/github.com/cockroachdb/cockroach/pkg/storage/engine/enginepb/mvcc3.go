@@ -14,16 +14,30 @@
 
 package enginepb
 
-import proto "github.com/gogo/protobuf/proto"
+import (
+	"fmt"
+
+	proto "github.com/gogo/protobuf/proto"
+)
 
 // ToStats converts the receiver to an MVCCStats.
-func (ms *MVCCNetworkStats) ToStats() MVCCStats {
+func (ms *MVCCStatsDelta) ToStats() MVCCStats {
 	return MVCCStats(*ms)
 }
 
-// ToNetworkStats converts the receiver to an MVCCNetworkStats.
-func (ms *MVCCStats) ToNetworkStats() MVCCNetworkStats {
-	return MVCCNetworkStats(*ms)
+// ToStatsDelta converts the receiver to an MVCCStatsDelta.
+func (ms *MVCCStats) ToStatsDelta() MVCCStatsDelta {
+	return MVCCStatsDelta(*ms)
+}
+
+// ToStats converts the receiver to an MVCCStats.
+func (ms *MVCCPersistentStats) ToStats() MVCCStats {
+	return MVCCStats(*ms)
+}
+
+// ToPersistentStats converts the receiver to an MVCCPersistentStats.
+func (ms *MVCCStats) ToPersistentStats() MVCCPersistentStats {
+	return MVCCPersistentStats(*ms)
 }
 
 var isolationTypeLowerCase = map[int32]string{
@@ -36,4 +50,13 @@ var isolationTypeLowerCase = map[int32]string{
 // that we don't want to call strings.ToLower(x.String()) all the time.
 func (x IsolationType) ToLowerCaseString() string {
 	return proto.EnumName(isolationTypeLowerCase, int32(x))
+}
+
+// MustSetValue is like SetValue, except it resets the enum and panics if the
+// provided value is not a valid variant type.
+func (op *MVCCLogicalOp) MustSetValue(value interface{}) {
+	op.Reset()
+	if !op.SetValue(value) {
+		panic(fmt.Sprintf("%T excludes %T", op, value))
+	}
 }

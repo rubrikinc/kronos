@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/pkg/errors"
 )
 
 // A groupNode implements the planNode interface and handles the grouping logic.
@@ -48,12 +47,19 @@ type groupNode struct {
 	// The source node (which returns values that feed into the aggregation).
 	plan planNode
 
-	// The group-by columns are the first numGroupCols columns of
-	// the source plan.
-	numGroupCols int
+	// Indices of the group by columns in the source plan.
+	groupCols []int
+	// Indices of the group by columns in the source plan that have an ordering.
+	orderedGroupCols []int
+
+	// isScalar is set for "scalar groupby", where we want a result
+	// even if there are no input rows, e.g. SELECT MIN(x) FROM t.
+	isScalar bool
 
 	// funcs are the aggregation functions that the renders use.
 	funcs []*aggregateFuncHolder
+
+	props physicalProps
 
 	run groupRun
 }
@@ -64,6 +70,9 @@ type groupNode struct {
 // The complex always includes a groupNode which initially uses the given
 // renderNode as its own data source; the data source can be changed later with
 // an equivalent one if the renderNode is optimized out.
+//
+// Note that this function clobbers the planner's semaCtx. The caller is responsible
+// for saving and restoring the Properties field.
 //
 // The visible node from the consumer-side is a renderNode which renders
 // post-aggregation expressions:
@@ -103,8 +112,11 @@ func (p *planner) groupBy(
 	// Determine if aggregation is being performed. This check is done on the raw
 	// Select expressions as simplification might have removed aggregation
 	// functions (e.g. `SELECT MIN(1)` -> `SELECT 1`).
-	if isAggregate := p.txCtx.IsAggregate(n, p.SessionData().SearchPath); !isAggregate {
+	if n.Having == nil && len(n.GroupBy) == 0 && !r.renderProps.SeenAggregate {
 		return nil, nil, nil
+	}
+	if n.Having != nil && len(n.From.Tables) == 0 {
+		return nil, nil, pgerror.UnimplementedWithIssueError(26349, "HAVING clause without FROM")
 	}
 
 	groupByExprs := make([]tree.Expr, len(n.GroupBy))
@@ -127,60 +139,9 @@ func (p *planner) groupBy(
 		}
 
 		if col != -1 {
-			groupByExprs[i] = r.render[col]
-			expr = n.Exprs[col].Expr
+			groupByExprs[i] = n.Exprs[col].Expr
 		} else {
-			// We do not need to fully analyze the GROUP BY expression here
-			// (as per analyzeExpr) because this is taken care of by computeRender
-			// below. We do however need to resolveNames so the
-			// AssertNoAggregationOrWindowing call below can find resolved
-			// FunctionDefs in the AST (instead of UnresolvedNames).
-
-			// While doing so, we must be careful not to expand top-level
-			// stars, because this is handled specially by
-			// computeRenderAllowingStars below.
-			skipResolve := false
-			if vName, ok := expr.(tree.VarName); ok {
-				v, err := vName.NormalizeVarName()
-				if err != nil {
-					return nil, nil, err
-				}
-				switch v.(type) {
-				case tree.UnqualifiedStar, *tree.AllColumnsSelector:
-					skipResolve = true
-				}
-			}
-
-			resolvedExpr := expr
-			if !skipResolve {
-				var hasStar bool
-				resolvedExpr, _, hasStar, err = p.resolveNames(expr, r.sourceInfo, r.ivarHelper)
-				if err != nil {
-					return nil, nil, err
-				}
-				p.curPlan.hasStar = p.curPlan.hasStar || hasStar
-			}
-			groupByExprs[i] = resolvedExpr
-		}
-
-		if err := p.txCtx.AssertNoAggregationOrWindowing(
-			expr, "GROUP BY", p.SessionData().SearchPath,
-		); err != nil {
-			return nil, nil, err
-		}
-	}
-
-	// Normalize and check the HAVING expression too if it exists.
-	var typedHaving tree.TypedExpr
-	if n.Having != nil {
-		if p.txCtx.WindowFuncInExpr(n.Having.Expr) {
-			return nil, nil, sqlbase.NewWindowingError("HAVING")
-		}
-		var err error
-		typedHaving, err = p.analyzeExpr(ctx, n.Having.Expr, r.sourceInfo, r.ivarHelper,
-			types.Bool, true /* requireType */, "HAVING")
-		if err != nil {
-			return nil, nil, err
+			groupByExprs[i] = expr
 		}
 	}
 
@@ -196,6 +157,7 @@ func (p *planner) groupBy(
 	origRenders := r.render
 	origColumns := r.columns
 	r.resetRenderColumns(nil, nil)
+	r.renderProps.Clear()
 
 	// Add the group-by expressions.
 
@@ -206,6 +168,10 @@ func (p *planner) groupBy(
 	// the aggregate function directly; there is no need to add a render. See
 	// extractAggregatesVisitor below.
 	groupStrs := make(groupByStrMap, len(groupByExprs))
+
+	// We need to ensure there are no special function in the clause.
+	p.semaCtx.Properties.Require("GROUP BY", tree.RejectSpecial)
+
 	for _, g := range groupByExprs {
 		cols, exprs, hasStar, err := p.computeRenderAllowingStars(
 			ctx, tree.SelectExpr{Expr: g}, types.Any, r.sourceInfo, r.ivarHelper,
@@ -232,7 +198,12 @@ func (p *planner) groupBy(
 			groupStrs[symbolicExprStr(e)] = colIdxs[i]
 		}
 	}
-	group.numGroupCols = len(r.render)
+	// Because of the way we set up the pre-projection above, the grouping columns
+	// are always the first columns.
+	group.groupCols = make([]int, len(r.render))
+	for i := range group.groupCols {
+		group.groupCols[i] = i
+	}
 
 	var havingNode *filterNode
 	plan := planNode(group)
@@ -241,14 +212,32 @@ func (p *planner) groupBy(
 	// r as needed.
 	//
 	// "Grouping expressions" - expressions that also show up under GROUP BY - are
-	// also treated as aggregate expressions (with identAggregate).
-	if typedHaving != nil {
+	// also treated as aggregate expressions (any_not_null aggregation).
+	// Normalize and check the HAVING expression too if it exists.
+	if n.Having != nil {
 		havingNode = &filterNode{
-			source: planDataSource{plan: plan, info: &sqlbase.DataSourceInfo{}},
+			source: planDataSource{
+				plan: plan,
+				info: r.source.info, // Note: info is re-populated below.
+			},
 		}
+		havingNode.ivarHelper = tree.MakeIndexedVarHelper(havingNode, len(r.source.info.SourceColumns))
 		plan = havingNode
-		havingNode.ivarHelper = tree.MakeIndexedVarHelper(havingNode, 0)
 
+		// We allow aggregates in HAVING clause, but not other special functions.
+		p.semaCtx.Properties.Require("HAVING", tree.RejectWindowApplications|tree.RejectGenerators)
+
+		// Semantically analyze the HAVING expression.
+		var err error
+		havingNode.filter, err = p.analyzeExpr(
+			ctx, n.Having.Expr, r.sourceInfo, havingNode.ivarHelper,
+			types.Bool, true /* require type */, "HAVING",
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		havingNode.ivarHelper = tree.MakeIndexedVarHelper(havingNode, 0)
 		aggVisitor := extractAggregatesVisitor{
 			ctx:        ctx,
 			planner:    p,
@@ -259,23 +248,16 @@ func (p *planner) groupBy(
 		}
 		// havingExpr is the HAVING expression, where any aggregates or grouping
 		// expressions have been replaced with havingNode IndexedVars.
-		havingExpr, err := aggVisitor.extract(typedHaving)
+		havingNode.filter, err = aggVisitor.extract(havingNode.filter)
 		if err != nil {
 			return nil, nil, err
 		}
-		// The group.columns have been updated; the sourceColumns in the node must
-		// also be updated (for IndexedVarResolvedType to work).
+
+		// The having node is being plugged to the groupNode as source.
+		// We reuse the group node's column names and types.
 		havingNode.source.info = sqlbase.NewSourceInfoForSingleTable(
 			sqlbase.AnonymousTable, group.columns,
 		)
-
-		havingNode.filter, err = p.analyzeExpr(
-			ctx, havingExpr, nil /* no source info */, havingNode.ivarHelper,
-			types.Bool, true /* require type */, "HAVING",
-		)
-		if err != nil {
-			return nil, nil, err
-		}
 	}
 
 	postRender := &renderNode{
@@ -311,16 +293,12 @@ func (p *planner) groupBy(
 	postRender.sourceInfo = sqlbase.MultiSourceInfo{postRender.source.info}
 
 	// Queries like `SELECT MAX(n) FROM t` expect a row of NULLs if nothing was aggregated.
-	group.run.addNullBucketIfEmpty = len(groupByExprs) == 0
-
-	// TODO(peter): This memory isn't being accounted for. The similar code in
-	// sql/distsqlrun/aggregator.go does account for the memory.
-	group.run.buckets = make(map[string]struct{})
+	group.isScalar = len(groupByExprs) == 0
 
 	if log.V(2) {
 		strs := make([]string, 0, len(group.funcs))
 		for _, f := range group.funcs {
-			strs = append(strs, f.expr.String())
+			strs = append(strs, f.funcName)
 		}
 		log.Infof(ctx, "Group: %s", strings.Join(strs, ", "))
 	}
@@ -334,10 +312,12 @@ func (p *planner) groupBy(
 type groupRun struct {
 	// The set of bucket keys. We add buckets as we are processing input rows, and
 	// we remove them as we are outputting results.
-	buckets   map[string]struct{}
-	populated bool
+	buckets     map[string]struct{}
+	populated   bool
+	sourceEmpty bool
 
-	addNullBucketIfEmpty bool
+	lastOrderedGroupKey tree.Datums
+	consumedGroupKey    bool
 
 	// The current result row.
 	values tree.Datums
@@ -345,14 +325,81 @@ type groupRun struct {
 	// gotOneRow becomes true after one result row has been produced.
 	// Used in conjunction with needOnlyOneRow.
 	gotOneRow bool
+
+	scratch []byte
+}
+
+// matchLastGroupKey takes a row and matches it with the row stored by
+// lastOrderedGroupKey. It returns true if the two rows are equal on the
+// grouping columns, and false otherwise.
+func (n *groupNode) matchLastGroupKey(ctx *tree.EvalContext, row tree.Datums) bool {
+	for _, i := range n.orderedGroupCols {
+		if n.run.lastOrderedGroupKey[i].Compare(ctx, row[i]) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// accumulateRow takes a row and accumulates it into all the aggregate
+// functions.
+func (n *groupNode) accumulateRow(params runParams, values tree.Datums) error {
+	bucket := n.run.scratch
+	for _, idx := range n.groupCols {
+		var err error
+		bucket, err = sqlbase.EncodeDatumKeyAscending(bucket, values[idx])
+		if err != nil {
+			return err
+		}
+	}
+
+	n.run.buckets[string(bucket)] = struct{}{}
+
+	// Feed the aggregateFuncHolders for this bucket the non-grouped values.
+	for _, f := range n.funcs {
+		if f.hasFilter() && values[f.filterRenderIdx] != tree.DBoolTrue {
+			continue
+		}
+
+		var value tree.Datum
+		if f.argRenderIdx != noRenderIdx {
+			value = values[f.argRenderIdx]
+		}
+
+		if err := f.add(params.ctx, params.EvalContext(), bucket, value); err != nil {
+			return err
+		}
+	}
+
+	n.run.scratch = bucket[:0]
+	n.run.gotOneRow = true
+
+	return nil
+}
+
+func (n *groupNode) startExec(params runParams) error {
+	// TODO(peter): This memory isn't being accounted for. The similar code in
+	// sql/distsqlrun/aggregator.go does account for the memory.
+	n.run.buckets = make(map[string]struct{})
+	return nil
 }
 
 func (n *groupNode) Next(params runParams) (bool, error) {
-	var scratch []byte
-	// We're going to consume n.plan until it's exhausted (feeding all the rows to
-	// n.funcs), and then call n.setupOutput.
-	// Subsequent calls to next will skip the first part and just return a result.
-	for !n.run.populated {
+	// We're going to accumulate rows from n.plan until it's either exhausted or
+	// the ordered group columns change. Subsequent calls to Next will return the
+	// result of each bucket, then continue accumulating n.plan when there are no
+	// more buckets.
+	for (!n.run.populated || len(n.run.buckets) == 0) && !n.run.sourceEmpty {
+		// We've finished consuming the old buckets.
+		n.run.populated = false
+
+		if !n.run.consumedGroupKey && n.run.lastOrderedGroupKey != nil {
+			if err := n.accumulateRow(params, n.run.lastOrderedGroupKey); err != nil {
+				return false, err
+			}
+			n.run.consumedGroupKey = true
+		}
+
 		next := false
 		if err := params.p.cancelChecker.Check(); err != nil {
 			return false, err
@@ -365,46 +412,29 @@ func (n *groupNode) Next(params runParams) (bool, error) {
 			}
 		}
 		if !next {
+			n.run.sourceEmpty = true
+			n.setupOutput()
+			break
+		}
+
+		values := n.plan.Values()
+		if n.run.lastOrderedGroupKey == nil {
+			n.run.lastOrderedGroupKey = make(tree.Datums, len(values))
+			copy(n.run.lastOrderedGroupKey, values)
+			n.run.consumedGroupKey = true
+		}
+		if !n.matchLastGroupKey(params.EvalContext(), values) {
+			copy(n.run.lastOrderedGroupKey, values)
+			n.run.consumedGroupKey = false
 			n.run.populated = true
 			n.setupOutput()
 			break
 		}
 
 		// Add row to bucket.
-
-		values := n.plan.Values()
-
-		// TODO(dt): optimization: skip buckets when underlying plan is ordered by grouped values.
-
-		bucket := scratch
-		for idx := 0; idx < n.numGroupCols; idx++ {
-			var err error
-			bucket, err = sqlbase.EncodeDatum(bucket, values[idx])
-			if err != nil {
-				return false, err
-			}
+		if err := n.accumulateRow(params, values); err != nil {
+			return false, err
 		}
-
-		n.run.buckets[string(bucket)] = struct{}{}
-
-		// Feed the aggregateFuncHolders for this bucket the non-grouped values.
-		for _, f := range n.funcs {
-			if f.hasFilter && values[f.filterRenderIdx] != tree.DBoolTrue {
-				continue
-			}
-
-			var value tree.Datum
-			if f.argRenderIdx != noRenderIdx {
-				value = values[f.argRenderIdx]
-			}
-
-			if err := f.add(params.ctx, params.EvalContext(), bucket, value); err != nil {
-				return false, err
-			}
-		}
-		scratch = bucket[:0]
-
-		n.run.gotOneRow = true
 	}
 
 	if len(n.run.buckets) == 0 {
@@ -425,7 +455,7 @@ func (n *groupNode) Next(params runParams) (bool, error) {
 			// No input for this bucket (possible if f has a FILTER).
 			// In most cases the result is NULL but there are exceptions
 			// (like COUNT).
-			aggregateFunc = f.create(params.EvalContext())
+			aggregateFunc = f.create(params.EvalContext(), nil /* arguments */)
 		}
 		var err error
 		n.run.values[i], err = aggregateFunc.Result()
@@ -451,10 +481,12 @@ func (n *groupNode) Close(ctx context.Context) {
 // setupOutput runs once after all the input rows have been processed. It sets
 // up the necessary state to start iterating through the buckets in Next().
 func (n *groupNode) setupOutput() {
-	if len(n.run.buckets) < 1 && n.run.addNullBucketIfEmpty {
+	if len(n.run.buckets) < 1 && n.isScalar {
 		n.run.buckets[""] = struct{}{}
 	}
-	n.run.values = make(tree.Datums, len(n.funcs))
+	if n.run.values == nil {
+		n.run.values = make(tree.Datums, len(n.funcs))
+	}
 }
 
 // requiresIsDistinctFromNullFilter returns whether a
@@ -497,7 +529,7 @@ func (n *groupNode) addIsDistinctFromNullFilter(where *filterNode, render *rende
 // instead have another variable (e.g. from the AST) tell us what type
 // of aggregation we're dealing with, and test that here.
 func (n *groupNode) desiredAggregateOrdering(evalCtx *tree.EvalContext) sqlbase.ColumnOrdering {
-	if n.numGroupCols > 0 {
+	if len(n.groupCols) > 0 {
 		return nil
 	}
 
@@ -505,7 +537,7 @@ func (n *groupNode) desiredAggregateOrdering(evalCtx *tree.EvalContext) sqlbase.
 		return nil
 	}
 	f := n.funcs[0]
-	impl := f.create(evalCtx)
+	impl := f.create(evalCtx, nil /* arguments */)
 	switch impl.(type) {
 	case *builtins.MinAggregate:
 		return sqlbase.ColumnOrdering{{ColIdx: f.argRenderIdx, Direction: encoding.Ascending}}
@@ -513,6 +545,20 @@ func (n *groupNode) desiredAggregateOrdering(evalCtx *tree.EvalContext) sqlbase.
 		return sqlbase.ColumnOrdering{{ColIdx: f.argRenderIdx, Direction: encoding.Descending}}
 	}
 	return nil
+}
+
+// aggIsGroupingColumn returns true if the given output aggregation is an
+// any_not_null aggregation for a grouping column. The grouping column
+// index is also returned.
+func (n *groupNode) aggIsGroupingColumn(aggIdx int) (colIdx int, ok bool) {
+	if holder := n.funcs[aggIdx]; holder.funcName == builtins.AnyNotNull {
+		for _, c := range n.groupCols {
+			if c == holder.argRenderIdx {
+				return c, true
+			}
+		}
+	}
+	return -1, false
 }
 
 // extractAggregatesVisitor extracts arguments to aggregate functions and adds
@@ -545,7 +591,7 @@ var _ tree.Visitor = &extractAggregatesVisitor{}
 func (v *extractAggregatesVisitor) addAggregation(f *aggregateFuncHolder) *tree.IndexedVar {
 	for i, g := range v.groupNode.funcs {
 		if aggregateFuncsEqual(f, g) {
-			return v.ivarHelper.IndexedVarWithType(i, f.expr.ResolvedType())
+			return v.ivarHelper.IndexedVarWithType(i, f.resultType)
 		}
 	}
 	v.groupNode.funcs = append(v.groupNode.funcs, f)
@@ -557,26 +603,13 @@ func (v *extractAggregatesVisitor) addAggregation(f *aggregateFuncHolder) *tree.
 			v.groupNode.funcs, renderIdx,
 		))
 	}
-	// We care about the name of the groupNode columns as an optimization: we want
-	// them to match the post-render node's columns if the post-render expressions
-	// are trivial (so the renderNode can be elided).
-	colName, err := getRenderColName(
-		v.planner.SessionData().SearchPath, tree.SelectExpr{Expr: f.expr}, &v.preRender.ivarHelper)
-	if err != nil {
-		colName = fmt.Sprintf("agg%d", renderIdx)
-	} else if strings.ToLower(colName) == "count_rows()" {
-		// Special case: count(*) expressions are converted to count_rows(); since
-		// typical usage is count(*), use that column name instead of count_rows(),
-		// allowing elision of the renderNode.
-		// TODO(radu): remove this if #16535 is resolved.
-		colName = "count(*)"
-	}
-	typ := f.expr.ResolvedType()
+	// Make up a column name. If we need a particular name to elide a renderNode,
+	// the column will be renamed.
 	v.groupNode.columns = append(v.groupNode.columns, sqlbase.ResultColumn{
-		Name: colName,
-		Typ:  typ,
+		Name: fmt.Sprintf("agg%d", renderIdx),
+		Typ:  f.resultType,
 	})
-	return v.ivarHelper.IndexedVarWithType(renderIdx, typ)
+	return v.ivarHelper.IndexedVarWithType(renderIdx, f.resultType)
 }
 
 func (v *extractAggregatesVisitor) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
@@ -586,12 +619,13 @@ func (v *extractAggregatesVisitor) VisitPre(expr tree.Expr) (recurse bool, newEx
 
 	if groupIdx, ok := v.groupStrs[symbolicExprStr(expr)]; ok {
 		// This expression is in the GROUP BY; it is already being rendered by the
-		// renderNode.
+		// renderNode. Set up an any_not_null aggregation.
 		f := v.groupNode.newAggregateFuncHolder(
-			v.preRender.render[groupIdx],
+			builtins.AnyNotNull,
+			v.preRender.render[groupIdx].ResolvedType(),
 			groupIdx,
-			true, /* ident */
-			builtins.NewIdentAggregate,
+			builtins.NewAnyNotNullAggregate,
+			nil,
 			v.planner.EvalContext().Mon.MakeBoundAccount(),
 		)
 
@@ -602,30 +636,52 @@ func (v *extractAggregatesVisitor) VisitPre(expr tree.Expr) (recurse bool, newEx
 	case *tree.FuncExpr:
 		if agg := t.GetAggregateConstructor(); agg != nil {
 			var f *aggregateFuncHolder
-			switch len(t.Exprs) {
-			case 0:
+			if len(t.Exprs) == 0 {
 				// COUNT_ROWS has no arguments.
 				f = v.groupNode.newAggregateFuncHolder(
-					t,
+					t.Func.String(),
+					t.ResolvedType(),
 					noRenderIdx,
-					false, /* not ident */
 					agg,
+					nil,
 					v.planner.EvalContext().Mon.MakeBoundAccount(),
 				)
+			} else {
+				// Only the first argument can be an expression, all the following ones
+				// must be consts. So before we proceed, they must be checked.
+				arguments := make(tree.Datums, len(t.Exprs)-1)
+				if len(t.Exprs) > 1 {
+					evalContext := v.planner.EvalContext()
+					for i := 1; i < len(t.Exprs); i++ {
+						if !tree.IsConst(evalContext, t.Exprs[i]) {
+							v.err = pgerror.UnimplementedWithIssueError(28417, "aggregate functions with multiple non-constant expressions are not supported")
+							return false, expr
+						}
+						var err error
+						arguments[i-1], err = t.Exprs[i].(tree.TypedExpr).Eval(evalContext)
+						if err != nil {
+							v.err = pgerror.NewAssertionErrorf("can't evaluate %s - %v", t.Exprs[i].String(), err)
+							return false, expr
+						}
+					}
+				}
 
-			case 1:
 				argExpr := t.Exprs[0].(tree.TypedExpr)
 
-				if err := v.planner.txCtx.AssertNoAggregationOrWindowing(
-					argExpr,
-					fmt.Sprintf("the argument of %s()", &t.Func),
-					v.planner.SessionData().SearchPath,
-				); err != nil {
-					v.err = err
+				// TODO(knz): it's really a shame that we need to recurse
+				// through the sub-tree to determine whether the arguments
+				// don't contain invalid functions. This really would want to
+				// be checked on the return path of the recursion.
+				// See issue #26425.
+				if v.planner.txCtx.WindowFuncInExpr(argExpr) {
+					v.err = sqlbase.NewWindowInAggError()
+					return false, expr
+				} else if v.planner.txCtx.AggregateInExpr(argExpr, v.planner.SessionData().SearchPath) {
+					v.err = sqlbase.NewAggInAggError()
 					return false, expr
 				}
 
-				// Add a render for the argument.
+				// Add a pre-rendering for the argument.
 				col := sqlbase.ResultColumn{
 					Name: argExpr.String(),
 					Typ:  argExpr.ResolvedType(),
@@ -634,17 +690,13 @@ func (v *extractAggregatesVisitor) VisitPre(expr tree.Expr) (recurse bool, newEx
 				argRenderIdx := v.preRender.addOrReuseRender(col, argExpr, true /* reuse */)
 
 				f = v.groupNode.newAggregateFuncHolder(
-					t,
+					t.Func.String(),
+					t.ResolvedType(),
 					argRenderIdx,
-					false, /* not ident */
 					agg,
+					arguments,
 					v.planner.EvalContext().Mon.MakeBoundAccount(),
 				)
-
-			default:
-				// TODO: #10495
-				v.err = pgerror.UnimplementedWithIssueError(10495, "aggregate functions with multiple arguments are not supported yet")
-				return false, expr
 			}
 
 			if t.Type == tree.DistinctFuncType {
@@ -654,12 +706,12 @@ func (v *extractAggregatesVisitor) VisitPre(expr tree.Expr) (recurse bool, newEx
 			if t.Filter != nil {
 				filterExpr := t.Filter.(tree.TypedExpr)
 
-				if err := v.planner.txCtx.AssertNoAggregationOrWindowing(
-					filterExpr, "FILTER", v.planner.SessionData().SearchPath,
-				); err != nil {
-					v.err = err
-					return false, expr
-				}
+				// We need to save and restore the previous value of the field in
+				// semaCtx in case we are recursively called within a subquery
+				// context.
+				scalarProps := &v.planner.semaCtx.Properties
+				defer scalarProps.Restore(*scalarProps)
+				scalarProps.Require("FILTER", tree.RejectSpecial)
 
 				col, renderExpr, err := v.planner.computeRender(
 					v.ctx,
@@ -681,7 +733,7 @@ func (v *extractAggregatesVisitor) VisitPre(expr tree.Expr) (recurse bool, newEx
 		}
 
 	case *tree.IndexedVar:
-		v.err = errors.Errorf(
+		v.err = pgerror.NewErrorf(pgerror.CodeGroupingError,
 			"column \"%s\" must appear in the GROUP BY clause or be used in an aggregate function",
 			t)
 		return false, expr
@@ -701,29 +753,27 @@ func (v extractAggregatesVisitor) extract(typedExpr tree.TypedExpr) (tree.TypedE
 }
 
 type aggregateFuncHolder struct {
-	// expr must either contain an aggregation function (SUM, COUNT, etc.) or an
-	// expression that also appears as one of the GROUP BY expressions (v+w in
-	// SELECT v+w FROM kvw GROUP BY v+w).
-	expr tree.TypedExpr
+	// Name of the aggregate function. Empty if this column reproduces a bucket
+	// key unchanged.
+	funcName string
+
+	resultType types.T
 
 	// The argument of the function is a single value produced by the renderNode
-	// underneath.
+	// underneath. If the function has no argument (COUNT_ROWS), it is set to
+	// noRenderIdx.
 	argRenderIdx int
-	// hasFilter indicates whether this aggregate function has a FILTER
-	// clause.  If true, then the filter is in the source column indexed
-	// by filterRenderIdx below.
-	hasFilter bool
 	// If there is a filter, the result is a single value produced by the
-	// renderNode underneath.
+	// renderNode underneath. If there is no filter, it is set to noRenderIdx.
 	filterRenderIdx int
-
-	// identAggregate is true if this column reproduces the bucket key
-	// unchanged.
-	identAggregate bool
 
 	// create instantiates the built-in execution context for the
 	// aggregation function.
-	create func(*tree.EvalContext) tree.AggregateFunc
+	create func(*tree.EvalContext, tree.Datums) tree.AggregateFunc
+
+	// arguments are constant expressions that can be optionally passed into an
+	// aggregator.
+	arguments tree.Datums
 
 	run aggregateFuncRun
 }
@@ -738,18 +788,28 @@ type aggregateFuncRun struct {
 
 const noRenderIdx = -1
 
+// newAggregateFuncHolder creates an aggregateFuncHolder.
+//
+// If function is nil, this is an "ident" aggregation (meaning that the input is
+// a group-by column and the "aggregation" returns its value)
+//
+// If the aggregation function takes no arguments (e.g. COUNT_ROWS),
+// argRenderIdx is noRenderIdx.
 func (n *groupNode) newAggregateFuncHolder(
-	expr tree.TypedExpr,
+	funcName string,
+	resultType types.T,
 	argRenderIdx int,
-	identAggregate bool,
-	create func(*tree.EvalContext) tree.AggregateFunc,
+	create func(*tree.EvalContext, tree.Datums) tree.AggregateFunc,
+	arguments tree.Datums,
 	acc mon.BoundAccount,
 ) *aggregateFuncHolder {
 	res := &aggregateFuncHolder{
-		expr:           expr,
-		argRenderIdx:   argRenderIdx,
-		create:         create,
-		identAggregate: identAggregate,
+		funcName:        funcName,
+		resultType:      resultType,
+		argRenderIdx:    argRenderIdx,
+		filterRenderIdx: noRenderIdx,
+		create:          create,
+		arguments:       arguments,
 		run: aggregateFuncRun{
 			buckets:       make(map[string]tree.AggregateFunc),
 			bucketsMemAcc: acc,
@@ -759,8 +819,11 @@ func (n *groupNode) newAggregateFuncHolder(
 }
 
 func (a *aggregateFuncHolder) setFilter(filterRenderIdx int) {
-	a.hasFilter = true
 	a.filterRenderIdx = filterRenderIdx
+}
+
+func (a *aggregateFuncHolder) hasFilter() bool {
+	return a.filterRenderIdx != noRenderIdx
 }
 
 // setDistinct causes a to ignore duplicate values of the argument.
@@ -768,8 +831,14 @@ func (a *aggregateFuncHolder) setDistinct() {
 	a.run.seen = make(map[string]struct{})
 }
 
+// isDistinct returns true if only distinct values are aggregated,
+// e.g. SUM(DISTINCT x).
+func (a *aggregateFuncHolder) isDistinct() bool {
+	return a.run.seen != nil
+}
+
 func aggregateFuncsEqual(a, b *aggregateFuncHolder) bool {
-	return a.expr.String() == b.expr.String() && a.expr.ResolvedType() == b.expr.ResolvedType() &&
+	return a.funcName == b.funcName && a.resultType == b.resultType &&
 		a.argRenderIdx == b.argRenderIdx && a.filterRenderIdx == b.filterRenderIdx
 }
 
@@ -793,7 +862,7 @@ func (a *aggregateFuncHolder) add(
 	// https://github.com/golang/go/commit/f5f5a8b6209f84961687d993b93ea0d397f5d5bf
 
 	if a.run.seen != nil {
-		encoded, err := sqlbase.EncodeDatum(bucket, d)
+		encoded, err := sqlbase.EncodeDatumKeyAscending(bucket, d)
 		if err != nil {
 			return err
 		}
@@ -809,7 +878,7 @@ func (a *aggregateFuncHolder) add(
 
 	impl, ok := a.run.buckets[string(bucket)]
 	if !ok {
-		impl = a.create(evalCtx)
+		impl = a.create(evalCtx, a.arguments)
 		a.run.buckets[string(bucket)] = impl
 	}
 
