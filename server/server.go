@@ -286,15 +286,17 @@ func (k *Server) trySyncWithOracle(ctx context.Context, oracle *kronospb.NodeAdd
 	}
 
 	k.OracleDelta.Add(deltaAdjustment)
-	log.Infof(
-		ctx,
-		"Synced with oracle: %s. Oracle time: %v, rtt: %v, delta adjustment: %v, new delta: %v",
-		oracle,
-		response.Time,
-		time.Duration(response.Rtt),
-		time.Duration(deltaAdjustment),
-		time.Duration(k.OracleDelta.Load()),
-	)
+	if log.V(1) {
+		log.Infof(
+			ctx,
+			"Synced with oracle: %s. Oracle time: %v, rtt: %v, delta adjustment: %v, new delta: %v",
+			oracle,
+			response.Time,
+			time.Duration(response.Rtt),
+			time.Duration(deltaAdjustment),
+			time.Duration(k.OracleDelta.Load()),
+		)
+	}
 	return nil
 }
 
@@ -456,16 +458,20 @@ func (k *Server) ManageOracle(tickCh <-chan time.Time, tickCallback func()) {
 		case <-tickCh:
 			oracleState := k.OracleSM.State(ctx)
 			k.Metrics.TimeCap.Update(oracleState.TimeCap)
-			log.Infof(ctx, "Oracle state: %s", oracleState)
+			if log.V(1) {
+				log.Infof(ctx, "Oracle state: %s", oracleState)
+			}
 			switch {
 			case proto.Equal(oracleState.Oracle, k.GRPCAddr):
 				k.Metrics.IsOracle.Update(1)
 				// Local IP is oracle
-				log.Infof(
-					ctx,
-					"Extending self oracle lease. Delta: %v",
-					time.Duration(k.OracleDelta.Load()),
-				)
+				if log.V(1) {
+					log.Infof(
+						ctx,
+						"Extending self oracle lease. Delta: %v",
+						time.Duration(k.OracleDelta.Load()),
+					)
+				}
 				k.proposeSelf(ctx, oracleState)
 
 			default:
