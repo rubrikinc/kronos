@@ -7,6 +7,7 @@ It provides an API to query "kronos time", which would be nearly same on all
 kronos nodes in the cluster. It does not update system time.
 
 - [What is Kronos?](#what-is-kronos)
+- [Comparison with NTPD](#comparison-with-ntpd)
 - [Design](#design)
 - [Server Operation](#server-operation)
 - [Usage](#usage)
@@ -290,6 +291,38 @@ import(
   // call kronos.Stop() in shutdown
   // call kronos.Now() for kronos time
 ```
+
+**Client example**  
+An example of a `go` client usage
+```
+import (
+	"context"
+	"fmt"
+
+	"github.com/rubrikinc/kronos/kronosutil/log"
+	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/server"
+)
+
+func main() {
+	ctx := context.Background()
+	
+	c := server.NewGRPCClient("" /* certs dir */)
+	timeResponse, err := c.KronosTime(ctx, &kronospb.NodeAddr{
+		Host: "127.0.0.1", /* IP of kronos server */
+		Port: "5767", /* GRPC port of kronos server */
+	})
+	
+	if err != nil {
+		log.Fatal(ctx, err)
+	}
+
+	fmt.Println(timeResponse.Time)
+}
+```
+
+Clients can also be created for other languages by generating GRPC clients
+for TimeService in `pb/kronos.proto`
 
 **TLS Support**  
 Kronos supports TLS. The certificates directory can be passed using --certs-dir
