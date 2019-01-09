@@ -259,7 +259,7 @@ A node can be removed using
 
 **Embedding kronos**  
 A kronos server can be started in a go application by using
-```
+```go
 import(
 	"github.com/rubrikinc/kronos"
 	"github.com/rubrikinc/kronos/oracle"
@@ -294,7 +294,7 @@ import(
 
 **Client example**  
 An example of a `go` client usage
-```
+```go
 import (
 	"context"
 	"fmt"
