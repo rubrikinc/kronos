@@ -13,18 +13,20 @@ import (
 )
 
 const (
-	maxFailuresFlag           = "max-failures"
-	maxDiffFlag               = "max-diff"
-	durationFlag              = "duration"
-	timeBetweenValidationFlag = "time-between-validation"
+	maxNodeFailuresFlag         = "max-node-failures"
+	fractionFailuresAllowedFlag = "fraction-failures-allowed"
+	maxDiffFlag                 = "max-diff"
+	durationFlag                = "duration"
+	timeBetweenValidationFlag   = "time-between-validation"
 )
 
 var validateCtx struct {
-	maxFailures           int
-	maxDiff               time.Duration
-	duration              time.Duration
-	timeout               time.Duration
-	timeBetweenValidation time.Duration
+	maxNodeFailures         int
+	fractionFailuresAllowed float64
+	maxDiff                 time.Duration
+	duration                time.Duration
+	timeout                 time.Duration
+	timeBetweenValidation   time.Duration
 }
 
 var validateCmd = &cobra.Command{
@@ -49,10 +51,16 @@ func init() {
 		"Maximum delta allowed between time on nodes",
 	)
 	validateCmd.Flags().IntVar(
-		&validateCtx.maxFailures,
-		maxFailuresFlag,
+		&validateCtx.maxNodeFailures,
+		maxNodeFailuresFlag,
 		0,
 		"Maximum number of nodes on which failure to return time can be tolerated in each validation.",
+	)
+	validateCmd.Flags().Float64Var(
+		&validateCtx.fractionFailuresAllowed,
+		fractionFailuresAllowedFlag,
+		0.0,
+		"Fraction of total validation failures tolerated.",
 	)
 	validateCmd.Flags().DurationVar(
 		&validateCtx.duration,
@@ -83,6 +91,11 @@ func runValidate() {
 		log.Fatal(ctx, err)
 	}
 	t := time.NewTicker(validateCtx.timeBetweenValidation)
+	numFailuresTolerated := int(
+		float64(validateCtx.duration/validateCtx.timeBetweenValidation) *
+			validateCtx.fractionFailuresAllowed,
+	)
+	numFailures := 0
 	stop := time.NewTimer(validateCtx.duration)
 	for {
 		select {
@@ -91,28 +104,43 @@ func runValidate() {
 			stores := nodeInfoFetcher{time: true}.fetch(ctx, nodes)
 			timesOnNodes := make(map[string]int64)
 			var concatenatedErrors string
-			numErrors := 0
+			numNodeFailures := 0
 			for _, store := range stores {
 				raftAddr := kronosutil.NodeAddrToString(store.RaftAddr)
 				if store.Err != nil {
 					concatenatedErrors = concatenatedErrors +
 						errors.Wrap(store.Err, raftAddr).Error() + "\n"
-					numErrors++
+					numNodeFailures++
 					continue
 				}
 				timesOnNodes[raftAddr] = store.Time
 			}
-			if numErrors > validateCtx.maxFailures {
-				log.Fatalf(
+			validateDatapoints := func() error {
+				if numNodeFailures > validateCtx.maxNodeFailures {
+					return errors.Errorf(
+						"%d nodes failed to return time, which is more than maxFailuresAllowed=%d\n%s",
+						numNodeFailures,
+						validateCtx.maxNodeFailures,
+						concatenatedErrors,
+					)
+				}
+				return kronosutil.ValidateTimeInConsensus(
 					ctx,
-					"%d nodes failed to return time, which is more than maxFailuresAllowed=%d\n%s",
-					numErrors,
-					validateCtx.maxFailures,
-					concatenatedErrors,
+					validateCtx.maxDiff,
+					timesOnNodes,
 				)
 			}
-			if err := kronosutil.ValidateTimeInConsensus(ctx, validateCtx.maxDiff, timesOnNodes); err != nil {
-				log.Fatal(ctx, err)
+			if err := validateDatapoints(); err != nil {
+				numFailures++
+				log.Error(ctx, err)
+			}
+			if numFailures > numFailuresTolerated {
+				log.Fatalf(
+					ctx,
+					"%d failures encountered, which is more than numFailuresTolerated(%d)",
+					numFailures,
+					numFailuresTolerated,
+				)
 			}
 			cancel()
 		case <-stop.C:
