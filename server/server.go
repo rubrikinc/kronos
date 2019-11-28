@@ -226,7 +226,7 @@ func (k *Server) syncOrOverthrowOracle(
 	k.oracleSyncErrs[pos].err = err
 	k.oracleSyncPos++
 	if err != nil {
-		log.Errorf(ctx, "Failed to sync with oracle, err: %v", err)
+		log.Errorf(ctx, "Failed to sync with oracle %s, err: %v", oracleState.Oracle, err)
 	}
 	if k.shouldOverthrowOracle(ctx) {
 		log.Warningf(ctx, "Overthrowing the oracle (%s) due to too many errors", oracleState)

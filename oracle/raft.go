@@ -1129,7 +1129,10 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 				rc.stop()
 				return
 			}
-			log.Infof(ctx, "Published %d entries", len(ents))
+			if appliedIndexBeforePublishing < rc.lastIndex {
+				// Only log if we are catching up, to prevent spam.
+				log.Infof(ctx, "Published %d entries", len(ents))
+			}
 			// If the publish moved us ahead or at par to the state at startup, send
 			// the special replayedWALMsg on commit channel to signal replay has
 			// finished.
