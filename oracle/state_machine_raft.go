@@ -123,18 +123,23 @@ func (s *RaftStateMachine) readCommits(
 			return
 		case loadSnapshotMsg:
 			// signaled to load snapshot
+			log.Infof(ctx, "Received loadSnapshotMsg")
 			if err := s.recoverFromSnapshot(ctx); err != nil {
 				log.Fatalf(ctx, "Failed to recover from snapshot, err: %v", err)
 			}
 		case unblockSnapshotMsg:
 			// signaled to unblock a snapshot
+			log.Infof(ctx, "Received unblockSnapshotMsg")
 			s.getSnapshotC <- struct{}{}
+			log.Infof(ctx, "Sent msg on getSnapshotC")
 		default:
 			proposal := &kronospb.OracleProposal{}
 			if err := protoutil.Unmarshal([]byte(data), proposal); err != nil {
 				log.Fatalf(ctx, "Failed to unmarshal message %+.100q, err: %v", data, err)
 			}
+			log.Infof(ctx, "Unmarshalled OracleProposal: %v", proposal)
 			s.stateMachine.SubmitProposal(ctx, proposal)
+			log.Infof(ctx, "SubmitProposal completed")
 		}
 	}
 
@@ -161,14 +166,16 @@ func (s *RaftStateMachine) recoverFromSnapshot(ctx context.Context) error {
 	}
 	log.Infof(
 		ctx,
-		"Applying snapshot to state machine, index: %d, term: %d",
+		"Applying snapshot to state machine, index: %d, term: %d, bytes: %d",
 		snapshot.Metadata.Index,
 		snapshot.Metadata.Term,
+		len(snapshot.Data),
 	)
 	var data kronospb.OracleState
 	if err := protoutil.Unmarshal(snapshot.Data, &data); err != nil {
 		return err
 	}
+	log.Infof(ctx, "Unmarshalled snapshot: %v", data)
 	s.stateMachine.restoreState(data)
 	return nil
 }

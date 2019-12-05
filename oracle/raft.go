@@ -678,6 +678,7 @@ func (rc *raftNode) replayWAL(ctx context.Context) *wal.WAL {
 		log.Fatal(ctx, err)
 	}
 
+	log.Infof(ctx, "There are %d entries to be replayed", len(ents))
 	if len(ents) > 0 {
 		// if there are entries to be replayed, note the last index so that we can
 		// tell when all past entries are published in the raft loop, and indicate
@@ -1123,12 +1124,14 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 			}
 
 			rc.transport.Send(rd.Messages)
-			if ok := rc.publishEntries(
-				ctx,
-				rc.entriesToApply(ctx, rd.CommittedEntries),
-			); !ok {
+			ents := rc.entriesToApply(ctx, rd.CommittedEntries)
+			if ok := rc.publishEntries(ctx, ents); !ok {
 				rc.stop()
 				return
+			}
+			if appliedIndexBeforePublishing < rc.lastIndex {
+				// Only log if we are catching up, to prevent spam.
+				log.Infof(ctx, "Published %d entries", len(ents))
 			}
 			// If the publish moved us ahead or at par to the state at startup, send
 			// the special replayedWALMsg on commit channel to signal replay has
