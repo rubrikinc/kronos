@@ -69,9 +69,10 @@ func (s *inMemStateMachine) SubmitProposal(ctx context.Context, proposal *kronos
 		return
 	}
 	s.state = &kronospb.OracleState{
-		Oracle:  newState.Oracle,
-		TimeCap: newState.TimeCap,
-		Id:      newState.Id,
+		Oracle:          newState.Oracle,
+		TimeCap:         newState.TimeCap,
+		Id:              newState.Id,
+		KronosUptimeCap: newState.KronosUptimeCap,
 	}
 }
 

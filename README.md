@@ -34,6 +34,12 @@ Kronos solves above problems and has the following properties:
 - It requires only a quorum of nodes to be up.
 - It supports addition / removal of nodes from the cluster.
 
+This library also provides an "uptime" which is a distributed monotonic timer
+starting from 0. This timer will not have backward jumps and not have forward
+jumps in most cases. In rare cases it can have small forward jumps (in the order
+of a few seconds). This "uptime" can be useful in measuring time durations when 
+the kronos service is live.
+
 ## Comparison with NTPD
 The ntpd program is an operating system daemon which sets and maintains the 
 system time of day in synchronism with Internet standard time server 
@@ -186,7 +192,7 @@ as a library.
 Kronos requires Go version 1.9+ for immunity against large clock jumps.
 
 **Install**
-- Install Go version 1.9
+- Install Go version 1.10
 - Run `go get github.com/rubrikinc/kronos`
   This will clone kronos in `$GOPATH/src/github.com/rubrikinc/kronos`
 
@@ -268,7 +274,7 @@ import(
 )
 
   if err := kronos.Initialize(ctx, kronosserver.Config{
-    Clock:                    tm.NewMonotonicClockWithOffset(int64(serverCfg.ClockOffset)),
+    Clock:                    tm.NewMonotonicClock(),
     OracleTimeCapDelta:       kronosserver.DefaultOracleTimeCapDelta,
     ManageOracleTickInterval: 3 * time.Second,
     RaftConfig: &oracle.RaftConfig{
@@ -308,6 +314,7 @@ func main() {
 	ctx := context.Background()
 	
 	c := server.NewGRPCClient("" /* certs dir */)
+	// Similar to below, KronosUptime endpoint can be used to get uptime.
 	timeResponse, err := c.KronosTime(ctx, &kronospb.NodeAddr{
 		Host: "127.0.0.1", /* IP of kronos server */
 		Port: "5767", /* GRPC port of kronos server */

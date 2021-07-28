@@ -94,7 +94,7 @@
 
 [[projects]]
   branch = "master"
-  name = "github.com/codahale/hdrhistogram"
+  name = "github.com/codahale/hdrhistogram-go"
   packages = ["."]
   revision = "3a0bb77429bd3a61596f5e8a3172445844342120"
 

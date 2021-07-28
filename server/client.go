@@ -24,6 +24,12 @@ type Client interface {
 		ctx context.Context,
 		server *kronospb.NodeAddr,
 	) (*kronospb.KronosTimeResponse, error)
+	// KronosUptime returns the KronosUptime for given server even if it is
+	// not the oracle.
+	KronosUptime(
+		ctx context.Context,
+		server *kronospb.NodeAddr,
+	) (*kronospb.KronosUptimeResponse, error)
 	// Status returns the status of the given Server
 	Status(
 		ctx context.Context,

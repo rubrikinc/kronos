@@ -17,8 +17,11 @@ import (
 func TestOracleTime(t *testing.T) {
 	clock := tm.NewManualClock()
 	clock.SetTime(101)
+	clock.SetUptime(51)
 	const delta = 49
+	const uptimeDelta = 20
 	const expectedKronosTime = 150
+	const expectedKronosUptime = 71
 	localGRPCAddr := &kronospb.NodeAddr{
 		Host: "host123",
 		Port: "123",
@@ -34,21 +37,24 @@ func TestOracleTime(t *testing.T) {
 		{
 			name: "valid response is oracle",
 			oracleState: &kronospb.OracleState{
-				Id:      1,
-				TimeCap: 200,
-				Oracle:  localGRPCAddr,
+				Id:              1,
+				TimeCap:         200,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus: kronospb.ServerStatus_INITIALIZED,
 			expectedResponse: &kronospb.OracleTimeResponse{
-				Time: expectedKronosTime,
+				Time:   expectedKronosTime,
+				Uptime: expectedKronosUptime,
 			},
 			expectedErr: nil,
 		},
 		{
 			name: "not oracle",
 			oracleState: &kronospb.OracleState{
-				Id:      1,
-				TimeCap: 200,
+				Id:              1,
+				TimeCap:         200,
+				KronosUptimeCap: 210,
 				Oracle: &kronospb.NodeAddr{
 					Host: "newOracle",
 					Port: "123",
@@ -58,15 +64,16 @@ func TestOracleTime(t *testing.T) {
 			expectedResponse: nil,
 			expectedErr: errors.New(
 				`server (host:"host123" port:"123" ) is not oracle, current oracle state:` +
-					` id:1 time_cap:200 oracle:<host:"newOracle" port:"123" > `,
+					` id:1 time_cap:200 oracle:<host:"newOracle" port:"123" > kronos_uptime_cap:210 `,
 			),
 		},
 		{
 			name: "not intialized",
 			oracleState: &kronospb.OracleState{
-				Id:      1,
-				TimeCap: 200,
-				Oracle:  localGRPCAddr,
+				Id:              1,
+				TimeCap:         200,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus:     kronospb.ServerStatus_NOT_INITIALIZED,
 			expectedResponse: nil,
@@ -87,15 +94,31 @@ func TestOracleTime(t *testing.T) {
 		{
 			name: "stale time",
 			oracleState: &kronospb.OracleState{
-				Id:      1,
-				TimeCap: 100,
-				Oracle:  localGRPCAddr,
+				Id:              1,
+				TimeCap:         100,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus:     kronospb.ServerStatus_INITIALIZED,
 			expectedResponse: nil,
 			expectedErr: errors.New(
 				`kronos time is beyond current time cap, time cap is too stale:` +
 					` kronos time: 150, status: INITIALIZED, time cap: 100`,
+			),
+		},
+		{
+			name: "stale uptime",
+			oracleState: &kronospb.OracleState{
+				Id:              1,
+				TimeCap:         200,
+				KronosUptimeCap: 10,
+				Oracle:          localGRPCAddr,
+			},
+			serverStatus:     kronospb.ServerStatus_INITIALIZED,
+			expectedResponse: nil,
+			expectedErr: errors.New(
+				`kronos up time is beyond current time cap, time cap is too stale: ` +
+					`kronos uptime: 71, status: INITIALIZED, uptime time cap: 10`,
 			),
 		},
 	}
@@ -115,6 +138,7 @@ func TestOracleTime(t *testing.T) {
 				GRPCAddr: localGRPCAddr,
 			}
 			server.OracleDelta.Store(delta)
+			server.OracleUptimeDelta.Store(uptimeDelta)
 			server.status.Store(tc.serverStatus)
 
 			timeResponse, err := server.OracleTime(
@@ -152,9 +176,10 @@ func TestKronosTimeNow(t *testing.T) {
 		{
 			name: "valid time",
 			oracleState: &kronospb.OracleState{
-				Id:      1,
-				TimeCap: 200,
-				Oracle:  localGRPCAddr,
+				Id:              1,
+				TimeCap:         200,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus: kronospb.ServerStatus_INITIALIZED,
 			physicalTime: 150,
@@ -164,8 +189,9 @@ func TestKronosTimeNow(t *testing.T) {
 		{
 			name: "valid time not oracle",
 			oracleState: &kronospb.OracleState{
-				Id:      2,
-				TimeCap: 201,
+				Id:              2,
+				TimeCap:         201,
+				KronosUptimeCap: 210,
 				Oracle: &kronospb.NodeAddr{
 					Host: "oracle",
 					Port: "123",
@@ -179,9 +205,10 @@ func TestKronosTimeNow(t *testing.T) {
 		{
 			name: "stale time",
 			oracleState: &kronospb.OracleState{
-				Id:      3,
-				TimeCap: 202,
-				Oracle:  localGRPCAddr,
+				Id:              3,
+				TimeCap:         202,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus: kronospb.ServerStatus_INITIALIZED,
 			physicalTime: 258,
@@ -194,9 +221,10 @@ func TestKronosTimeNow(t *testing.T) {
 		{
 			name: "not initialized",
 			oracleState: &kronospb.OracleState{
-				Id:      4,
-				TimeCap: 300,
-				Oracle:  localGRPCAddr,
+				Id:              4,
+				TimeCap:         300,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus: kronospb.ServerStatus_NOT_INITIALIZED,
 			physicalTime: 259,
@@ -209,9 +237,10 @@ func TestKronosTimeNow(t *testing.T) {
 		{
 			name: "valid time 2",
 			oracleState: &kronospb.OracleState{
-				Id:      5,
-				TimeCap: 301,
-				Oracle:  localGRPCAddr,
+				Id:              5,
+				TimeCap:         301,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus: kronospb.ServerStatus_INITIALIZED,
 			physicalTime: 270,
@@ -221,9 +250,10 @@ func TestKronosTimeNow(t *testing.T) {
 		{
 			name: "ensure monotonicity",
 			oracleState: &kronospb.OracleState{
-				Id:      6,
-				TimeCap: 302,
-				Oracle:  localGRPCAddr,
+				Id:              6,
+				TimeCap:         302,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus: kronospb.ServerStatus_INITIALIZED,
 			physicalTime: 240,
@@ -233,9 +263,10 @@ func TestKronosTimeNow(t *testing.T) {
 		{
 			name: "ensure monotonicity corner case",
 			oracleState: &kronospb.OracleState{
-				Id:      7,
-				TimeCap: 303,
-				Oracle:  localGRPCAddr,
+				Id:              7,
+				TimeCap:         303,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus: kronospb.ServerStatus_INITIALIZED,
 			physicalTime: 271,
@@ -245,9 +276,10 @@ func TestKronosTimeNow(t *testing.T) {
 		{
 			name: "ensure monotonicity 3",
 			oracleState: &kronospb.OracleState{
-				Id:      8,
-				TimeCap: 305,
-				Oracle:  localGRPCAddr,
+				Id:              8,
+				TimeCap:         305,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus: kronospb.ServerStatus_INITIALIZED,
 			physicalTime: 210,
@@ -257,9 +289,10 @@ func TestKronosTimeNow(t *testing.T) {
 		{
 			name: "valid time 3",
 			oracleState: &kronospb.OracleState{
-				Id:      9,
-				TimeCap: 307,
-				Oracle:  localGRPCAddr,
+				Id:              9,
+				TimeCap:         307,
+				KronosUptimeCap: 210,
+				Oracle:          localGRPCAddr,
 			},
 			serverStatus: kronospb.ServerStatus_INITIALIZED,
 			physicalTime: 290,
@@ -318,56 +351,64 @@ func TestProposeSelf(t *testing.T) {
 		{
 			name: "valid proposal 1",
 			proposalState: &kronospb.OracleState{
-				Id:      0,
-				TimeCap: 200,
-				Oracle:  localGRPCAddr,
+				Id:              0,
+				TimeCap:         200,
+				KronosUptimeCap: 20,
+				Oracle:          localGRPCAddr,
 			},
 			expectedState: &kronospb.OracleState{
-				Id:      1,
-				TimeCap: int64(160 * time.Second),
-				Oracle:  localGRPCAddr,
+				Id:              1,
+				TimeCap:         int64(160 * time.Second),
+				KronosUptimeCap: int64(130 * time.Second),
+				Oracle:          localGRPCAddr,
 			},
 			physicalTime: int64(100 * time.Second),
 		},
 		{
 			name: "valid proposal 2",
 			proposalState: &kronospb.OracleState{
-				Id:      1,
-				TimeCap: int64(115 * time.Second),
-				Oracle:  localGRPCAddr,
+				Id:              1,
+				TimeCap:         int64(115 * time.Second),
+				KronosUptimeCap: int64(110 * time.Second),
+				Oracle:          localGRPCAddr,
 			},
 			expectedState: &kronospb.OracleState{
-				Id:      2,
-				TimeCap: int64(175 * time.Second),
-				Oracle:  localGRPCAddr,
+				Id:              2,
+				TimeCap:         int64(175 * time.Second),
+				KronosUptimeCap: int64(145 * time.Second),
+				Oracle:          localGRPCAddr,
 			},
 			physicalTime: int64(115 * time.Second),
 		},
 		{
 			name: "stale time",
 			proposalState: &kronospb.OracleState{
-				Id:      2,
-				TimeCap: int64(1000 * time.Second),
-				Oracle:  localGRPCAddr,
+				Id:              2,
+				TimeCap:         int64(1000 * time.Second),
+				KronosUptimeCap: int64(145 * time.Second),
+				Oracle:          localGRPCAddr,
 			},
 			expectedState: &kronospb.OracleState{
-				Id:      3,
-				TimeCap: int64(1000*time.Second) + 1,
-				Oracle:  localGRPCAddr,
+				Id:              3,
+				TimeCap:         int64(1000*time.Second) + 1,
+				KronosUptimeCap: int64(145*time.Second) + 1,
+				Oracle:          localGRPCAddr,
 			},
 			physicalTime: int64(100 * time.Second),
 		},
 		{
 			name: "invalid id",
 			proposalState: &kronospb.OracleState{
-				Id:      4,
-				TimeCap: int64(1000 * time.Second),
-				Oracle:  localGRPCAddr,
+				Id:              4,
+				TimeCap:         int64(1000 * time.Second),
+				KronosUptimeCap: int64(145 * time.Second),
+				Oracle:          localGRPCAddr,
 			},
 			expectedState: &kronospb.OracleState{
-				Id:      3,
-				TimeCap: int64(1000*time.Second) + 1,
-				Oracle:  localGRPCAddr,
+				Id:              3,
+				TimeCap:         int64(1000*time.Second) + 1,
+				KronosUptimeCap: int64(145*time.Second) + 1,
+				Oracle:          localGRPCAddr,
 			},
 			physicalTime: int64(100 * time.Second),
 		},
@@ -378,12 +419,13 @@ func TestProposeSelf(t *testing.T) {
 			ctx := context.TODO()
 			a := assert.New(t)
 			clock := tm.NewManualClock()
-			clock.SetTime(tc.physicalTime)
+			clock.AdvanceTime(time.Duration(tc.physicalTime))
 			server := &Server{
-				OracleSM:           sm,
-				GRPCAddr:           localGRPCAddr,
-				Clock:              clock,
-				OracleTimeCapDelta: DefaultOracleTimeCapDelta,
+				OracleSM:             sm,
+				GRPCAddr:             localGRPCAddr,
+				Clock:                clock,
+				OracleTimeCapDelta:   DefaultOracleTimeCapDelta,
+				OracleUptimeCapDelta: DefaultOracleUptimeCapDelta,
 			}
 
 			server.proposeSelf(ctx, tc.proposalState)
@@ -401,6 +443,12 @@ func (c *simpleMockClient) KronosTime(
 	ctx context.Context, server *kronospb.NodeAddr,
 ) (*kronospb.KronosTimeResponse, error) {
 	return &kronospb.KronosTimeResponse{}, nil
+}
+
+func (c *simpleMockClient) KronosUptime(
+	ctx context.Context, server *kronospb.NodeAddr,
+) (*kronospb.KronosUptimeResponse, error) {
+	return &kronospb.KronosUptimeResponse{}, nil
 }
 
 func (c *simpleMockClient) OracleTime(
@@ -433,8 +481,9 @@ func TestSyncWithOracle(t *testing.T) {
 			name: "rtt low end adjustment",
 			mockClient: &simpleMockClient{
 				response: &kronospb.OracleTimeResponse{
-					Time: int64(2 * time.Hour),
-					Rtt:  int64(10 * time.Millisecond),
+					Time:   int64(2 * time.Hour),
+					Uptime: int64(2 * time.Hour),
+					Rtt:    int64(10 * time.Millisecond),
 				},
 				err: nil,
 			},
@@ -445,8 +494,9 @@ func TestSyncWithOracle(t *testing.T) {
 			name: "rtt error no adjustment",
 			mockClient: &simpleMockClient{
 				response: &kronospb.OracleTimeResponse{
-					Time: -int64(20 * time.Millisecond),
-					Rtt:  int64(100 * time.Millisecond),
+					Time:   -int64(20 * time.Millisecond),
+					Uptime: -int64(20 * time.Millisecond),
+					Rtt:    int64(100 * time.Millisecond),
 				},
 				err: nil,
 			},
@@ -457,8 +507,9 @@ func TestSyncWithOracle(t *testing.T) {
 			name: "rtt high end adjustment",
 			mockClient: &simpleMockClient{
 				response: &kronospb.OracleTimeResponse{
-					Time: -int64(20 * time.Millisecond),
-					Rtt:  int64(10 * time.Millisecond),
+					Time:   -int64(20 * time.Millisecond),
+					Uptime: -int64(20 * time.Millisecond),
+					Rtt:    int64(10 * time.Millisecond),
 				},
 				err: nil,
 			},
@@ -469,8 +520,9 @@ func TestSyncWithOracle(t *testing.T) {
 			name: "rtt too high",
 			mockClient: &simpleMockClient{
 				response: &kronospb.OracleTimeResponse{
-					Time: int64(2 * time.Hour),
-					Rtt:  int64(300 * time.Millisecond),
+					Time:   int64(2 * time.Hour),
+					Uptime: int64(2 * time.Hour),
+					Rtt:    int64(300 * time.Millisecond),
 				},
 				err: nil,
 			},
@@ -480,8 +532,9 @@ func TestSyncWithOracle(t *testing.T) {
 			name: "server error",
 			mockClient: &simpleMockClient{
 				response: &kronospb.OracleTimeResponse{
-					Time: int64(2 * time.Hour),
-					Rtt:  int64(10 * time.Millisecond),
+					Time:   int64(2 * time.Hour),
+					Uptime: int64(2 * time.Hour),
+					Rtt:    int64(10 * time.Millisecond),
 				},
 				err: errors.New("test error"),
 			},
@@ -493,7 +546,7 @@ func TestSyncWithOracle(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			a := assert.New(t)
 			clk := tm.NewManualClock()
-			clk.SetTime(initTime)
+			clk.AdvanceTime(time.Duration(initTime))
 			server := &Server{
 				Client:  tc.mockClient,
 				Clock:   clk,
@@ -510,6 +563,7 @@ func TestSyncWithOracle(t *testing.T) {
 			if tc.expectedErr == nil {
 				a.NoError(err)
 				a.Equal(tc.delta, server.OracleDelta.Load())
+				a.Equal(tc.delta, server.OracleUptimeDelta.Load())
 			} else if a.Error(err) {
 				a.Equal(tc.expectedErr.Error(), err.Error())
 			}
@@ -523,9 +577,9 @@ func TestOverthrowPolicy(t *testing.T) {
 	c := &simpleMockClient{}
 	sm := oracle.NewMemStateMachine()
 	nodes := []*kronospb.NodeAddr{
-		{"h0", "p0"},
-		{"h1", "p1"},
-		{"h2", "p2"},
+		{Host: "h0", Port: "p0"},
+		{Host: "h1", Port: "p1"},
+		{Host: "h2", Port: "p2"},
 	}
 	s := &Server{
 		Client:   c,
@@ -550,9 +604,10 @@ func TestOverthrowPolicy(t *testing.T) {
 	}
 	sm.SubmitProposal(ctx, &kronospb.OracleProposal{
 		ProposedState: &kronospb.OracleState{
-			Oracle:  nodes[2],
-			TimeCap: int64(2),
-			Id:      2,
+			Oracle:          nodes[2],
+			TimeCap:         int64(2),
+			KronosUptimeCap: int64(2),
+			Id:              2,
 		},
 	})
 	// No overthrow or time adjustment for next two errors because the oracle has
@@ -564,8 +619,9 @@ func TestOverthrowPolicy(t *testing.T) {
 	}
 	// Return a valid response.
 	c.response = &kronospb.OracleTimeResponse{
-		Time: int64(time.Second),
-		Rtt:  int64(time.Millisecond),
+		Time:   int64(time.Second),
+		Uptime: int64(time.Second),
+		Rtt:    int64(time.Millisecond),
 	}
 	c.err = nil
 	a.True(s.syncOrOverthrowOracle(ctx, sm.State(ctx)))
@@ -586,9 +642,10 @@ func TestOverthrowPolicy(t *testing.T) {
 	// Make node 2 the oracle again.
 	sm.SubmitProposal(ctx, &kronospb.OracleProposal{
 		ProposedState: &kronospb.OracleState{
-			Oracle:  nodes[2],
-			TimeCap: int64(time.Hour),
-			Id:      4,
+			Oracle:          nodes[2],
+			TimeCap:         int64(time.Hour),
+			KronosUptimeCap: int64(time.Hour),
+			Id:              4,
 		},
 	})
 	// No overthrow for next two errors because we proposed self as the oracle one

@@ -102,10 +102,11 @@ func runValidate() {
 		case <-t.C:
 			ctx, cancel := context.WithTimeout(context.Background(), validateCtx.timeout)
 			stores := nodeInfoFetcher{time: true}.fetch(ctx, nodes)
-			timesOnNodes := make(map[string]int64)
+			timesOnNodes := make(map[int]int64)
+			uptimesOnNodes := make(map[int]int64)
 			var concatenatedErrors string
 			numNodeFailures := 0
-			for _, store := range stores {
+			for i, store := range stores {
 				raftAddr := kronosutil.NodeAddrToString(store.RaftAddr)
 				if store.Err != nil {
 					concatenatedErrors = concatenatedErrors +
@@ -113,7 +114,8 @@ func runValidate() {
 					numNodeFailures++
 					continue
 				}
-				timesOnNodes[raftAddr] = store.Time
+				timesOnNodes[i] = store.Time
+				uptimesOnNodes[i] = store.Uptime
 			}
 			validateDatapoints := func() error {
 				if numNodeFailures > validateCtx.maxNodeFailures {
@@ -124,11 +126,23 @@ func runValidate() {
 						concatenatedErrors,
 					)
 				}
-				return kronosutil.ValidateTimeInConsensus(
+				if err := kronosutil.ValidateTimeInConsensus(
 					ctx,
 					validateCtx.maxDiff,
 					timesOnNodes,
-				)
+				); err != nil {
+					log.Errorf(ctx, "Error validating kronos time: %v", timesOnNodes)
+					return err
+				}
+				if err := kronosutil.ValidateTimeInConsensus(
+					ctx,
+					validateCtx.maxDiff,
+					uptimesOnNodes,
+				); err != nil {
+					log.Errorf(ctx, "Error validating kronos uptime: %v", uptimesOnNodes)
+					return err
+				}
+				return nil
 			}
 			if err := validateDatapoints(); err != nil {
 				numFailures++

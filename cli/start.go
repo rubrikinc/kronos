@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+
 	// net/http/pprof is included for profiling
 	_ "net/http/pprof"
 	"strings"
@@ -27,6 +28,7 @@ const (
 	grpcPortFlag                 = "grpc-port"
 	manageOracleTickIntervalFlag = "manage-oracle-tick-interval"
 	oracleTimeCapDeltaFlag       = "oracle-time-cap-delta"
+	oracleUptimeCapDeltaFlag     = "oracle-uptime-cap-delta"
 	raftPortFlag                 = "raft-port"
 	raftSnapCountFlag            = "raft-snap-count"
 	seedHostsFlag                = "seed-hosts"
@@ -38,6 +40,7 @@ var startCtx struct {
 	grpcPort                 string
 	manageOracleTickInterval time.Duration
 	oracleTimeCapDelta       time.Duration
+	oracleUptimeCapDelta     time.Duration
 	pprofAddr                string
 	raftPort                 string
 	seedHosts                string
@@ -125,6 +128,17 @@ func init() {
 		server.DefaultOracleTimeCapDelta,
 		"OracleTimeCapDelta is the delta added to current KronosTime to determine the time cap."+
 			"No server will return a KronosTime more than the time cap known to it."+
+			" The time cap is persisted in the oracle state machine and is used to"+
+			" ensure monotonicity on cluster restarts. The delta should at least be twice"+
+			" as much as "+manageOracleTickIntervalFlag,
+	)
+
+	startCmd.Flags().DurationVar(
+		&startCtx.oracleUptimeCapDelta,
+		oracleUptimeCapDeltaFlag,
+		server.DefaultOracleUptimeCapDelta,
+		"OracleUptimeCapDelta is the delta added to current KronosUptime to determine the time cap."+
+			"No server will return a KronosUptime more than the time cap known to it."+
 			" The time cap is persisted in the oracle state machine and is used to"+
 			" ensure monotonicity on cluster restarts. The delta should at least be twice"+
 			" as much as "+manageOracleTickIntervalFlag,
@@ -228,9 +242,10 @@ func runStart() {
 		clock = tm.NewMonotonicClock()
 	}
 	config := server.Config{
-		Clock: clock,
+		Clock:                    clock,
 		ManageOracleTickInterval: startCtx.manageOracleTickInterval,
 		OracleTimeCapDelta:       startCtx.oracleTimeCapDelta,
+		OracleUptimeCapDelta:     startCtx.oracleUptimeCapDelta,
 		RaftConfig: &oracle.RaftConfig{
 			CertsDir: kronosCertsDir(),
 			DataDir:  startCtx.dataDir,

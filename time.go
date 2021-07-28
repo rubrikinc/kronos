@@ -78,6 +78,28 @@ func Now() int64 {
 	}
 }
 
+// Uptime returns Kronos uptime. This function can block if kronos uptime
+// is invalid.
+func Uptime() int64 {
+	if kronosServer == nil {
+		log.Fatalf(context.TODO(), "Kronos server is not initialized")
+	}
+	// timePollInterval is the time to wait before internally retrying
+	// this function.
+	// This function blocks if not initialized or if KronosTime is stale
+	const timePollInterval = 500 * time.Millisecond
+	ctx := context.TODO()
+
+	for {
+		ut, err := kronosServer.KronosUptimeNow(ctx)
+		if err != nil {
+			time.Sleep(timePollInterval)
+			continue
+		}
+		return ut.Uptime
+	}
+}
+
 // NodeID returns the NodeID of the kronos server in the kronos raft cluster.
 // NodeID returns an empty string if kronosServer is not initialized
 func NodeID(ctx context.Context) string {

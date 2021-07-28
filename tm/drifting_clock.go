@@ -16,6 +16,7 @@ type DriftingClock struct {
 	mu              *syncutil.RWMutex
 	lastActualTime  time.Time
 	lastDriftedTime time.Time
+	firstServedTime int64
 	clockConfig     *kronospb.DriftTimeConfig
 }
 
@@ -41,7 +42,16 @@ func (t *DriftingClock) Now() int64 {
 	driftedTime := t.lastDriftedTime.Add(durationSinceLastSeenTime).Add(diffDuration)
 	t.lastDriftedTime = driftedTime
 	// Add offset at the end.
-	return driftedTime.UnixNano() + t.clockConfig.Offset
+
+	timeToReturn := driftedTime.UnixNano() + t.clockConfig.Offset
+	if t.firstServedTime == 0 {
+		t.firstServedTime = timeToReturn
+	}
+	return timeToReturn
+}
+
+func (t *DriftingClock) Uptime() int64 {
+	return t.Now() - t.firstServedTime
 }
 
 // UpdateDriftConfig changes the driftFactor according to dtc and jumps the

@@ -36,7 +36,7 @@ func TestKronosSanity(t *testing.T) {
 	tc, err := cluster.NewCluster(
 		ctx,
 		cluster.ClusterConfig{
-			Fs: fs,
+			Fs:                       fs,
 			ManageOracleTickInterval: manageOracleTickInterval,
 			NumNodes:                 numNodes,
 			RaftSnapCount:            2,
@@ -50,7 +50,7 @@ func TestKronosSanity(t *testing.T) {
 	// give some time to elect the oracle
 	time.Sleep(kronosStabilizationBufferTime)
 	// PreCheck - validate time across cluster is in similar range
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		false, /* checkOnlyRunningNodes */
@@ -74,7 +74,7 @@ func TestKronosSanity(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(kronosStabilizationBufferTime)
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		false, /* checkOnlyRunningNodes */
@@ -104,7 +104,7 @@ func TestKronosSanity(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		// The delta range is kept lenient as the nodes have variable drift, making
 		// them far apart for the period the node is not syncing with orcale.
-		_, err = tc.ValidateTimeInConsensus(
+		_, _, err = tc.ValidateTimeInConsensus(
 			ctx,
 			time.Duration(driftRange*float64(manageOracleTickInterval)),
 			false, /* checkOnlyRunningNodes */
@@ -124,7 +124,7 @@ func TestKronosSanity(t *testing.T) {
 		log.Fatal(ctx, err)
 	}
 	time.Sleep(kronosStabilizationBufferTime)
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		time.Duration(driftRange*float64(manageOracleTickInterval)),
 		false, /* checkOnlyRunningNodes */
@@ -186,7 +186,7 @@ func TestKronosInsecureCluster(t *testing.T) {
 	tc, err := cluster.NewInsecureCluster(
 		ctx,
 		cluster.ClusterConfig{
-			Fs: fs,
+			Fs:                       fs,
 			ManageOracleTickInterval: manageOracleTickInterval,
 			NumNodes:                 numNodes,
 			RaftSnapCount:            2,
@@ -200,7 +200,7 @@ func TestKronosInsecureCluster(t *testing.T) {
 	// give some time to elect the oracle
 	time.Sleep(10 * manageOracleTickInterval)
 	// PreCheck - validate time across cluster is in similar range
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		false, /* checkOnlyRunningNodes */
@@ -219,7 +219,7 @@ func TestKronosSanityReIP(t *testing.T) {
 	tc, err := cluster.NewCluster(
 		ctx,
 		cluster.ClusterConfig{
-			Fs: fs,
+			Fs:                       fs,
 			ManageOracleTickInterval: manageOracleTickInterval,
 			NumNodes:                 numNodes,
 			RaftSnapCount:            2,
@@ -233,7 +233,7 @@ func TestKronosSanityReIP(t *testing.T) {
 	// give some time to elect the oracle
 	time.Sleep(kronosStabilizationBufferTime)
 	// PreCheck - validate time across cluster is in similar range
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		false, /*checkOnlyRunningNodes*/
@@ -253,7 +253,7 @@ func TestKronosSanityReIP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		false, /*checkOnlyRunningNodes*/
@@ -272,7 +272,7 @@ func TestKronosSanityBackupRestore(t *testing.T) {
 	tc, err := cluster.NewCluster(
 		ctx,
 		cluster.ClusterConfig{
-			Fs: fs,
+			Fs:                       fs,
 			ManageOracleTickInterval: manageOracleTickInterval,
 			NumNodes:                 numNodes,
 			RaftSnapCount:            2,
@@ -286,7 +286,7 @@ func TestKronosSanityBackupRestore(t *testing.T) {
 	// give some time to elect the oracle
 	time.Sleep(kronosStabilizationBufferTime)
 	// PreCheck - validate time across cluster is in similar range
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		false, /*checkOnlyRunningNodes*/
@@ -350,7 +350,7 @@ func TestKronosSanityBackupRestore(t *testing.T) {
 		t.Fatal("restore should not succeed when node is running")
 	}
 
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		false, /*checkOnlyRunningNodes*/
@@ -369,7 +369,7 @@ func TestKronosSanityAddRemove(t *testing.T) {
 	tc, err := cluster.NewCluster(
 		ctx,
 		cluster.ClusterConfig{
-			Fs: fs,
+			Fs:                       fs,
 			ManageOracleTickInterval: manageOracleTickInterval,
 			NumNodes:                 numNodes,
 			RaftSnapCount:            2,
@@ -395,7 +395,7 @@ func TestKronosSanityAddRemove(t *testing.T) {
 	// give some time to let the cluster stabilize in case node 2 was oracle or
 	// raft leader.
 	time.Sleep(kronosStabilizationBufferTime)
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		true, /*checkOnlyRunningNodes*/
@@ -410,7 +410,7 @@ func TestKronosSanityAddRemove(t *testing.T) {
 
 	// wait for 2 to get initialized
 	time.Sleep(kronosStabilizationBufferTime)
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		false, /*checkOnlyRunningNodes*/
@@ -464,7 +464,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	}
 	// Need more time to initialize more 7 nodes cluster.
 	time.Sleep(2 * kronosStabilizationBufferTime)
-	if _, err = tc.ValidateTimeInConsensus(
+	if _, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		true, /*checkOnlyRunningNodes*/
@@ -482,7 +482,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	// Stop the node to be dead for a long time.
 	stopNode(2)
 	time.Sleep(kronosStabilizationBufferTime)
-	if _, err = tc.ValidateTimeInConsensus(
+	if _, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		true, /*checkOnlyRunningNodes*/
@@ -496,7 +496,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	addNode(5)
 	nodeIDForNewNode := addNode(6)
 	time.Sleep(kronosStabilizationBufferTime)
-	if _, err = tc.ValidateTimeInConsensus(
+	if _, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		true, /*checkOnlyRunningNodes*/
@@ -508,7 +508,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	// Stop and start 0 to make sure it is neither raft leader nor oracle.
 	stopNode(0)
 	time.Sleep(kronosStabilizationBufferTime)
-	if _, err = tc.ValidateTimeInConsensus(
+	if _, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		true, /*checkOnlyRunningNodes*/
@@ -517,7 +517,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	}
 	startNode(0)
 	time.Sleep(kronosStabilizationBufferTime)
-	if _, err = tc.ValidateTimeInConsensus(
+	if _, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		true, /*checkOnlyRunningNodes*/
@@ -530,7 +530,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	// Remove node 6. Dead node isn't aware of it's removal and addition.
 	removeNode(6)
 	time.Sleep(kronosStabilizationBufferTime)
-	if _, err = tc.ValidateTimeInConsensus(
+	if _, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		true, /*checkOnlyRunningNodes*/
@@ -542,7 +542,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	startNode(2)
 	// Wait longer so that the node gets and publish a snapshot
 	time.Sleep(2 * kronosStabilizationBufferTime)
-	if _, err = tc.ValidateTimeInConsensus(
+	if _, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		true, /*checkOnlyRunningNodes*/

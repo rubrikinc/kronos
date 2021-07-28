@@ -11,7 +11,7 @@ import (
 // ValidateTimeInConsensus validates that the kronos time across the given nodes
 // (difference between maxTime and minTime) is within maxDiffAllowed.
 func ValidateTimeInConsensus(
-	ctx context.Context, maxDiffAllowed time.Duration, timeOnNodes map[string]int64,
+	ctx context.Context, maxDiffAllowed time.Duration, timeOnNodes map[int]int64,
 ) error {
 	var maxTimeAcrossNodes int64 = math.MinInt64
 	var minTimeAcrossNodes int64 = math.MaxInt64

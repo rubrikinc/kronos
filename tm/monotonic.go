@@ -4,8 +4,9 @@ import "time"
 
 // MonotonicClock is an implementation of Clock which is immune to clock jumps
 type MonotonicClock struct {
-	startTime time.Time
-	offset    int64
+	startTime    time.Time
+	offset       int64
+	uptimeOffset int64
 }
 
 // Now takes adds the elapsed time from a fixed point of reference to generate
@@ -14,16 +15,21 @@ func (c *MonotonicClock) Now() int64 {
 	return c.startTime.UnixNano() + time.Since(c.startTime).Nanoseconds() + c.offset
 }
 
+func (c *MonotonicClock) Uptime() int64 {
+	return time.Since(c.startTime).Nanoseconds() + c.uptimeOffset
+}
+
 // NewMonotonicClock returns an instance of MonotonicClock
 func NewMonotonicClock() Clock {
-	return NewMonotonicClockWithOffset(0)
+	return NewMonotonicClockWithOffset(0, 0)
 }
 
 // NewMonotonicClockWithOffset returns an instance of MonotonicClock
 // offset is added to startTime when computing Now()
-func NewMonotonicClockWithOffset(offset int64) Clock {
+func NewMonotonicClockWithOffset(offset int64, uptimeOffset int64) Clock {
 	return &MonotonicClock{
-		startTime: time.Now(),
-		offset:    offset,
+		startTime:    time.Now(),
+		offset:       offset,
+		uptimeOffset: uptimeOffset,
 	}
 }

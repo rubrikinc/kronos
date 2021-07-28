@@ -76,17 +76,30 @@ func (tc *Cluster) IsClusterInSync(ctx context.Context, nodes ...*Node) error {
 
 	maxTm := int64(math.MinInt64)
 	minTm := int64(math.MaxInt64)
+
+	maxUTm := int64(math.MinInt64)
+	minUTm := int64(math.MaxInt64)
 	for _, node := range nodes {
 		kt, err := node.Server.KronosTimeNow(ctx)
-		kronosTime := kt.Time
 		if err != nil {
 			return err
 		}
-		if maxTm < kronosTime {
-			maxTm = kronosTime
+		if maxTm < kt.Time {
+			maxTm = kt.Time
 		}
-		if minTm > kronosTime {
-			minTm = kronosTime
+		if minTm > kt.Time {
+			minTm = kt.Time
+		}
+
+		ut, err := node.Server.KronosUptimeNow(ctx)
+		if err != nil {
+			return err
+		}
+		if maxUTm < ut.Uptime {
+			maxUTm = ut.Uptime
+		}
+		if minUTm > ut.Uptime {
+			minUTm = ut.Uptime
 		}
 	}
 
@@ -95,6 +108,15 @@ func (tc *Cluster) IsClusterInSync(ctx context.Context, nodes ...*Node) error {
 	if timeDiff > tolerance {
 		return fmt.Errorf(
 			"time difference too high. Expected %v < %v",
+			timeDiff,
+			tolerance,
+		)
+	}
+
+	uTimeDiff := maxUTm - minUTm
+	if uTimeDiff > tolerance {
+		return fmt.Errorf(
+			"uptime time difference too high. Expected %v < %v",
 			timeDiff,
 			tolerance,
 		)
@@ -123,6 +145,7 @@ func (tc *Cluster) addNode(idx int, isNew bool) *Node {
 		tc.StateMachine,
 		tc.Client,
 		15*time.Second,
+		5*time.Second,
 	)
 	tickerCh := make(chan time.Time)
 	tickDoneCh := make(chan struct{})
@@ -205,6 +228,7 @@ func InitializeCluster(a *assert.Assertions, numNodes int) (cluster *Cluster, no
 		node := cluster.Node(i)
 		a.NotNil(node)
 		node.Clock.SetTime(int64(i+1) * int64(time.Hour))
+		node.Clock.SetUptime(int64(i+1) * int64(time.Second))
 		nodes = append(nodes, node)
 	}
 	return
@@ -217,14 +241,16 @@ func NewServerForTest(
 	oracle oracle.StateMachine,
 	client server.Client,
 	oracleTimeCapDelta time.Duration,
+	oracleUptimeCapDelta time.Duration,
 ) *server.Server {
 	return &server.Server{
-		Clock:              clock,
-		OracleSM:           oracle,
-		Client:             client,
-		GRPCAddr:           address,
-		StopC:              make(chan struct{}),
-		OracleTimeCapDelta: oracleTimeCapDelta,
-		Metrics:            kronosstats.NewMetrics(),
+		Clock:                clock,
+		OracleSM:             oracle,
+		Client:               client,
+		GRPCAddr:             address,
+		StopC:                make(chan struct{}),
+		OracleTimeCapDelta:   oracleTimeCapDelta,
+		OracleUptimeCapDelta: oracleUptimeCapDelta,
+		Metrics:              kronosstats.NewMetrics(),
 	}
 }
