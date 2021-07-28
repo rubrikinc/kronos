@@ -28,7 +28,7 @@ func TestKronosStatus(t *testing.T) {
 	tc, err := cluster.NewCluster(
 		ctx,
 		cluster.ClusterConfig{
-			Fs: fs,
+			Fs:                       fs,
 			ManageOracleTickInterval: manageOracleTickInterval,
 			NumNodes:                 numNodes,
 			RaftSnapCount:            2,
@@ -51,7 +51,7 @@ func TestKronosStatus(t *testing.T) {
 	// give some time so that nodes have non-zero delta
 	time.Sleep(kronosStabilizationBufferTime)
 	// PreCheck - validate time across cluster is in similar range
-	_, err = tc.ValidateTimeInConsensus(
+	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
 		false, /*checkOnlyRunningNodes*/

@@ -25,6 +25,7 @@ const (
 	grpcAddrErrTag = "grpc-addr"
 	statusErrTag   = "status"
 	timeErrTag     = "time"
+	uptimeErrTag   = "uptime"
 )
 
 // NodeInfo stores the information for a node required by cli commands like
@@ -37,6 +38,7 @@ type NodeInfo struct {
 	OracleState  *kronospb.OracleState `json:"oracle_state"`
 	Delta        int64                 `json:"delta"`
 	Time         int64                 `json:"time"`
+	Uptime       int64                 `json:"uptime"`
 	Err          errMap                `json:"error"`
 }
 
@@ -96,6 +98,12 @@ func (n nodeInfoFetcher) fetch(
 					ndInfo.addError(err, timeErrTag)
 				} else {
 					ndInfo.Time = tr.Time
+				}
+				ut, err := grpcClient.KronosUptime(ctx, grpcAddr)
+				if err != nil {
+					ndInfo.addError(err, uptimeErrTag)
+				} else {
+					ndInfo.Uptime = ut.Uptime
 				}
 			}
 			if n.status {

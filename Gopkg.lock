@@ -124,7 +124,7 @@
 [[projects]]
   branch = "master"
   digest = "1:8ecb89af7dfe3ac401bdb0c9390b134ef96a97e85f732d2b0604fb7b3977839f"
-  name = "github.com/codahale/hdrhistogram"
+  name = "github.com/codahale/hdrhistogram-go"
   packages = ["."]
   pruneopts = "NUT"
   revision = "3a0bb77429bd3a61596f5e8a3172445844342120"

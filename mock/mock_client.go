@@ -22,6 +22,19 @@ type Client struct {
 	Latency time.Duration
 }
 
+func (c *Client) KronosUptime(ctx context.Context, server *kronospb.NodeAddr) (*kronospb.KronosUptimeResponse, error) {
+	node, err := c.node(ctx, server)
+	if err != nil {
+		return nil, err
+	}
+	response, err := node.Server.KronosUptimeNow(ctx)
+	if err != nil {
+		return response, err
+	}
+	response.Rtt = int64(c.Latency)
+	return response, nil
+}
+
 var _ server.Client = &Client{}
 
 // connect connects to the given Server if not already connected

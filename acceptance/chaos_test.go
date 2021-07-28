@@ -116,12 +116,12 @@ func TestKronosChaos(t *testing.T) {
 	log.Info(ctx, "Initialized Test Cluster.")
 
 	time.Sleep(3 * chaosInterval)
-	nodeIdxToTimes, err := tc.ValidateTimeInConsensus(
+	nodeIdxToTimes, nodeIdxToUptimes, err := tc.ValidateTimeInConsensus(
 		ctx,
 		50*time.Millisecond,
 		false, /*checkOnlyRunningNodes*/
 	)
-	log.Infof(ctx, "Initial relative time on nodes: %v", nodeIdxToTimes.Relative())
+	log.Infof(ctx, "Initial relative time on nodes: %v", nodeIdxToTimes.Relative(), nodeIdxToUptimes.Relative())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestKronosChaos(t *testing.T) {
 
 	go injectChaosPeriodically()
 
-	lastNodeIdxToTimes, err := tc.ValidateTimeInConsensus(
+	lastNodeIdxToTimes, lastNodeIdxToUptimes, err := tc.ValidateTimeInConsensus(
 		ctx,
 		validator.validationThreshold,
 		true, /*checkOnlyRunningNodes*/
@@ -173,6 +173,7 @@ func TestKronosChaos(t *testing.T) {
 	lastActualTime := time.Now()
 	assert.Nil(t, err)
 	var timeElapsedOnNodes map[int]time.Duration
+	var uptimeElapsedOnNodes map[int]time.Duration
 	start := time.Now()
 	validationCount := 0
 	for time.Since(start) < testDuration {
@@ -182,7 +183,7 @@ func TestKronosChaos(t *testing.T) {
 			timeoutCtx, cancelFunc := context.WithTimeout(ctx, validationInterval)
 			defer cancelFunc()
 			// validate time is in consensus on all the nodes
-			nodeIdxToTimes, err = tc.ValidateTimeInConsensus(
+			nodeIdxToTimes, nodeIdxToUptimes, err = tc.ValidateTimeInConsensus(
 				timeoutCtx,
 				validator.validationThreshold,
 				true, /*checkOnlyRunningNodes*/
@@ -220,16 +221,28 @@ func TestKronosChaos(t *testing.T) {
 							0.5*float64(validationInterval*loggingPeriod),
 						)
 					}
+
+					uptimeElapsedOnNodes = nodeIdxToUptimes.Since(lastNodeIdxToUptimes)
+					for _, uptimeElapsed := range uptimeElapsedOnNodes {
+						assert.InDelta(
+							t,
+							float64(expectedDuration),
+							float64(uptimeElapsed),
+							0.5*float64(validationInterval*loggingPeriod),
+						)
+					}
 				}
 				log.Infof(
 					ctx,
-					"Completed %d validations over %v, relative time: %v, time elapsed on nodes: %v",
+					"Completed %d validations over %v, relative time: %v, time elapsed on nodes: %v, uptime elapsed on nodes",
 					validationCount,
 					time.Since(start),
 					nodeIdxToTimes.Relative(),
 					timeElapsedOnNodes,
+					uptimeElapsedOnNodes,
 				)
 				lastNodeIdxToTimes = nodeIdxToTimes
+				lastNodeIdxToUptimes = nodeIdxToUptimes
 				lastActualTime = currActualTime
 			}
 		}()

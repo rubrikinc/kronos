@@ -108,6 +108,26 @@ func (c *grpcClient) KronosTime(
 	return timeResponse, err
 }
 
+// KronosUptime implements the Client interface.
+func (c *grpcClient) KronosUptime(
+	ctx context.Context, server *kronospb.NodeAddr,
+) (*kronospb.KronosUptimeResponse, error) {
+	if err := c.connect(ctx, server); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
+	startUptime := time.Now()
+	timeResponse, err := c.grpcClient.KronosUptime(ctx, &kronospb.KronosUptimeRequest{})
+	// time.Since uses monotonic time and is immune to clock jumps
+	if timeResponse != nil {
+		timeResponse.Rtt = int64(time.Since(startUptime))
+	}
+	return timeResponse, err
+}
+
 // Status implements the Client interface.
 func (c *grpcClient) Status(
 	ctx context.Context, server *kronospb.NodeAddr,

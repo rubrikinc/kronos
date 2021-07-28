@@ -21,8 +21,9 @@ install:
 goreman:
 	@$(GO_BUILD) -v ./vendor/github.com/mattn/goreman
 
+# Run these tests serially to avoid port conflicts.
 acceptance: build goreman
-	$(GO) test -v ./acceptance/... --tags=acceptance --timeout 20m
+	$(GO) test -p 1 -v ./acceptance/... --tags=acceptance --timeout 30m
 
 test:
 	$(GO) test -v ./...

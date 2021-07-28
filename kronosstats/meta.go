@@ -7,6 +7,9 @@ var (
 	MetaKronosDelta = metric.Metadata{
 		Name: "kronos.delta",
 		Help: "Offset between local time and kronos time"}
+	MetaKronosUptimeDelta = metric.Metadata{
+		Name: "kronos.uptimedelta",
+		Help: "Offset between local uptime and kronos uptime"}
 	MetaKronosIsOracle = metric.Metadata{
 		Name: "kronos.oracle",
 		Help: "1 if the current node is the oracle, 0 otherwise"}
@@ -25,4 +28,7 @@ var (
 	MetaKronosTimeCap = metric.Metadata{
 		Name: "kronos.timecap",
 		Help: "Time cap of Kronos"}
+	MetaKronosUptimeCap = metric.Metadata{
+		Name: "kronos.uptimecap",
+		Help: "Time cap of Kronos Uptime"}
 )

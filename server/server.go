@@ -26,6 +26,9 @@ const (
 	// DefaultOracleTimeCapDelta is the delta of the upper bound of KronosTime
 	// which is persisted in the oracle state machine
 	DefaultOracleTimeCapDelta = time.Minute
+	// DefaultOracleUptimeCapDelta is the delta of the upper bound of KronosTime
+	// which is persisted in the oracle state machine
+	DefaultOracleUptimeCapDelta = 30 * time.Second
 	// KronosDefaultRaftPort is the default port used by the raft HTTP transport
 	KronosDefaultRaftPort = "5766"
 	// KronosDefaultGRPCPort is the default port used by the kronos GRPC server
@@ -56,6 +59,8 @@ type Server struct {
 	raftAddr *kronospb.NodeAddr
 	// OracleDelta is the delta of this server with respect to KronosTime
 	OracleDelta atomic.Int64
+	// OracleUptimeDelta is the delta of this server with respect to KronosUptime
+	OracleUptimeDelta atomic.Int64
 	// Clock is used to get current time
 	Clock tm.Clock
 	// StopC is used to trigger cleanup functions
@@ -63,6 +68,9 @@ type Server struct {
 	// OracleTimeCapDelta is the delta of the upper bound of KronosTime which
 	// is persisted in the oracle state machine
 	OracleTimeCapDelta time.Duration
+	// OracleUptimeCapDelta is the delta of the upper bound of KronosUptime which
+	// is persisted in the oracle state machine
+	OracleUptimeCapDelta time.Duration
 	// Metrics records kronos metrics
 	Metrics *kronosstats.KronosMetrics
 
@@ -71,6 +79,9 @@ type Server struct {
 		// lastKronosTime is the last served KronosTime. This is used to
 		// ensure KronosTime does not have backward jumps
 		lastKronosTime int64
+		// lastKronosUptime is the last served KronosUptime. This is used to
+		// ensure KronosUptime does not have backward jumps
+		lastKronosUptime int64
 	}
 
 	// status of the server
@@ -133,7 +144,15 @@ func (k *Server) OracleTime(
 		return nil, err
 	}
 
-	return &kronospb.OracleTimeResponse{Time: kt.Time}, nil
+	ut, err := k.KronosUptimeNow(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &kronospb.OracleTimeResponse{
+		Time:   kt.Time,
+		Uptime: ut.Uptime,
+	}, nil
 }
 
 // KronosTime is the same as KronosTimeNow except that it takes a
@@ -143,6 +162,46 @@ func (k *Server) KronosTime(
 	ctx context.Context, request *kronospb.KronosTimeRequest,
 ) (*kronospb.KronosTimeResponse, error) {
 	return k.KronosTimeNow(ctx)
+}
+
+func (k *Server) KronosUptimeNow(
+	ctx context.Context,
+) (*kronospb.KronosUptimeResponse, error) {
+	return k.KronosUptime(ctx, &kronospb.KronosUptimeRequest{})
+}
+
+func (k *Server) KronosUptime(
+	ctx context.Context, request *kronospb.KronosUptimeRequest,
+) (*kronospb.KronosUptimeResponse, error) {
+	oracleData := k.OracleSM.State(ctx)
+
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	t := k.upTime()
+	currentStatus := k.ServerStatus()
+	initialized := currentStatus == kronospb.ServerStatus_INITIALIZED
+	var errorMsg string
+	if !initialized {
+		errorMsg = "kronos server not yet initialized"
+	} else if oracleData.KronosUptimeCap == 0 {
+		errorMsg = "kronos up time cap not yet initialized"
+	} else if oracleData.KronosUptimeCap <= t {
+		errorMsg = "kronos up time is beyond current time cap, time cap is too stale"
+	}
+	if errorMsg != "" {
+		return nil, errors.Errorf(
+			"%s: kronos uptime: %v, status: %v, uptime time cap: %v",
+			errorMsg, t, currentStatus, oracleData.KronosUptimeCap,
+		)
+	}
+
+	// ensure that KronosTime does not have backward jumps
+	if k.mu.lastKronosUptime > t {
+		t = k.mu.lastKronosUptime
+	}
+
+	k.mu.lastKronosTime = t
+	return &kronospb.KronosUptimeResponse{Uptime: t, UptimeCap: oracleData.KronosUptimeCap}, nil
 }
 
 // KronosTimeNow returns the current KronosTime according to the server.
@@ -236,6 +295,18 @@ func (k *Server) syncOrOverthrowOracle(
 	return err == nil
 }
 
+func getDeltaAdjustment(localTime int64, lowerBound int64, upperBound int64) int64 {
+	var deltaAdjustment int64
+	if localTime < lowerBound {
+		deltaAdjustment = lowerBound - localTime
+	} else if localTime > upperBound {
+		deltaAdjustment = upperBound - localTime
+	} else {
+		deltaAdjustment = 0
+	}
+	return deltaAdjustment
+}
+
 // trySyncWithOracle queries the oracle for KronosTime and adjusts
 // the delta of this server.
 // This returns whether the current oracle is healthy
@@ -274,27 +345,28 @@ func (k *Server) trySyncWithOracle(ctx context.Context, oracle *kronospb.NodeAdd
 	oracleTimeRangeLHS := response.Time
 	oracleTimeRangeRHS := response.Time + response.Rtt
 
-	adjustedTime := k.adjustedTime()
+	oracleUptimeRangeLHS := response.Uptime
+	oracleUptimeRangeRHS := response.Uptime + response.Rtt
 
-	var deltaAdjustment int64
-	if adjustedTime < oracleTimeRangeLHS {
-		deltaAdjustment = oracleTimeRangeLHS - adjustedTime
-	} else if adjustedTime > oracleTimeRangeRHS {
-		deltaAdjustment = oracleTimeRangeRHS - adjustedTime
-	} else {
-		deltaAdjustment = 0
-	}
+	adjustedTime := k.adjustedTime()
+	deltaAdjustment := getDeltaAdjustment(adjustedTime, oracleTimeRangeLHS, oracleTimeRangeRHS)
+
+	upTime := k.upTime()
+	uptimeDeltaAdjustment := getDeltaAdjustment(upTime, oracleUptimeRangeLHS, oracleUptimeRangeRHS)
 
 	k.OracleDelta.Add(deltaAdjustment)
+	k.OracleUptimeDelta.Add(uptimeDeltaAdjustment)
 	if log.V(1) {
 		log.Infof(
 			ctx,
-			"Synced with oracle: %s. Oracle time: %v, rtt: %v, delta adjustment: %v, new delta: %v",
+			"Synced with oracle: %s. Oracle time: %v, rtt: %v, delta adjustment: %v, new delta: %v, uptime delta adjustment: %v, new uptime delta: %v",
 			oracle,
 			response.Time,
 			time.Duration(response.Rtt),
 			time.Duration(deltaAdjustment),
 			time.Duration(k.OracleDelta.Load()),
+			time.Duration(uptimeDeltaAdjustment),
+			time.Duration(k.OracleUptimeDelta.Load()),
 		)
 	}
 	return nil
@@ -336,6 +408,7 @@ func (k *Server) initialize(ctx context.Context, tickCh <-chan time.Time, tickCa
 		case <-tickCh:
 			oracleState := k.OracleSM.State(ctx)
 			k.Metrics.TimeCap.Update(oracleState.TimeCap)
+			k.Metrics.UptimeCap.Update(oracleState.KronosUptimeCap)
 			log.Infof(ctx, "Oracle state: %v", oracleState)
 			switch {
 			case oracleState.Oracle == nil:
@@ -399,10 +472,23 @@ func (k *Server) initialize(ctx context.Context, tickCh <-chan time.Time, tickCa
 					k.OracleDelta.Add(deltaAdj)
 				}
 
+				if uptimeCap := k.upTimeCap(); uptimeCap < oracleState.KronosUptimeCap {
+					// Adjust uptime to continue from where it left off to ensure monotonic time.
+					uptimeDeltaAdj := oracleState.KronosUptimeCap - k.upTime() + 1
+					log.Infof(
+						ctx,
+						"Adjusting uptime to continue from time cap: "+
+							" Local upTimeCap: %v. Adjusting delta by %v to ensure monotonicity",
+						oracleState.KronosUptimeCap, uptimeDeltaAdj,
+					)
+					k.OracleUptimeDelta.Add(uptimeDeltaAdj)
+				}
+
 				log.Infof(
 					ctx,
-					"Initializing self as oracle. Extending oracle lease. Delta: %v",
+					"Initializing self as oracle. Extending oracle lease. Delta: %v, Uptime Delta: %v",
 					time.Duration(k.OracleDelta.Load()),
+					time.Duration(k.OracleUptimeDelta.Load()),
 				)
 				k.proposeSelf(ctx, oracleState)
 				// This server is the oracle. It is now initialized.
@@ -424,6 +510,7 @@ func (k *Server) initialize(ctx context.Context, tickCh <-chan time.Time, tickCa
 			// tested
 			if k.ServerStatus() == kronospb.ServerStatus_INITIALIZED {
 				k.Metrics.Delta.Update(k.OracleDelta.Load())
+				k.Metrics.UptimeDelta.Update(k.OracleUptimeDelta.Load())
 			}
 			tickCallback()
 			tickNum++
@@ -458,6 +545,7 @@ func (k *Server) ManageOracle(tickCh <-chan time.Time, tickCallback func()) {
 		case <-tickCh:
 			oracleState := k.OracleSM.State(ctx)
 			k.Metrics.TimeCap.Update(oracleState.TimeCap)
+			k.Metrics.UptimeCap.Update(oracleState.KronosUptimeCap)
 			if log.V(1) {
 				log.Infof(ctx, "Oracle state: %s", oracleState)
 			}
@@ -468,8 +556,9 @@ func (k *Server) ManageOracle(tickCh <-chan time.Time, tickCallback func()) {
 				if log.V(1) {
 					log.Infof(
 						ctx,
-						"Extending self oracle lease. Delta: %v",
+						"Extending self oracle lease. Delta: %v, Uptime Delta: %v",
 						time.Duration(k.OracleDelta.Load()),
+						time.Duration(k.OracleUptimeDelta.Load()),
 					)
 				}
 				k.proposeSelf(ctx, oracleState)
@@ -480,6 +569,7 @@ func (k *Server) ManageOracle(tickCh <-chan time.Time, tickCallback func()) {
 				k.syncOrOverthrowOracle(ctx, oracleState)
 			}
 			k.Metrics.Delta.Update(k.OracleDelta.Load())
+			k.Metrics.UptimeDelta.Update(k.OracleUptimeDelta.Load())
 			tickCallback()
 		}
 	}
@@ -504,10 +594,19 @@ func (k *Server) proposeSelf(ctx context.Context, curOracle *kronospb.OracleStat
 		timeCap = curOracle.TimeCap + 1
 	}
 
+	uptimeCap := k.upTimeCap()
+	if curOracle.KronosUptimeCap >= uptimeCap {
+		// Always bump the time cap to ensure monotonicity. If the whole cluster is
+		// restarted and all nodes forget their delta, we start the time at the
+		// previous time cap.
+		uptimeCap = curOracle.KronosUptimeCap + 1
+	}
+
 	k.OracleSM.SubmitProposal(ctx, &kronospb.OracleProposal{
 		ProposedState: &kronospb.OracleState{
-			Oracle:  k.GRPCAddr,
-			TimeCap: timeCap,
+			Oracle:          k.GRPCAddr,
+			TimeCap:         timeCap,
+			KronosUptimeCap: uptimeCap,
 			// Hope to be next in the sequence of state machine update proposals. If
 			// someone else's proposal makes it before us, our proposal will be
 			// rejected, which is good because we do not want multiple claimants to
@@ -542,9 +641,19 @@ func (k *Server) adjustedTime() int64 {
 	return k.Clock.Now() + k.OracleDelta.Load()
 }
 
+// upTime returns the kronos uptime.
+func (k *Server) upTime() int64 {
+	return k.Clock.Uptime() + k.OracleUptimeDelta.Load()
+}
+
 // timeCap returns an upper bound to KronosTime
 func (k *Server) timeCap() int64 {
 	return k.adjustedTime() + int64(k.OracleTimeCapDelta)
+}
+
+// uptimeCap returns an upper bound to KronosUptime
+func (k *Server) upTimeCap() int64 {
+	return k.upTime() + int64(k.OracleUptimeCapDelta)
 }
 
 // NewClusterClient returns a ClusterClient which can be used to perform
@@ -607,6 +716,9 @@ type Config struct {
 	// OracleTimeCapDelta is the delta of the upper bound of KronosTime which
 	// is persisted in the oracle state machine
 	OracleTimeCapDelta time.Duration
+	// OracleUptimeCapDelta is the delta of the upper bound of KronosUptime which
+	// is persisted in the oracle state machine
+	OracleUptimeCapDelta time.Duration
 	// manageOracleTickInterval is the time after which an action is taken based
 	// on the current state of state machine. Action can be to sync with oracle
 	// or extend the oracle lease.
@@ -630,6 +742,7 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 		dataDir:                  config.DataDir,
 		StopC:                    make(chan struct{}),
 		OracleTimeCapDelta:       config.OracleTimeCapDelta,
+		OracleUptimeCapDelta:     config.OracleUptimeCapDelta,
 		manageOracleTickInterval: config.ManageOracleTickInterval,
 		Metrics:                  kronosstats.NewMetrics(),
 	}, nil

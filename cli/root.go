@@ -38,5 +38,5 @@ func init() {
 		"Certificates directory for GRPC Server / Client",
 	)
 
-	RootCmd.AddCommand(clusterCmd, startCmd, statusCmd, validateCmd, timeCmd)
+	RootCmd.AddCommand(clusterCmd, startCmd, statusCmd, validateCmd, timeCmd, uptimeCmd)
 }

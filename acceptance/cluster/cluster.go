@@ -275,10 +275,10 @@ func (tc *TestCluster) Time(ctx context.Context, nodeIdx int) (int64, error) {
 
 // ValidateTimeInConsensus validates time across the cluster(difference between
 // maxTime and minTime) is within maxDiffAllowed for the running nodes. It
-// returns ClusterTime which is a map of NodeID to time.
+// returns ClusterTime and uptime which is a map of NodeID to time / uptime.
 func (tc *TestCluster) ValidateTimeInConsensus(
 	ctx context.Context, maxDiffAllowed time.Duration, checkOnlyRunningNodes bool,
-) (ClusterTime, error) {
+) (ClusterTime, ClusterTime, error) {
 	var nodesToValidate []string
 	for nodeIdx, node := range tc.Nodes {
 		if checkOnlyRunningNodes && !tc.IsRunning(nodeIdx) {
@@ -289,18 +289,14 @@ func (tc *TestCluster) ValidateTimeInConsensus(
 			net.JoinHostPort(localhost, node.grpcPort),
 		)
 	}
-	addressToTime, err := validateTimeInConsensus(
+	addressToTime, addressToUptime, err := tc.validateTimeInConsensus(
 		ctx,
 		maxDiffAllowed,
 		nodesToValidate,
 		tc.CertsDir,
 	)
-	nodeIdxToTime := make(ClusterTime)
-	for address, time := range addressToTime {
-		nodeIdxToTime[tc.index(address)] = time
-	}
 
-	return nodeIdxToTime, err
+	return addressToTime, addressToUptime, err
 }
 
 func (tc *TestCluster) index(address string) int {
@@ -744,13 +740,13 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 	}
 
 	tc := &TestCluster{
-		CertsDir: certsDir,
-		fs:       cc.Fs,
-		ErrCh:    make(chan error),
+		CertsDir:                 certsDir,
+		fs:                       cc.Fs,
+		ErrCh:                    make(chan error),
 		ManageOracleTickInterval: cc.ManageOracleTickInterval,
-		Nodes:         make([]*testNode, cc.NumNodes),
-		procfile:      filepath.Join(testDir, procfile),
-		RaftSnapCount: cc.RaftSnapCount,
+		Nodes:                    make([]*testNode, cc.NumNodes),
+		procfile:                 filepath.Join(testDir, procfile),
+		RaftSnapCount:            cc.RaftSnapCount,
 	}
 	log.Infof(ctx, "Procfile: %v", tc.procfile)
 
@@ -807,11 +803,13 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 
 // validateTimeInConsensus validates that the kronos time across the given nodes
 // (difference between maxTime and minTime) is within maxDiffAllowed.
-func validateTimeInConsensus(
+// Returns a map of node id to time, node id to uptime, and error (if any)
+func (tc *TestCluster) validateTimeInConsensus(
 	ctx context.Context, maxDiffAllowed time.Duration, nodeAddresses []string, certsDir string,
-) (map[string]int64, error) {
+) (ClusterTime, ClusterTime, error) {
 	var mu syncutil.RWMutex
-	timeOnNodes := make(map[string]int64)
+	timeOnNodes := make(ClusterTime)
+	uptimeOnNodes := make(ClusterTime)
 	eg, ctx := errgroup.WithContext(ctx)
 	var wg sync.WaitGroup
 	wg.Add(len(nodeAddresses))
@@ -821,7 +819,7 @@ func validateTimeInConsensus(
 		currAddress := address
 		host, port, err := net.SplitHostPort(currAddress)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		nodeAddr := &kronospb.NodeAddr{
 			Host: host,
@@ -854,18 +852,34 @@ func validateTimeInConsensus(
 					)
 					return err
 				}
+				utr, err := timeClient.KronosUptime(ctx, nodeAddr)
+				if err != nil {
+					log.Errorf(
+						ctx, "Failed to get KronosUptime from address %s, error: %v",
+						currAddress, err,
+					)
+					return err
+				}
 				mu.Lock()
 				defer mu.Unlock()
-				timeOnNodes[currAddress] = tr.Time
+				timeOnNodes[tc.index(currAddress)] = tr.Time
+				uptimeOnNodes[tc.index(currAddress)] = utr.Uptime
 				return err
 			},
 		)
 	}
 	if err := eg.Wait(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	// Validate time on nodes.
 	if err := kronosutil.ValidateTimeInConsensus(ctx, maxDiffAllowed, timeOnNodes); err != nil {
-		return nil, err
+		log.Errorf(ctx, "Time validation failed: %v", timeOnNodes.Relative())
+		return nil, nil, err
 	}
-	return timeOnNodes, nil
+	// Validate uptime on nodes.
+	if err := kronosutil.ValidateTimeInConsensus(ctx, maxDiffAllowed, uptimeOnNodes); err != nil {
+		log.Errorf(ctx, "Uptime validation failed: %v", uptimeOnNodes.Relative())
+		return nil, nil, err
+	}
+	return timeOnNodes, uptimeOnNodes, nil
 }

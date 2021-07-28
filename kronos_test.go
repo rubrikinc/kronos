@@ -25,8 +25,11 @@ func TestSingleNodeKronos(t *testing.T) {
 	node.Clock.SetTime(int64(time.Hour))
 	a.Equal(kronospb.ServerStatus_NOT_INITIALIZED, node.Server.ServerStatus())
 	// KronosTimeNow() should give an error when not initialized.
-	kt, err := node.Server.KronosTimeNow(ctx)
-	a.Nil(kt)
+	kt0, err := node.Server.KronosTimeNow(ctx)
+	a.Nil(kt0)
+	a.Error(err)
+	ut0, err := node.Server.KronosUptimeNow(ctx)
+	a.Nil(ut0)
 	a.Error(err)
 	// Time Server needs 2 ticks to initialize.
 	cluster.Tick(node)
@@ -34,40 +37,67 @@ func TestSingleNodeKronos(t *testing.T) {
 	a.Equal(kronospb.ServerStatus_INITIALIZED, node.Server.ServerStatus())
 
 	// Verify KronosTimeNow() works.
-	kt, err = node.Server.KronosTimeNow(ctx)
-	kronosTime1, cap := kt.Time, kt.TimeCap
+	kt1, err := node.Server.KronosTimeNow(ctx)
 	a.NoError(err)
-	a.Equal(int64(time.Hour+15*time.Second+1), cap)
-	timeCap1 := cluster.StateMachine.State(ctx).TimeCap
+	a.Equal(int64(time.Hour+15*time.Second+1), kt1.TimeCap)
+	timeCap1SM := cluster.StateMachine.State(ctx).TimeCap
 	delta1 := node.Server.OracleDelta.Load()
-	a.Equal(int64(time.Hour), kronosTime1)
-	a.True(kronosTime1 < timeCap1)
+	a.Equal(int64(time.Hour), kt1.Time)
+	a.True(kt1.Time < timeCap1SM)
 	// First time the Server initializes.
 	a.Equal(delta1, int64(0))
+	// Verify KronosUpimeNow() works.
+	ut1, err := node.Server.KronosUptimeNow(ctx)
+	a.NoError(err)
+	a.Equal(int64(5*time.Second+1), ut1.UptimeCap)
+	uptimeCap1SM := cluster.StateMachine.State(ctx).KronosUptimeCap
+	uptimeDelta1 := node.Server.OracleUptimeDelta.Load()
+	// Kronos uptime starts from 0.
+	a.Equal(int64(0), ut1.Uptime)
+	a.True(ut1.Uptime < uptimeCap1SM)
+	// First time the Server initializes.
+	a.Equal(uptimeDelta1, int64(0))
 
 	// Bump Clock by 30 seconds. Kronos time should give an error as it is more
 	// than time cap.
 	node.Clock.AdvanceTime(30 * time.Second)
-	kt, err = node.Server.KronosTimeNow(ctx)
-	a.Nil(kt)
+	kt2, err := node.Server.KronosTimeNow(ctx)
+	a.Nil(kt2)
+	a.Error(err)
+	ut2, err := node.Server.KronosUptimeNow(ctx)
+	a.Nil(ut2)
 	a.Error(err)
 
 	// After a Tick, a new time cap will be updated and KronosTime should work.
 	cluster.Tick(node)
-	kt, err = node.Server.KronosTimeNow(ctx)
-	kronosTime2, cap2 := kt.Time, kt.TimeCap
-	timeCap2 := cluster.StateMachine.State(ctx).TimeCap
+	kt3, err := node.Server.KronosTimeNow(ctx)
+	timeCap3SM := cluster.StateMachine.State(ctx).TimeCap
 	// Time Cap metric has the last seen time cap. The node does not have a fresh
 	// reading of the state machine
-	a.Equal(timeCap1, node.Server.Metrics.TimeCap.Value())
+	a.Equal(timeCap1SM, node.Server.Metrics.TimeCap.Value())
 	delta2 := node.Server.OracleDelta.Load()
 	a.NoError(err)
-	a.Equal(timeCap2, cap2)
-	a.Equal(cap2, int64(time.Hour+45*time.Second))
-	a.Equal(int64(time.Hour+30*time.Second), kronosTime2)
-	a.True(kronosTime2 < timeCap2)
-	a.True(timeCap1 < timeCap2)
+	a.Equal(timeCap3SM, kt3.TimeCap)
+	a.Equal(kt3.TimeCap, int64(time.Hour+45*time.Second))
+	a.Equal(int64(time.Hour+30*time.Second), kt3.Time)
+	a.True(kt3.Time < timeCap3SM)
+	a.True(timeCap1SM < timeCap3SM)
 	a.Equal(delta2, int64(0))
+	// Verify KronosUptime.
+	ut3, err := node.Server.KronosUptimeNow(ctx)
+	uptimeCap3SM := cluster.StateMachine.State(ctx).KronosUptimeCap
+	// Time Cap metric has the last seen time cap. The node does not have a fresh
+	// reading of the state machine
+	a.Equal(uptimeCap1SM, node.Server.Metrics.UptimeCap.Value())
+	uptimeDelta2 := node.Server.OracleUptimeDelta.Load()
+	a.NoError(err)
+	a.Equal(uptimeCap3SM, ut3.UptimeCap)
+	a.Equal(ut3.UptimeCap, int64(30*time.Second+5*time.Second))
+	// Uptime advances by 30s.
+	a.Equal(int64(30*time.Second), ut3.Uptime)
+	a.True(ut3.Uptime < uptimeCap3SM)
+	a.True(uptimeCap1SM < uptimeCap3SM)
+	a.Equal(uptimeDelta2, int64(0))
 
 	// After kronos restarts it should continue time from Time Cap.
 	node = cluster.RestartNode(ctx, node)
@@ -77,20 +107,27 @@ func TestSingleNodeKronos(t *testing.T) {
 	cluster.TickN(node, 4)
 	// Time Cap metric has the last seen time cap. The node does not have a fresh
 	// reading of the state machine
-	a.Equal(timeCap2, node.Server.Metrics.TimeCap.Value())
+	a.Equal(timeCap3SM, node.Server.Metrics.TimeCap.Value())
 	a.Equal(kronospb.ServerStatus_NOT_INITIALIZED, node.Server.ServerStatus())
 	cluster.Tick(node)
 	a.Equal(kronospb.ServerStatus_INITIALIZED, node.Server.ServerStatus())
-	kt, err = node.Server.KronosTimeNow(ctx)
+	// Verify Kronos Time.
+	kt4, err := node.Server.KronosTimeNow(ctx)
 	a.NoError(err)
-	kronosTime3, cap3 := kt.Time, kt.TimeCap
-	a.Equal(cap3, int64(time.Hour+60*time.Second+1))
-	a.True(kronosTime3 > timeCap2)
+	a.Equal(kt4.TimeCap, int64(time.Hour+60*time.Second+1))
+	a.True(kt4.Time > timeCap3SM)
+	// Verify Kronos Uptime.
+	ut4, err := node.Server.KronosUptimeNow(ctx)
+	a.NoError(err)
+	// Time continues from timecap.
+	a.Equal(ut4.Uptime, ut3.UptimeCap+1)
+	a.Equal(ut4.UptimeCap, ut3.UptimeCap+int64(5*time.Second)+1)
+	a.True(ut4.UptimeCap > uptimeCap3SM)
 	// Time Cap metric has the last seen time cap. The node does not have a fresh
 	// reading of the state machine
-	a.Equal(timeCap2, node.Server.Metrics.TimeCap.Value())
+	a.Equal(timeCap3SM, node.Server.Metrics.TimeCap.Value())
 	cluster.Tick(node)
-	a.Equal(cap3, node.Server.Metrics.TimeCap.Value())
+	a.Equal(kt4.TimeCap, node.Server.Metrics.TimeCap.Value())
 }
 
 func TestMultiNodeClientStatus(t *testing.T) {
@@ -204,13 +241,18 @@ func TestMultiNodeBackwardJump(t *testing.T) {
 			a.NoError(err)
 			a.True(resp.Time > 0)
 
-			kt, err := nodes[2].Server.KronosTimeNow(ctx)
-			kronosTime0 := kt.Time
+			kt0, err := nodes[2].Server.KronosTimeNow(ctx)
 			a.NoError(err)
-			a.Equal(int64(2*time.Hour), kronosTime0)
+			a.Equal(int64(2*time.Hour), kt0.Time)
+			ut0, err := nodes[2].Server.KronosUptimeNow(ctx)
+			a.NoError(err)
+			// Uptime starts from uptime of Oracle (nodes[1]).
+			a.Equal(int64(2*time.Second), ut0.Uptime)
 
 			timeCap0 := cluster.StateMachine.State(ctx).TimeCap
+			upTimeCap0 := cluster.StateMachine.State(ctx).KronosUptimeCap
 			a.Equal(int64(2*time.Hour+15*time.Second+1), timeCap0)
+			a.Equal(int64(2*time.Second+5*time.Second)+1, upTimeCap0)
 
 			var newOracle, nonOracle1, nonOracle2 *mock.Node
 			// Node 1 is oracle at this point
@@ -236,6 +278,10 @@ func TestMultiNodeBackwardJump(t *testing.T) {
 			newOracle.Clock.SetTime(int64(-10 * time.Hour))
 			nonOracle1.Clock.SetTime(int64(-10 * time.Hour))
 
+			nonOracle2.Clock.SetTime(int64(-11 * time.Hour))
+			newOracle.Clock.SetTime(int64(-11 * time.Hour))
+			nonOracle1.Clock.SetTime(int64(-11 * time.Hour))
+
 			// Node waits for 4 ticks before state machine management so that an
 			// initialized Server can become the oracle
 			cluster.TickN(newOracle, 4)
@@ -257,23 +303,32 @@ func TestMultiNodeBackwardJump(t *testing.T) {
 			resp, err = newOracle.Server.OracleTime(ctx, &kronospb.OracleTimeRequest{})
 			a.NoError(err)
 			a.True(resp.Time > 0)
+			a.True(resp.Uptime > 0)
 
-			kt, err = nonOracle1.Server.KronosTimeNow(ctx)
-			kronosTime1 := kt.Time
+			kt1, err := nonOracle1.Server.KronosTimeNow(ctx)
 			a.NoError(err)
 			// A non initialized orcle continues time from time cap
-			a.True(kronosTime1 > timeCap0)
+			a.True(kt1.Time > timeCap0)
+			ut1, err := nonOracle1.Server.KronosUptimeNow(ctx)
+			a.NoError(err)
+			// A non initialized orcle continues time from time cap
+			a.True(ut1.Uptime > upTimeCap0)
 
 			timeCap1 := cluster.StateMachine.State(ctx).TimeCap
-			a.True(kronosTime1 < timeCap1)
+			a.True(kt1.Time < timeCap1)
+			uptimeCap1 := cluster.StateMachine.State(ctx).KronosUptimeCap
+			a.True(ut1.Uptime < uptimeCap1)
 
 			nonOracle2.Clock.AdvanceTime(time.Second / 2)
 			newOracle.Clock.AdvanceTime(time.Second)
 			nonOracle1.Clock.AdvanceTime(time.Second / 3)
-			kt, err = nonOracle1.Server.KronosTimeNow(ctx)
-			kronosTime2 := kt.Time
+			kt2, err := nonOracle1.Server.KronosTimeNow(ctx)
 			a.NoError(err)
-			a.True(kronosTime2 > kronosTime1)
+			a.True(kt2.Time > kt1.Time)
+
+			ut2, err := nonOracle1.Server.KronosUptimeNow(ctx)
+			a.NoError(err)
+			a.True(ut2.Uptime > ut1.Uptime)
 
 			// Clusters are not in sync as they advanced by different time
 			err = cluster.IsClusterInSync(ctx, nonOracle2, newOracle, nonOracle1)
@@ -319,16 +374,25 @@ func TestMultiNodesDeltaComputation(t *testing.T) {
 	a.True(resp.Time > 0)
 
 	// Verify deltas. Kronos Time now is ~2 Hours (Since Node 1 is oracle)
-	kt, err := nodes[1].Server.KronosTimeNow(ctx)
-	kronosTime := kt.Time
+	kt0, err := nodes[1].Server.KronosTimeNow(ctx)
 	a.NoError(err)
-	a.Equal(int64(2*time.Hour), kronosTime)
+	a.Equal(int64(2*time.Hour), kt0.Time)
 	// Node 1 is oracle. It has 0 delta
 	a.Equal(int64(0), nodes[1].Server.OracleDelta.Load())
 	// Node 0 has delta of +1 hour
 	a.Equal(int64(time.Hour), nodes[0].Server.OracleDelta.Load())
 	// Node 2 has delta of -1 hour
 	a.Equal(int64(-time.Hour), nodes[2].Server.OracleDelta.Load())
+	// Verify deltas. Kronos Uptime now is ~2 seconds (Since Node 1 is oracle)
+	ut0, err := nodes[1].Server.KronosUptimeNow(ctx)
+	a.NoError(err)
+	a.Equal(int64(2*time.Second), ut0.Uptime)
+	// Node 1 is oracle. It has 0 delta
+	a.Equal(int64(0), nodes[1].Server.OracleUptimeDelta.Load())
+	// Node 0 has delta of +1 second
+	a.Equal(int64(time.Second), nodes[0].Server.OracleUptimeDelta.Load())
+	// Node 2 has delta of -1 hour
+	a.Equal(int64(-time.Second), nodes[2].Server.OracleUptimeDelta.Load())
 
 	nodes[0].Clock.AdvanceTime(time.Second)
 	nodes[1].Clock.AdvanceTime(time.Second)
@@ -353,8 +417,10 @@ func TestMultiNodesDeltaComputation(t *testing.T) {
 	// Verify deltas
 	// Node 0 is oracle. It continues with delta of 1 hour
 	a.Equal(int64(time.Hour), nodes[0].Server.OracleDelta.Load())
+	a.Equal(int64(time.Second), nodes[0].Server.OracleUptimeDelta.Load())
 	// Node 2 continues with delta of -1 hour
 	a.Equal(int64(-time.Hour), nodes[2].Server.OracleDelta.Load())
+	a.Equal(int64(-time.Second), nodes[2].Server.OracleUptimeDelta.Load())
 
 	// Advance clocks of live Nodes by different amounts
 	nodes[0].Clock.AdvanceTime(1 * time.Hour)
@@ -369,8 +435,18 @@ func TestMultiNodesDeltaComputation(t *testing.T) {
 		float64(10*time.Millisecond),
 	)
 	a.InDelta(
+		int64(time.Second),
+		nodes[0].Server.OracleUptimeDelta.Load(),
+		float64(10*time.Millisecond),
+	)
+	a.InDelta(
 		int64(time.Hour),
 		nodes[0].Server.Metrics.Delta.Value(),
+		float64(10*time.Millisecond),
+	)
+	a.InDelta(
+		int64(time.Second),
+		nodes[0].Server.Metrics.UptimeDelta.Value(),
 		float64(10*time.Millisecond),
 	)
 	// Node 2 delta is now -2 hour
@@ -380,8 +456,18 @@ func TestMultiNodesDeltaComputation(t *testing.T) {
 		float64(10*time.Millisecond),
 	)
 	a.InDelta(
+		int64(-time.Hour-time.Second),
+		nodes[2].Server.OracleUptimeDelta.Load(),
+		float64(10*time.Millisecond),
+	)
+	a.InDelta(
 		int64(-2*time.Hour),
 		nodes[2].Server.Metrics.Delta.Value(),
+		float64(10*time.Millisecond),
+	)
+	a.InDelta(
+		int64(-time.Hour-time.Second),
+		nodes[2].Server.Metrics.UptimeDelta.Value(),
 		float64(10*time.Millisecond),
 	)
 
@@ -410,12 +496,18 @@ func TestMultiNodesDeltaComputation(t *testing.T) {
 	cluster.Tick(nodes[1])
 	cluster.Tick(nodes[2])
 	// Verify deltas. Kronos time now is ~3 hours and 2 seconds
-	kt, err = nodes[2].Server.KronosTimeNow(ctx)
-	kronosTime = kt.Time
+	kt1, err := nodes[2].Server.KronosTimeNow(ctx)
 	a.NoError(err)
 	a.InDelta(
 		int64(3*time.Hour+2*time.Second),
-		kronosTime,
+		kt1.Time,
+		float64(10*time.Millisecond),
+	)
+	ut1, err := nodes[2].Server.KronosUptimeNow(ctx)
+	a.NoError(err)
+	a.InDelta(
+		int64(1*time.Hour+4*time.Second),
+		ut1.Uptime,
 		float64(10*time.Millisecond),
 	)
 	// Node 2 is oracle. It continues with same delta
@@ -428,8 +520,18 @@ func TestMultiNodesDeltaComputation(t *testing.T) {
 		float64(10*time.Millisecond),
 	)
 	a.InDelta(
+		int64(-time.Hour-time.Second),
+		nodes[2].Server.OracleUptimeDelta.Load(),
+		float64(10*time.Millisecond),
+	)
+	a.InDelta(
 		int64(-2*time.Hour),
 		nodes[2].Server.Metrics.Delta.Value(),
+		float64(10*time.Millisecond),
+	)
+	a.InDelta(
+		int64(-time.Hour-time.Second),
+		nodes[2].Server.Metrics.UptimeDelta.Value(),
 		float64(10*time.Millisecond),
 	)
 	// Node 0 has delta of 3 hours
@@ -443,10 +545,25 @@ func TestMultiNodesDeltaComputation(t *testing.T) {
 		nodes[0].Server.Metrics.Delta.Value(),
 		float64(10*time.Millisecond),
 	)
+	a.InDelta(
+		int64(1*time.Hour+4*time.Second),
+		nodes[0].Server.OracleUptimeDelta.Load(),
+		float64(10*time.Millisecond),
+	)
+	a.InDelta(
+		int64(1*time.Hour+4*time.Second),
+		nodes[0].Server.Metrics.UptimeDelta.Value(),
+		float64(10*time.Millisecond),
+	)
 	// Node 1 has delta of -2 hours
 	a.InDelta(
 		int64(2*time.Hour+2*time.Second),
 		nodes[1].Server.OracleDelta.Load(),
+		float64(10*time.Millisecond),
+	)
+	a.InDelta(
+		int64(1*time.Hour+4*time.Second),
+		nodes[1].Server.OracleUptimeDelta.Load(),
 		float64(10*time.Millisecond),
 	)
 }
@@ -616,33 +733,34 @@ func TestMultiNodeExceedsTimeCap(t *testing.T) {
 	cluster.Tick(nodes[2])
 	cluster.Tick(nodes[0])
 
-	_, err := nodes[0].Server.KronosTimeNow(ctx)
-	a.NoError(err)
-	_, err = nodes[1].Server.KronosTimeNow(ctx)
-	a.NoError(err)
-	_, err = nodes[2].Server.KronosTimeNow(ctx)
-	a.NoError(err)
+	for _, node := range nodes {
+		_, err := node.Server.KronosTimeNow(ctx)
+		a.NoError(err)
+		_, err = node.Server.KronosUptimeNow(ctx)
+		a.NoError(err)
+	}
 
-	nodes[0].Clock.AdvanceTime(16 * time.Second)
-	nodes[1].Clock.AdvanceTime(16 * time.Second)
-	nodes[2].Clock.AdvanceTime(16 * time.Second)
+	for _, node := range nodes {
+		node.Clock.AdvanceTime(16 * time.Second)
+	}
 
 	// Kronos Time should exceed time cap
-	_, err = nodes[0].Server.KronosTimeNow(ctx)
-	a.Error(err)
-	_, err = nodes[1].Server.KronosTimeNow(ctx)
-	a.Error(err)
-	_, err = nodes[2].Server.KronosTimeNow(ctx)
-	a.Error(err)
+	for _, node := range nodes {
+		_, err := node.Server.KronosTimeNow(ctx)
+		a.Error(err)
+		_, err = node.Server.KronosUptimeNow(ctx)
+		a.Error(err)
+	}
 
 	// After oracle persists new time cap Kronos Time should not error out
 	cluster.Tick(nodes[1])
-	_, err = nodes[0].Server.KronosTimeNow(ctx)
-	a.NoError(err)
-	_, err = nodes[1].Server.KronosTimeNow(ctx)
-	a.NoError(err)
-	_, err = nodes[2].Server.KronosTimeNow(ctx)
-	a.NoError(err)
+
+	for _, node := range nodes {
+		_, err := node.Server.KronosTimeNow(ctx)
+		a.NoError(err)
+		_, err = node.Server.KronosUptimeNow(ctx)
+		a.NoError(err)
+	}
 }
 
 func TestMultiNodeOracleOverthrow(t *testing.T) {
@@ -712,18 +830,24 @@ func TestKronosTimeWithRetries(t *testing.T) {
 		nodes[0].Server.GRPCAddr,
 	)
 	a.NoError(err)
-	kt, err := nodes[0].Server.KronosTimeNow(ctx)
-	kronosTime0 := kt.Time
+	kt0, err := nodes[0].Server.KronosTimeNow(ctx)
 	a.NoError(err)
 	// Verify kronos time is of Node 0
-	a.Equal(kronosTime0, kronosTime20.Time)
-	kt, err = nodes[2].Server.KronosTimeNow(ctx)
-	node2Time := kt.Time
+	a.Equal(kt0.Time, kronosTime20.Time)
+	kt2, err := nodes[2].Server.KronosTimeNow(ctx)
 	a.NoError(err)
-	a.NotEqual(kronosTime20.Time, node2Time)
+	a.NotEqual(kronosTime20.Time, kt2.Time)
+	// Verify with Kronos uptime.
+	ut0, err := nodes[0].Server.KronosUptimeNow(ctx)
+	a.NoError(err)
+	// Verify kronos time is of Node 0
+	a.Equal(ut0.Uptime, kronosTime20.Uptime)
+	ut2, err := nodes[2].Server.KronosUptimeNow(ctx)
+	a.NoError(err)
+	a.NotEqual(kronosTime20.Uptime, ut2.Uptime)
 
 	// Advance Node 0 Clock and query kronos time again
-	nodes[0].Clock.SetTime(int64(2*time.Hour + 5*time.Second))
+	nodes[0].Clock.AdvanceTime(2*time.Hour + 5*time.Second)
 	// Persist new time cap
 	cluster.Tick(nodes[0])
 	newKronosTime12, err := nodes[2].Server.Client.OracleTime(
@@ -731,16 +855,14 @@ func TestKronosTimeWithRetries(t *testing.T) {
 		nodes[0].Server.GRPCAddr,
 	)
 	a.NoError(err)
-	kt, err = nodes[0].Server.KronosTimeNow(ctx)
-	newKronosTime2 := kt.Time
+	newKt0, err := nodes[0].Server.KronosTimeNow(ctx)
 	a.NoError(err)
-	a.Equal(newKronosTime12.Time, newKronosTime2)
+	a.Equal(newKronosTime12.Time, newKt0.Time)
 	// Verify kronos time is not of Node 1
-	kt, err = nodes[2].Server.KronosTimeNow(ctx)
-	node2Time = kt.Time
+	newKt2, err := nodes[2].Server.KronosTimeNow(ctx)
 	a.NoError(err)
-	a.NotEqual(newKronosTime2, node2Time)
-	a.True(newKronosTime2 > kronosTime0)
+	a.NotEqual(newKt2, newKt0)
+	a.True(newKt0.Time > kt0.Time)
 
 	// Querying Node 1 should give an error since it is not the oracle
 	_, err = nodes[2].Server.Client.OracleTime(
