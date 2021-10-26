@@ -200,7 +200,7 @@ func (k *Server) KronosUptime(
 		t = k.mu.lastKronosUptime
 	}
 
-	k.mu.lastKronosTime = t
+	k.mu.lastKronosUptime = t
 	return &kronospb.KronosUptimeResponse{Uptime: t, UptimeCap: oracleData.KronosUptimeCap}, nil
 }
 
