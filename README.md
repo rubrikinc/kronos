@@ -192,9 +192,8 @@ as a library.
 Kronos requires Go version 1.9+ for immunity against large clock jumps.
 
 **Install**
-- Install Go version 1.10
-- Run `go get github.com/rubrikinc/kronos`
-  This will clone kronos in `$GOPATH/src/github.com/rubrikinc/kronos`
+- Install Go version >= 1.15
+- Clone the repository `git clone https://github.com/rubrikinc/kronos.git && cd kronos`
 
 **Build/Test**
 - Build kronos: `make build` creates a kronos binary.

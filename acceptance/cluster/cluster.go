@@ -632,7 +632,7 @@ func (tc *TestCluster) start(ctx context.Context) error {
 	}
 	if _, err = tc.fs.Stat(goremanBinary); err != nil {
 		if os.IsNotExist(err) {
-			log.Info(ctx, "goreman binary is missing")
+			log.Info(ctx, "goreman binary is missing. Make sure $GOPATH/bin is in $PATH")
 		} else {
 			return err
 		}
