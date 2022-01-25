@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/rubrikinc/kronos/checksumfile"
 	"math"
 	"net"
 	"os"
@@ -21,9 +22,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/rubrikinc/kronos/syncutil"
 
 	"github.com/rubrikinc/kronos/acceptance/testutil"
 	"github.com/rubrikinc/kronos/kronosutil"
@@ -349,7 +348,7 @@ func (tc *TestCluster) nodeID(idx int) (string, error) {
 // RemoveNode removes a node from testCluster and wipes it's data directory
 func (tc *TestCluster) RemoveNode(ctx context.Context, idx int) error {
 	var nodeToRunRemoveFrom int
-	r, _ := randutil.NewPseudoRand()
+	r, _ := checksumfile.NewPseudoRand()
 	if r.Float32() < 0.5 {
 		// Test remove node from the node being removed
 		nodeToRunRemoveFrom = idx
@@ -697,7 +696,8 @@ func NewInsecureCluster(ctx context.Context, cc ClusterConfig) (*TestCluster, er
 // TestCluster should be closed using Close method once test is finished.
 // This returns a cluster which runs in secure mode.
 func NewCluster(ctx context.Context, cc ClusterConfig) (*TestCluster, error) {
-	return newCluster(ctx, cc, false /* insecure */)
+	//return newCluster(ctx, cc, false /* insecure */)
+	return newCluster(ctx, cc, true /* insecure */)
 }
 
 // newCluster returns an instance of a test kronos cluster. It returns
@@ -711,32 +711,33 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 	}
 	var certsDir string
 	if !insecure {
-		certsDir = filepath.Join(testDir, "certs_dir")
-		// The certs related constants are taken from
-		// pkg/acceptance/cluster/dockercluster.go
-		const keyLen = 1024
-		err = security.CreateCAPair(
-			certsDir,
-			filepath.Join(certsDir, security.EmbeddedCAKey),
-			keyLen,
-			96*time.Hour,
-			false, /* allowKeyReuse */
-			false, /* overwrite */
-		)
-		if err != nil {
-			return nil, err
-		}
-		err = security.CreateNodePair(
-			certsDir,
-			filepath.Join(certsDir, security.EmbeddedCAKey),
-			keyLen,
-			48*time.Hour,
-			false, /* overwrite */
-			[]string{localhost},
-		)
-		if err != nil {
-			return nil, err
-		}
+		//certsDir = filepath.Join(testDir, "certs_dir")
+		//// The certs related constants are taken from
+		//// pkg/acceptance/cluster/dockercluster.go
+		//const keyLen = 1024
+		//err = security.CreateCAPair(
+		//	certsDir,
+		//	filepath.Join(certsDir, security.EmbeddedCAKey),
+		//	keyLen,
+		//	96*time.Hour,
+		//	false, /* allowKeyReuse */
+		//	false, /* overwrite */
+		//)
+		//if err != nil {
+		//	return nil, err
+		//}
+		//err = security.CreateNodePair(
+		//	certsDir,
+		//	filepath.Join(certsDir, security.EmbeddedCAKey),
+		//	keyLen,
+		//	48*time.Hour,
+		//	false, /* overwrite */
+		//	[]string{localhost},
+		//)
+		//if err != nil {
+		//	return nil, err
+		//}
+		return nil, errors.New("Can't get secure cluster")
 	}
 
 	tc := &TestCluster{

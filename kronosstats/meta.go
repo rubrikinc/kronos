@@ -1,34 +1,50 @@
 package kronosstats
 
-import "github.com/cockroachdb/cockroach/pkg/util/metric"
+type LabelPair struct {
+	Name                 *string  `protobuf:"bytes,1,opt,name=name" json:"name,omitempty"`
+	Value                *string  `protobuf:"bytes,2,opt,name=value" json:"value,omitempty"`
+	//XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	//XXX_sizecache        int32    `json:"-"`
+}
+
+type Metadata struct {
+	Name                 string         `protobuf:"bytes,1,req,name=name" json:"name"`
+	Help                 string         `protobuf:"bytes,2,req,name=help" json:"help"`
+	Measurement          string         `protobuf:"bytes,3,req,name=measurement" json:"measurement"`
+	Unit                 int32           `protobuf:"varint,4,req,name=unit,enum=cockroach.util.metric.Unit" json:"unit"`
+//	MetricType           _go.MetricType `protobuf:"varint,5,opt,name=metricType,enum=io.prometheus.client.MetricType" json:"metricType"`
+	Labels               []*LabelPair   `protobuf:"bytes,6,rep,name=labels" json:"labels,omitempty"`
+//	XXX_NoUnkeyedLiteral struct{}       `json:"-"`
+//	XXX_sizecache        int32          `json:"-"`
+}
 
 // Fully-qualified names for metrics.
 var (
-	MetaKronosDelta = metric.Metadata{
+	MetaKronosDelta = Metadata{
 		Name: "kronos.delta",
 		Help: "Offset between local time and kronos time"}
-	MetaKronosUptimeDelta = metric.Metadata{
+	MetaKronosUptimeDelta = Metadata{
 		Name: "kronos.uptimedelta",
 		Help: "Offset between local uptime and kronos uptime"}
-	MetaKronosIsOracle = metric.Metadata{
+	MetaKronosIsOracle = Metadata{
 		Name: "kronos.oracle",
 		Help: "1 if the current node is the oracle, 0 otherwise"}
-	MetaKronosOverthrowCounter = metric.Metadata{
+	MetaKronosOverthrowCounter = Metadata{
 		Name: "kronos.overthrow.count",
 		Help: "Number of oracle overthrow attempts"}
-	MetaKronosRTT = metric.Metadata{
+	MetaKronosRTT = Metadata{
 		Name: "kronos.rtt",
 		Help: "RTT of Kronos RPCs"}
-	MetaKronosSyncSuccess = metric.Metadata{
+	MetaKronosSyncSuccess = Metadata{
 		Name: "kronos.sync.success.count",
 		Help: "Number of successful syncs with the oracle"}
-	MetaKronosSyncFailure = metric.Metadata{
+	MetaKronosSyncFailure = Metadata{
 		Name: "kronos.sync.failure.count",
 		Help: "Number of failed syncs with the oracle"}
-	MetaKronosTimeCap = metric.Metadata{
+	MetaKronosTimeCap = Metadata{
 		Name: "kronos.timecap",
 		Help: "Time cap of Kronos"}
-	MetaKronosUptimeCap = metric.Metadata{
+	MetaKronosUptimeCap = Metadata{
 		Name: "kronos.uptimecap",
 		Help: "Time cap of Kronos Uptime"}
 )

@@ -3,13 +3,13 @@ package checksumfile
 import (
 	"bytes"
 	"context"
+	"github.com/rubrikinc/kronos/protoutil"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/rubrikinc/kronos/kronosutil/log"

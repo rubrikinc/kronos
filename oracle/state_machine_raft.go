@@ -2,8 +2,8 @@ package oracle
 
 import (
 	"context"
+	"github.com/rubrikinc/kronos/protoutil"
 
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/scaledata/etcd/snap"
 
 	"github.com/rubrikinc/kronos/kronosutil"

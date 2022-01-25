@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/rubrikinc/kronos/syncutil"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"go.uber.org/atomic"

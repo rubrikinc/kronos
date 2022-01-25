@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/coreos/pkg/capnslog"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
@@ -28,6 +26,7 @@ import (
 
 	"github.com/rubrikinc/kronos/kronoshttp"
 	"github.com/rubrikinc/kronos/kronosutil"
+	"github.com/rubrikinc/kronos/protoutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/metadata"
 	"github.com/rubrikinc/kronos/pb"
@@ -217,7 +216,7 @@ func (rc *raftNode) getNodesIncludingRemoved(
 	ctx context.Context, remote *kronospb.NodeAddr,
 ) (nodes []kronoshttp.Node, err error) {
 	log.Infof(ctx, "Getting nodes from %v", remote)
-	err = retry.ForDuration(
+	err = kronoshttp.ForDuration(
 		time.Minute,
 		func() error {
 			c, err := kronoshttp.NewClusterClient(remote, rc.transport.TLSInfo)
@@ -775,7 +774,7 @@ func (rc *raftNode) startRaft(
 	} else {
 		if !isFirstSH {
 			// Add all hosts to cluster formed by the first seedHost.
-			if err := retry.ForDuration(
+			if err := kronoshttp.ForDuration(
 				time.Minute,
 				func() error {
 					// try on both the seedHosts to maintain one seedHost failure tolerance

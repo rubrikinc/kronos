@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/scaledata/etcd/pkg/types"
 
 	"github.com/rubrikinc/kronos/checksumfile"
@@ -16,7 +15,7 @@ import (
 const nodeIDFileName = "node-info"
 
 func newNodeID() types.ID {
-	r, _ := randutil.NewPseudoRand()
+	r, _ := checksumfile.NewPseudoRand()
 	return types.ID(r.Uint64())
 }
 

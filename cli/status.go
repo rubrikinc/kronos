@@ -11,7 +11,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/spf13/cobra"
 
 	"github.com/rubrikinc/kronos/kronosutil"
@@ -68,7 +67,7 @@ func init() {
 
 func runStatus() {
 	ctx := context.Background()
-	if err := flag.Lookup(logflags.LogToStderrName).Value.Set("false"); err != nil {
+	if err := flag.Lookup("logtostderr").Value.Set("false"); err != nil {
 		panic(err)
 	}
 

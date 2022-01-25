@@ -2,10 +2,8 @@ package oracle
 
 import (
 	"context"
-
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-
+	"github.com/rubrikinc/kronos/syncutil"
+	"github.com/rubrikinc/kronos/protoutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/pb"
 )

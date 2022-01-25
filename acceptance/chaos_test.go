@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/rubrikinc/kronos/syncutil"
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 

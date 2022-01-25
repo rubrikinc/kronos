@@ -3,23 +3,51 @@ package checksumfile
 import (
 	"bytes"
 	"crypto/md5"
+	crypto_rand "crypto/rand"
+	"encoding/binary"
+	"fmt"
+	"github.com/rubrikinc/kronos/protoutil"
 	"hash"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"syscall"
 
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/pkg/errors"
 )
+
+var randLetters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+// RandBytes returns a byte slice of the given length with random
+// data.
+func RandBytes(r *rand.Rand, size int) []byte {
+	if size <= 0 {
+		return nil
+	}
+
+	arr := make([]byte, size)
+	for i := 0; i < len(arr); i++ {
+		arr[i] = randLetters[r.Intn(len(randLetters))]
+	}
+	return arr
+}
+
+
+func NewPseudoRand() (*rand.Rand, int64) {
+	var seed int64
+	if err := binary.Read(crypto_rand.Reader, binary.LittleEndian, &seed); err!= nil {
+		panic(fmt.Sprintf("could not read from crypto/rand: %s", err))
+	}
+	return rand.New(rand.NewSource(seed)), seed
+}
+
 
 // ErrChecksumMismatch is returned when checksum and data don't match for a file
 var ErrChecksumMismatch = errors.New("checksum and data don't match")
 
 func tempFileSuffix() string {
-	rng, _ := randutil.NewPseudoRand()
-	return "tmp." + string(randutil.RandBytes(rng, 6))
+	rng, _ := NewPseudoRand()
+	return "tmp." + string(RandBytes(rng, 6))
 }
 
 // checksumedFile only supports complete rewrites. It internally serializes the

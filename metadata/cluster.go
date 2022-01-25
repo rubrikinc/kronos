@@ -3,15 +3,15 @@ package metadata
 import (
 	"bytes"
 	"fmt"
+	"github.com/rubrikinc/kronos/protoutil"
 	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"text/tabwriter"
 
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/pkg/errors"
+	"github.com/rubrikinc/kronos/syncutil"
 	"github.com/scaledata/etcd/pkg/fileutil"
 
 	"github.com/rubrikinc/kronos/checksumfile"

@@ -2,9 +2,9 @@ package oracle
 
 import (
 	"context"
+	"github.com/rubrikinc/kronos/protoutil"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/rubrikinc/kronos/pb"

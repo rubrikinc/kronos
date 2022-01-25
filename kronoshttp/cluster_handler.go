@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/pkg/errors"
 	"github.com/scaledata/etcd/pkg/types"
 	"github.com/scaledata/etcd/raft/sdraftpb"
@@ -115,6 +114,21 @@ func NewClusterHandler(
 		grpcAddr:               grpcAddr,
 	}
 }
+func ForDuration(duration time.Duration, fn func() error) error {
+	deadline := time.Now().Add(duration)
+	var lastErr error
+	for wait := time.Duration(1); time.Now().Before(deadline); wait *= 2 {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if wait > time.Second {
+			wait = time.Second
+		}
+		time.Sleep(wait)
+	}
+	return lastErr
+}
 
 // tryConfChange proposes a confChange cc to confChangeC and retries till verify
 // returns true.
@@ -145,7 +159,7 @@ func tryConfChange(
 		return nil
 	}
 	// retry till the request times out or verify returns true.
-	return retry.ForDuration(
+	return ForDuration(
 		timeout,
 		func() error {
 			confChangeC <- cc

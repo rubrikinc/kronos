@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/rubrikinc/kronos/syncutil"
 
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/pb"

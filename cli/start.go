@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"github.com/rubrikinc/kronos/protoutil"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -11,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 

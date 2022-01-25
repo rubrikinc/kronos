@@ -2,15 +2,13 @@ package log
 
 import (
 	"context"
-
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"sync"
 )
 
 type kronosLogger struct {
-	syncutil.Mutex
+	sync.Mutex
 	l Logger
 }
-
 var logger = &kronosLogger{l: &simpleLogger{}}
 
 // Logger can be be used to override the logger used by kronos
