@@ -18,6 +18,11 @@ func (g Gauge) Update(i int64)  {
 
 }
 
+func (g Gauge) Value() int64 {
+	return 0
+}
+
+
 // NewGauge creates a Gauge.
 func NewGauge(metadata Metadata) *Gauge {
 	return &Gauge{metadata, new(int64), nil}
