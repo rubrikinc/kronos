@@ -3,7 +3,7 @@ package log
 import (
 	"context"
 
-	"log"
+	log "github.com/sirupsen/logrus"
 )
 
 type simpleLogger struct {
@@ -70,13 +70,12 @@ func (s *simpleLogger) FatalfDepth(ctx context.Context, depth int, format string
 }
 
 func (s *simpleLogger) V(level int32) bool {
-	log.SetPrefix(string(level))
+	log.SetLevel(log.TraceLevel)
 	return true
 }
 
 func (s *simpleLogger) WithLogTag(ctx context.Context, name string, value interface{}) context.Context {
-	log.SetPrefix(name)
-	log.Println(value)
+	log.WithField(name, value)
 	return ctx
 }
 

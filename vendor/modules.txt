@@ -83,6 +83,9 @@ github.com/scaledata/etcd/snap/sdsnappb
 github.com/scaledata/etcd/version
 github.com/scaledata/etcd/wal
 github.com/scaledata/etcd/wal/sdwalpb
+# github.com/sirupsen/logrus v1.8.1
+## explicit
+github.com/sirupsen/logrus
 # github.com/spf13/afero v1.1.1
 ## explicit
 github.com/spf13/afero
@@ -114,9 +117,9 @@ golang.org/x/net/trace
 # golang.org/x/sync v0.0.0-20170927054112-8e0aa688b654
 ## explicit
 golang.org/x/sync/errgroup
-# golang.org/x/sys v0.0.0-20180905080454-ebe1bf3edb33
-## explicit
+# golang.org/x/sys v0.0.0-20191026070338-33540a1f6037
 golang.org/x/sys/unix
+golang.org/x/sys/windows
 # golang.org/x/text v0.3.0
 ## explicit
 golang.org/x/text/secure/bidirule
@@ -159,4 +162,3 @@ google.golang.org/grpc/status
 google.golang.org/grpc/tap
 # gopkg.in/yaml.v2 v2.2.1
 ## explicit
-# github.com/codahale/hdrhistogram => github.com/HdrHistogram/hdrhistogram-go v0.9.0
