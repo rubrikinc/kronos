@@ -21,7 +21,7 @@ require (
 	github.com/coreos/go-systemd v0.0.0-20180511133405-39ca1b05acc7 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/golang/glog v1.0.0 // indirect
-	github.com/golang/protobuf v1.2.0 // indirect
+	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/inconshreveable/mousetrap v1.0.0 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
 	github.com/petermattis/goid v0.0.0-20180202154549-b0b1615b78e5
