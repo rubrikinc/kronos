@@ -63,7 +63,7 @@ github.com/prometheus/procfs/xfs
 # github.com/sasha-s/go-deadlock v0.2.0
 ## explicit
 github.com/sasha-s/go-deadlock
-# github.com/scaledata/etcd v3.3.9-0.20180723183617-caf3fa4c48ff+incompatible
+# github.com/scaledata/etcd v3.3.9-0.20220505204322-89c62c604f5d+incompatible
 ## explicit
 github.com/scaledata/etcd/etcdserver/stats
 github.com/scaledata/etcd/pkg/crc
