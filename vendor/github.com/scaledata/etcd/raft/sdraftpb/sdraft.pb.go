@@ -5,7 +5,7 @@
 	Package sdraftpb is a generated protocol buffer package.
 
 	It is generated from these files:
-		raft.proto
+		sdraft.proto
 
 	It has these top-level messages:
 		Entry
