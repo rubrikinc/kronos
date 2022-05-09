@@ -1946,7 +1946,7 @@ var (
 	ErrIntOverflowRaft   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("raft.proto", fileDescriptorRaft) }
+func init() { proto.RegisterFile("sdraft.proto", fileDescriptorRaft) }
 
 var fileDescriptorRaft = []byte{
 	// 816 bytes of a gzipped FileDescriptorProto

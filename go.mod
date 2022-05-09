@@ -6,7 +6,7 @@ require (
 	github.com/coreos/pkg v0.0.0-20180108230652-97fdf19511ea
 	github.com/gogo/protobuf v1.1.1
 	github.com/pkg/errors v0.8.0
-        github.com/scaledata/etcd v3.3.9-0.20220509221515-45edc5027b5d+incompatible
+        github.com/scaledata/etcd v3.3.9-0.20220509223953-d81e03140099+incompatible
 	github.com/spf13/afero v1.1.1
 	github.com/spf13/cobra v0.0.3
 	github.com/stretchr/testify v1.2.2
