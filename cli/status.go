@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -67,9 +66,6 @@ func init() {
 
 func runStatus() {
 	ctx := context.Background()
-	if err := flag.Lookup("logtostderr").Value.Set("false"); err != nil {
-		panic(err)
-	}
 
 	if statusCtx.timeout != 0 {
 		var cancelCtx func()
