@@ -261,12 +261,16 @@ func (c *Cluster) PrettyPrint() (string, error) {
 	fmt.Fprintf(tw, fmt.Sprintf(format, "ID", "Address", "IsRemoved"))
 	for _, id := range ids {
 		node := c.mu.cluster.AllNodes[id]
+		nodeAddrIfPresent := ""
+		if node.RaftAddr != nil {
+			nodeAddrIfPresent = net.JoinHostPort(node.RaftAddr.Host, node.RaftAddr.Port)
+		}
 		fmt.Fprintf(
 			tw,
 			fmt.Sprintf(
 				format,
 				id,
-				net.JoinHostPort(node.RaftAddr.Host, node.RaftAddr.Port),
+				nodeAddrIfPresent,
 				node.IsRemoved,
 			),
 		)
