@@ -205,7 +205,7 @@ github.com/sasha-s/go-deadlock
 # github.com/satori/go.uuid v1.2.0
 ## explicit
 github.com/satori/go.uuid
-# github.com/scaledata/etcd v3.3.9-0.20180723183617-caf3fa4c48ff+incompatible
+# github.com/scaledata/etcd v4.0.0-rubrik+incompatible
 ## explicit
 github.com/scaledata/etcd/etcdserver/stats
 github.com/scaledata/etcd/pkg/crc
