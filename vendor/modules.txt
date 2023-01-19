@@ -11,7 +11,6 @@ github.com/coreos/go-systemd/journal
 ## explicit
 github.com/coreos/pkg/capnslog
 # github.com/davecgh/go-spew v1.1.1
-## explicit
 github.com/davecgh/go-spew/spew
 # github.com/gogo/protobuf v1.1.1
 ## explicit
@@ -41,7 +40,6 @@ github.com/petermattis/goid
 ## explicit
 github.com/pkg/errors
 # github.com/pmezard/go-difflib v1.0.0
-## explicit
 github.com/pmezard/go-difflib/difflib
 # github.com/prometheus/client_golang v0.8.0
 ## explicit
@@ -63,7 +61,7 @@ github.com/prometheus/procfs/xfs
 # github.com/sasha-s/go-deadlock v0.2.0
 ## explicit
 github.com/sasha-s/go-deadlock
-# github.com/scaledata/etcd v3.3.9-0.20220509223953-d81e03140099+incompatible
+# github.com/scaledata/etcd v4.0.0-rubrik+incompatible
 ## explicit
 github.com/scaledata/etcd/etcdserver/stats
 github.com/scaledata/etcd/pkg/crc
