@@ -62,16 +62,21 @@ func Now() int64 {
 	// This function blocks if not initialized or if KronosTime is stale
 	const timePollInterval = 100 * time.Millisecond
 	ctx := context.TODO()
+	var count = 0
 
 	for {
 		kt, err := kronosServer.KronosTimeNow(ctx)
 		if err != nil {
-			log.Errorf(
-				ctx,
-				"Failed to get KronosTime, err: %v. Sleeping for %s before retrying.",
-				err, timePollInterval,
-			)
+			// We print the first 10 retries, then every 10th retry until 200 retries, and then every 100th retry
+			if count < 10 || (count < 200 && count%10 == 0) || count%100 == 0 {
+				log.Errorf(
+					ctx,
+					"Failed to get KronosTime after %d retries, err: %v. Sleeping for %s before retrying.",
+					count, err, timePollInterval,
+				)
+			}
 			time.Sleep(timePollInterval)
+			count += 1
 			continue
 		}
 		return kt.Time
