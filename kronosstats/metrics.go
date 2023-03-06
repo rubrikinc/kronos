@@ -1,67 +1,36 @@
 package kronosstats
 
-type Gauge struct {
-	Metadata
-	value *int64
-	fn    func() int64
+type Gauge interface {
+	Value() int64
+	Update(int64)
 }
 
-func (g Gauge) Inc(i int64)  {
-
+type Counter interface {
+	Inc(int64)
 }
 
-func (g Gauge) RecordValue(i int64)  {
-
-}
-
-func (g Gauge) Update(i int64)  {
-
-}
-
-func (g Gauge) Value() int64 {
-	return 0
-}
-
-
-// NewGauge creates a Gauge.
-func NewGauge(metadata Metadata) *Gauge {
-	return &Gauge{metadata, new(int64), nil}
+type Histogram interface {
+	RecordValue(int64)
 }
 
 // KronosMetrics is used to record metrics of Kronos
 type KronosMetrics struct {
 	// Delta is the offset between local time with kronos time.
-	Delta *Gauge
+	Delta Gauge
 	// UptimeDelta is the offset between local time with kronos uptime.
-	UptimeDelta *Gauge
+	UptimeDelta Gauge
 	// IsOracle is 1 if the current server is the oracle, otherwise 0.
-	IsOracle *Gauge
+	IsOracle Gauge
 	// OverthrowAttemptCount is the number of oracle overthrow attempts.
-	OverthrowAttemptCount *Gauge
+	OverthrowAttemptCount Counter
 	// RTT is the histogram of RTT of oracle time queries.
-	RTT *Gauge
+	RTT Histogram
 	// SyncSuccessCount is the number of successful time syncs with the oracle.
-	SyncSuccessCount *Gauge
+	SyncSuccessCount Counter
 	// SyncFailureCount is the number of failed time syncs with the oracle.
-	SyncFailureCount *Gauge
+	SyncFailureCount Counter
 	// TimeCap is an upper bound to kronos time.
-	TimeCap *Gauge
+	TimeCap Gauge
 	// TimeCap is an upper bound to kronos uptime.
-	UptimeCap *Gauge
-}
-
-// NewMetrics returns KronosMetrics which can be used to record metrics
-func NewMetrics() *KronosMetrics {
-	return &KronosMetrics{
-		// Percentile values of RTT is over last 1 minute
-		Delta:                 NewGauge(MetaKronosDelta),
-		UptimeDelta:           NewGauge(MetaKronosUptimeDelta),
-		IsOracle:              NewGauge(MetaKronosIsOracle),
-		OverthrowAttemptCount: NewGauge(MetaKronosOverthrowCounter),
-		RTT:                   NewGauge(MetaKronosRTT),
-		SyncFailureCount:      NewGauge(MetaKronosSyncFailure),
-		SyncSuccessCount:      NewGauge(MetaKronosSyncSuccess),
-		TimeCap:               NewGauge(MetaKronosTimeCap),
-		UptimeCap:             NewGauge(MetaKronosUptimeCap),
-	}
+	UptimeCap Gauge
 }

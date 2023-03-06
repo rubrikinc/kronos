@@ -2,10 +2,11 @@ package cli
 
 import (
 	"context"
-	"github.com/rubrikinc/kronos/protoutil"
 	"io/ioutil"
 	"net"
 	"net/http"
+
+	"github.com/rubrikinc/kronos/protoutil"
 
 	// net/http/pprof is included for profiling
 	_ "net/http/pprof"

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/rubrikinc/kronos/checksumfile"
 	"math"
 	"net"
 	"os"
@@ -16,6 +15,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/rubrikinc/kronos/checksumfile"
 
 	"github.com/pkg/errors"
 	"github.com/spf13/afero"
@@ -102,7 +103,7 @@ func (t *testNode) kronosStartCmd(
 ) string {
 	kronosCmd := []string{
 		kronosBinary,
-		"--log-dir", t.logDir,
+		//"--log-dir", t.logDir,
 		"start",
 		"--advertise-host", localhost,
 		"--raft-port", t.raftPort,
@@ -534,12 +535,12 @@ func (tc *TestCluster) ReIP(ctx context.Context) error {
 		}
 	}
 	for _, node := range tc.Nodes {
-		reIPLogDir, err := afero.TempDir(tc.fs, node.logDir, "reIp")
+		_, err := afero.TempDir(tc.fs, node.logDir, "reIp")
 		if err != nil {
 			return err
 		}
 		reIPArgs := []string{
-			"--log-dir", reIPLogDir,
+			//"--log-dir", reIPLogDir,
 			"cluster",
 			"re_ip",
 			"--mapping-file", tempFile.Name(),

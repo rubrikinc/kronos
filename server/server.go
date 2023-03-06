@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rubrikinc/kronos/syncutil"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
+	"github.com/rubrikinc/kronos/syncutil"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 
@@ -726,12 +726,17 @@ type Config struct {
 	ManageOracleTickInterval time.Duration
 	// Clock is the interface which is used to access system time inside server.
 	Clock tm.Clock
+	// Metrics
+	Metrics *kronosstats.KronosMetrics
 }
 
 // NewKronosServer returns an instance of Server based on given
 // configurations
 func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 	oracleSM := oracle.NewRaftStateMachine(ctx, config.RaftConfig)
+	if config.Metrics == nil {
+		config.Metrics = kronosstats.NewTestMetrics()
+	}
 
 	return &Server{
 		Clock:                    config.Clock,
@@ -745,6 +750,6 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 		OracleTimeCapDelta:       config.OracleTimeCapDelta,
 		OracleUptimeCapDelta:     config.OracleUptimeCapDelta,
 		manageOracleTickInterval: config.ManageOracleTickInterval,
-		Metrics:                  kronosstats.NewMetrics(),
+		Metrics:                  config.Metrics,
 	}, nil
 }

@@ -6,12 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-
 	"github.com/rubrikinc/kronos/kronosstats"
 	"github.com/rubrikinc/kronos/oracle"
 	"github.com/rubrikinc/kronos/pb"
 	"github.com/rubrikinc/kronos/tm"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestOracleTime(t *testing.T) {
@@ -550,7 +549,7 @@ func TestSyncWithOracle(t *testing.T) {
 			server := &Server{
 				Client:  tc.mockClient,
 				Clock:   clk,
-				Metrics: kronosstats.NewMetrics(),
+				Metrics: kronosstats.NewTestMetrics(),
 			}
 
 			err := server.trySyncWithOracle(
@@ -586,7 +585,7 @@ func TestOverthrowPolicy(t *testing.T) {
 		Clock:    tm.NewManualClock(),
 		OracleSM: sm,
 		GRPCAddr: nodes[0],
-		Metrics:  kronosstats.NewMetrics(),
+		Metrics:  kronosstats.NewTestMetrics(),
 	}
 	sm.SubmitProposal(ctx, &kronospb.OracleProposal{
 		ProposedState: &kronospb.OracleState{

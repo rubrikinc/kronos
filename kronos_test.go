@@ -2,10 +2,10 @@ package kronos
 
 import (
 	"context"
-	leaktest "github.com/rubrikinc/kronos/crdbutils"
 	"testing"
 	"time"
 
+	leaktest "github.com/rubrikinc/kronos/crdbutils"
 
 	"github.com/stretchr/testify/assert"
 

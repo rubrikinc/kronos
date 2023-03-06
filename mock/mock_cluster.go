@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/rubrikinc/kronos/kronosstats"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/rubrikinc/kronos/kronosstats"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/oracle"
 	"github.com/rubrikinc/kronos/pb"
@@ -251,6 +251,6 @@ func NewServerForTest(
 		StopC:                make(chan struct{}),
 		OracleTimeCapDelta:   oracleTimeCapDelta,
 		OracleUptimeCapDelta: oracleUptimeCapDelta,
-		Metrics:              kronosstats.NewMetrics(),
+		Metrics:              kronosstats.NewTestMetrics(),
 	}
 }
