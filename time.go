@@ -3,6 +3,7 @@ package kronos
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/rubrikinc/kronos/kronoshttp"
@@ -144,4 +145,38 @@ func Metrics() *kronosstats.KronosMetrics {
 		return nil
 	}
 	return kronosServer.Metrics
+}
+
+// GetTime returns kronos time and an error if not able to
+// get time within timeout
+func GetTime(timeout time.Duration) (int64, error) {
+	if kronosServer == nil {
+		log.Fatalf(context.TODO(), "Kronos server is not initialized")
+	}
+	// timePollInterval is the time to wait before internally retrying
+	// this function.
+	// This function blocks if not initialized or if KronosTime is stale
+	const timePollInterval = 100 * time.Millisecond
+	ctx := context.TODO()
+	var count = 0
+	start := time.Now()
+	for timeout == 0 || time.Since(start) < timeout {
+		kt, err := kronosServer.KronosTimeNow(ctx)
+		if err != nil {
+			// We print the first 10 retries, then every 10th retry until 200 retries, and then every 100th retry
+			if count < 10 || (count < 200 && count%10 == 0) || count%100 == 0 {
+				log.Errorf(
+					ctx,
+					"Failed to get KronosTime after %d retries, err: %v. Sleeping for %s before retrying.",
+					count, err, timePollInterval,
+				)
+			}
+			time.Sleep(timePollInterval)
+			count += 1
+			continue
+		}
+		return kt.Time, nil
+	}
+	return 0, errors.New(fmt.Sprintf(
+		"Couldn't get kronos time within timeout - %v", timeout))
 }
