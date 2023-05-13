@@ -12,8 +12,8 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-// +build !deadlock
-// +build race
+//go:build !deadlock && race
+// +build !deadlock,race
 
 package syncutil
 

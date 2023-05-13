@@ -6,7 +6,6 @@ import (
 	crypto_rand "crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"github.com/rubrikinc/kronos/protoutil"
 	"hash"
 	"io/ioutil"
 	"math/rand"
@@ -14,10 +13,13 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/rubrikinc/kronos/protoutil"
+
 	"github.com/pkg/errors"
 )
 
 var randLetters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
 // RandBytes returns a byte slice of the given length with random
 // data.
 func RandBytes(r *rand.Rand, size int) []byte {
@@ -32,15 +34,13 @@ func RandBytes(r *rand.Rand, size int) []byte {
 	return arr
 }
 
-
 func NewPseudoRand() (*rand.Rand, int64) {
 	var seed int64
-	if err := binary.Read(crypto_rand.Reader, binary.LittleEndian, &seed); err!= nil {
+	if err := binary.Read(crypto_rand.Reader, binary.LittleEndian, &seed); err != nil {
 		panic(fmt.Sprintf("could not read from crypto/rand: %s", err))
 	}
 	return rand.New(rand.NewSource(seed)), seed
 }
-
 
 // ErrChecksumMismatch is returned when checksum and data don't match for a file
 var ErrChecksumMismatch = errors.New("checksum and data don't match")

@@ -2,8 +2,9 @@ package oracle
 
 import (
 	"context"
-	"github.com/rubrikinc/kronos/protoutil"
 	"testing"
+
+	"github.com/rubrikinc/kronos/protoutil"
 
 	"github.com/stretchr/testify/assert"
 

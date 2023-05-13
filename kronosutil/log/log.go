@@ -9,6 +9,7 @@ type kronosLogger struct {
 	sync.Mutex
 	l Logger
 }
+
 var logger = &kronosLogger{l: &simpleLogger{}}
 
 // Logger can be be used to override the logger used by kronos

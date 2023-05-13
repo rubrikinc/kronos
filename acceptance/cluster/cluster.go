@@ -103,7 +103,6 @@ func (t *testNode) kronosStartCmd(
 ) string {
 	kronosCmd := []string{
 		kronosBinary,
-		//"--log-dir", t.logDir,
 		"start",
 		"--advertise-host", localhost,
 		"--raft-port", t.raftPort,
@@ -637,6 +636,10 @@ func (tc *TestCluster) start(ctx context.Context) error {
 			return err
 		}
 	}
+	if tc.goremanCmd != nil {
+		tc.goremanCmd.Wait()
+	}
+
 	tc.goremanCmd = exec.Command(
 		goremanBinary,
 		"-p",
@@ -651,12 +654,6 @@ func (tc *TestCluster) start(ctx context.Context) error {
 		}
 		return err
 	}
-
-	go func() {
-		if err := tc.goremanCmd.Wait(); err != nil {
-			tc.ErrCh <- err
-		}
-	}()
 
 	return nil
 }

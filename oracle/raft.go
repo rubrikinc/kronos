@@ -26,10 +26,10 @@ import (
 
 	"github.com/rubrikinc/kronos/kronoshttp"
 	"github.com/rubrikinc/kronos/kronosutil"
-	"github.com/rubrikinc/kronos/protoutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/metadata"
 	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/protoutil"
 )
 
 // This code in this file is based on
@@ -239,7 +239,8 @@ func (rc *raftNode) getNodesIncludingRemoved(
 }
 
 // extraNodes returns 2 sets, one set containing the nodes present in set A, but
-//  not in B. Other set is one present in set B, but not in A.
+//
+//	not in B. Other set is one present in set B, but not in A.
 func extraNodes(
 	setA map[string]*kronospb.Node, setB []uint64,
 ) (extraInA map[string]struct{}, extraInB map[string]struct{}) {

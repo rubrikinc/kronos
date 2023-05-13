@@ -59,7 +59,6 @@ func Unmarshal(data []byte, pb Message) error {
 	return pb.Unmarshal(data)
 }
 
-
 func Clone(pb Message) Message {
 	//if t, ok := uncloneable(pb); ok {
 	//	panic(fmt.Sprintf("attempt to clone %T, which contains uncloneable field of type %s", pb, t))

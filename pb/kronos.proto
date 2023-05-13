@@ -113,31 +113,31 @@ message StatusResponse {
 }
 
 service TimeService {
-    // OracleTime returns the server's KronosTime if the server believes it is
-    // the oracle, otherwise it returns an error.
-    // A distributed state machine is used to store the identity of the oracle
-    // and it is used by the server to know if it should respond to OracleTime
-    // requests.
-    // This RPC is used internally by kronos nodes to sync time with the elected
-    // oracle.
-    // This returns an error if
-    // 1. The server is not the current oracle.
-    // 2. The server is not initialized.
-    // 3. The server's KronosTime is stale (KronosTime > Time Cap). This can
-    //    mean that the cluster has lost a quorum of the nodes.
-    rpc OracleTime (OracleTimeRequest) returns (OracleTimeResponse) {}
-    // KronosTime returns the server's KronosTime. An application can call this
-    // RPC on the local kronos server to get access to KronosTime.
-    // This does not validate whether the server is the oracle.
-    // This returns an error if the server is not initialized or has
-    // a stale KronosTime (KronosTime > Time Cap).
-    rpc KronosTime (KronosTimeRequest) returns (KronosTimeResponse) {}
-    // KronosTime returns the server's KronosUptime. An application can call this
-    // RPC on the local kronos server to get access to KronosUptime.
-    // This does not validate whether the server is the oracle.
-    // This returns an error if the server is not initialized or has
-    // a stale KronosUptime (KronosUptime > Kronos Uptime Time Cap).
-    rpc KronosUptime (KronosUptimeRequest) returns (KronosUptimeResponse) {}
-    // Status returns the status of the server.
-    rpc Status (StatusRequest) returns (StatusResponse) {}
+  // OracleTime returns the server's KronosTime if the server believes it is
+  // the oracle, otherwise it returns an error.
+  // A distributed state machine is used to store the identity of the oracle
+  // and it is used by the server to know if it should respond to OracleTime
+  // requests.
+  // This RPC is used internally by kronos nodes to sync time with the elected
+  // oracle.
+  // This returns an error if
+  // 1. The server is not the current oracle.
+  // 2. The server is not initialized.
+  // 3. The server's KronosTime is stale (KronosTime > Time Cap). This can
+  //    mean that the cluster has lost a quorum of the nodes.
+  rpc OracleTime (OracleTimeRequest) returns (OracleTimeResponse) {}
+  // KronosTime returns the server's KronosTime. An application can call this
+  // RPC on the local kronos server to get access to KronosTime.
+  // This does not validate whether the server is the oracle.
+  // This returns an error if the server is not initialized or has
+  // a stale KronosTime (KronosTime > Time Cap).
+  rpc KronosTime (KronosTimeRequest) returns (KronosTimeResponse) {}
+  // KronosTime returns the server's KronosUptime. An application can call this
+  // RPC on the local kronos server to get access to KronosUptime.
+  // This does not validate whether the server is the oracle.
+  // This returns an error if the server is not initialized or has
+  // a stale KronosUptime (KronosUptime > Kronos Uptime Time Cap).
+  rpc KronosUptime (KronosUptimeRequest) returns (KronosUptimeResponse) {}
+  // Status returns the status of the server.
+  rpc Status (StatusRequest) returns (StatusResponse) {}
 }

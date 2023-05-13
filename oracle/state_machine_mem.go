@@ -2,10 +2,11 @@ package oracle
 
 import (
 	"context"
-	"github.com/rubrikinc/kronos/syncutil"
-	"github.com/rubrikinc/kronos/protoutil"
+
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/protoutil"
+	"github.com/rubrikinc/kronos/syncutil"
 )
 
 // inMemStateMachine is an in-memory implementation of StateMachine

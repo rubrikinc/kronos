@@ -13,7 +13,6 @@ import (
 	"github.com/scaledata/etcd/pkg/transport"
 
 	"github.com/rubrikinc/kronos/kronosutil"
-	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/pb"
 )
 
@@ -68,12 +67,6 @@ func (c *ClusterClient) AddNode(ctx context.Context, request *AddNodeRequest) er
 		return err
 	}
 	addNodeURL := kronosutil.AddToURLPath(c.url, requestTypeAdd)
-	log.Infof(
-		ctx,
-		"AddNode URL: %s, request: %s",
-		addNodeURL.String(),
-		string(requestJSON),
-	)
 	httpReq, err := http.NewRequest(
 		http.MethodPost,
 		addNodeURL.String(),
@@ -108,12 +101,6 @@ func (c *ClusterClient) RemoveNode(ctx context.Context, request *RemoveNodeReque
 		return err
 	}
 	removeNodeURL := kronosutil.AddToURLPath(c.url, requestTypeRemove)
-	log.Infof(
-		ctx,
-		"RemoveNode URL: %s, request: %s",
-		removeNodeURL.String(),
-		string(requestJSON),
-	)
 	httpReq, err := http.NewRequest(
 		http.MethodPost,
 		removeNodeURL.String(),
@@ -144,11 +131,6 @@ func (c *ClusterClient) RemoveNode(ctx context.Context, request *RemoveNodeReque
 // server of ClusterClient.
 func (c *ClusterClient) Nodes(ctx context.Context) ([]Node, error) {
 	nodesURL := kronosutil.AddToURLPath(c.url, requestTypeNodes)
-	log.Infof(
-		ctx,
-		"Get nodes URL: %s",
-		nodesURL.String(),
-	)
 	httpReq, err := http.NewRequest(
 		http.MethodGet,
 		nodesURL.String(),

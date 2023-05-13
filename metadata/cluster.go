@@ -3,12 +3,13 @@ package metadata
 import (
 	"bytes"
 	"fmt"
-	"github.com/rubrikinc/kronos/protoutil"
 	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"text/tabwriter"
+
+	"github.com/rubrikinc/kronos/protoutil"
 
 	"github.com/pkg/errors"
 	"github.com/rubrikinc/kronos/syncutil"
