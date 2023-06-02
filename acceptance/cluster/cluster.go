@@ -330,9 +330,9 @@ func (tc *TestCluster) OracleForNode(ctx context.Context, nodeIdx int) (int, err
 	return idx, nil
 }
 
-// nodeID returns the raft id of the idx node. It reads cluster
+// NodeID returns the raft id of the idx node. It reads cluster
 // metadata of idx node to get the same.
-func (tc *TestCluster) nodeID(idx int) (string, error) {
+func (tc *TestCluster) NodeID(idx int) (string, error) {
 	c, err := metadata.LoadCluster(tc.Nodes[idx].dataDir, true /*readOnly*/)
 	if err != nil {
 		return "", err
@@ -346,22 +346,27 @@ func (tc *TestCluster) nodeID(idx int) (string, error) {
 }
 
 // RemoveNode removes a node from testCluster and wipes it's data directory
-func (tc *TestCluster) RemoveNode(ctx context.Context, idx int) error {
-	var nodeToRunRemoveFrom int
-	r, _ := checksumfile.NewPseudoRand()
-	if r.Float32() < 0.5 {
-		// Test remove node from the node being removed
-		nodeToRunRemoveFrom = idx
-	} else {
-		// Test remove node from a node not being removed (idx of 0 or 1)
-		if idx == 0 {
-			nodeToRunRemoveFrom = 1
+func (tc *TestCluster) RemoveNode(ctx context.Context, idx int, nodeToRunRemoveFrom int, nodeID string) error {
+	if nodeToRunRemoveFrom == -1 {
+		r, _ := checksumfile.NewPseudoRand()
+		if r.Float32() < 0.5 {
+			// Test remove node from the node being removed
+			nodeToRunRemoveFrom = idx
+		} else {
+			// Test remove node from a node not being removed (idx of 0 or 1)
+			if idx == 0 {
+				nodeToRunRemoveFrom = 1
+			} else {
+				nodeToRunRemoveFrom = 0
+			}
 		}
 	}
 
-	log.Infof(ctx, "Removing node %d from node %d", idx, nodeToRunRemoveFrom)
-
-	nodeID, err := tc.nodeID(idx)
+	var err error
+	if idx != -1 {
+		nodeID, err = tc.NodeID(idx)
+	}
+	log.Infof(ctx, "Removing node %v from node %d", nodeID, nodeToRunRemoveFrom)
 	if err != nil {
 		return err
 	}
@@ -378,15 +383,19 @@ func (tc *TestCluster) RemoveNode(ctx context.Context, idx int) error {
 	).CombinedOutput(); err != nil {
 		return errors.Wrapf(err, "Output: %s", string(output))
 	}
-	if err := tc.RunOperation(ctx, Stop, idx); err != nil {
-		return err
+	if idx != -1 {
+		if err := tc.RunOperation(ctx, Stop, idx); err != nil {
+			return err
+		}
+		// deleting the data directory, as we don't support recommission of node to
+		// kronos cluster yet.
+		return tc.fs.RemoveAll(tc.Nodes[idx].dataDir)
+	} else {
+		return nil
 	}
-	// deleting the data directory, as we don't support recommission of node to
-	// kronos cluster yet.
-	return tc.fs.RemoveAll(tc.Nodes[idx].dataDir)
 }
 
-// AddNode adds a new node to testCluster and returns the newly assigned nodeID.
+// AddNode adds a new node to testCluster and returns the newly assigned NodeID.
 func (tc *TestCluster) AddNode(ctx context.Context, idx int) (string, error) {
 	log.Infof(ctx, "Adding node %d to the cluster", idx)
 	if _, err := os.Stat(tc.Nodes[idx].dataDir); err == nil || os.IsExist(err) {

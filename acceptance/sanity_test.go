@@ -385,7 +385,7 @@ func TestKronosSanityAddRemove(t *testing.T) {
 
 	// remove node 2
 	nodeToRemove := 2
-	if err := tc.RemoveNode(ctx, nodeToRemove); err != nil {
+	if err := tc.RemoveNode(ctx, nodeToRemove, -1, ""); err != nil {
 		t.Fatal(err)
 	}
 	_, err = tc.Time(ctx, nodeToRemove)
@@ -442,7 +442,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 
 	// utility functions
 	removeNode := func(idx int) {
-		if err := tc.RemoveNode(ctx, idx); err != nil {
+		if err := tc.RemoveNode(ctx, idx, -1, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -555,4 +555,58 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	isRemoved, err := tc.Nodes[2].IsNodeRemoved(nodeIDForNewNode)
 	a.NoError(err)
 	a.True(isRemoved)
+}
+
+func TestKronosSanityDuplicateNodes(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 4
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			RaftSnapCount:            2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+	// give some time to elect the oracle
+	time.Sleep(kronosStabilizationBufferTime)
+
+	WipeAndAdd := func(idx int) {
+		dataDir := tc.Nodes[idx].DataDir()
+		oldNodeID, err := tc.NodeID(idx)
+		a.NoError(err)
+		tc.RunOperation(ctx, cluster.Stop, idx)
+		fs.RemoveAll(dataDir)
+		_, err = tc.AddNode(ctx, idx)
+		time.Sleep(kronosStabilizationBufferTime)
+		// Node idx should not come up since a node with
+		// same raft-addr already exists in the cluster
+		_, err = tc.Time(ctx, idx)
+		a.Error(err)
+		// Add the node back by removing it first
+		time.Sleep(kronosStabilizationBufferTime)
+		a.NoError(tc.RemoveNode(ctx, -1, idx^1, oldNodeID))
+		time.Sleep(kronosStabilizationBufferTime)
+		a.NoError(tc.RunOperation(ctx, cluster.Start, idx))
+		time.Sleep(kronosStabilizationBufferTime)
+		timeMap, uptimeMap, err := tc.ValidateTimeInConsensus(ctx,
+			50*time.Millisecond, false)
+		a.NoError(err)
+		a.Contains(timeMap, idx)
+		a.Contains(uptimeMap, idx)
+	}
+	// Non-seed node
+	WipeAndAdd(2)
+	// first seed node wipe and add
+	// is not supported yet. It will form a cluster
+	// of size 1 independent of the other nodes.
+	//WipeAndAdd(0)
 }

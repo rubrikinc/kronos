@@ -246,7 +246,7 @@ func (d *AddRemovePolicy) Inject(
 	// Getting a number from [2, num_nodes-1) to avoid removing seedHosts.
 	d.nodeToRemove = rand.Intn(len(tc.Nodes)-2) + 2
 	log.Infof(ctx, "Removing node %d", d.nodeToRemove)
-	if err := tc.RemoveNode(ctx, d.nodeToRemove); err != nil {
+	if err := tc.RemoveNode(ctx, d.nodeToRemove, -1, ""); err != nil {
 		return 0, err
 	}
 	time.Sleep(10 * tc.ManageOracleTickInterval)

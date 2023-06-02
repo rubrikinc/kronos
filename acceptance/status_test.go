@@ -60,7 +60,7 @@ func TestKronosStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.NoError(tc.RemoveNode(ctx, len(tc.Nodes)-1))
+	a.NoError(tc.RemoveNode(ctx, len(tc.Nodes)-1, -1, ""))
 	data, err := tc.Status(rand.Intn(len(tc.Nodes)-1), false /*local*/)
 	a.NoError(err)
 	nodeInfos := nodeInfosFromBytes(data)

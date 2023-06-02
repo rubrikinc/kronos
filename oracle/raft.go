@@ -16,6 +16,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/scaledata/etcd/etcdserver/stats"
 	"github.com/scaledata/etcd/pkg/fileutil"
+	"github.com/scaledata/etcd/pkg/transport"
 	"github.com/scaledata/etcd/pkg/types"
 	"github.com/scaledata/etcd/raft"
 	"github.com/scaledata/etcd/raft/sdraftpb"
@@ -724,6 +725,69 @@ func raftID(nodeID string) types.ID {
 	return raftID
 }
 
+func (rc *raftNode) seedRpc(ctx context.Context,
+	tlsInfo transport.TLSInfo, timeout time.Duration,
+	rpc func(ctx context.Context,
+		client *kronoshttp.
+			ClusterClient) error) error {
+	// try on both the seedHosts to maintain one seedHost failure tolerance
+	var lastTryError error
+	for _, seed := range rc.seedHosts {
+		if proto.Equal(seed, rc.localAddr) {
+			continue
+		}
+		log.Infof(ctx, "Executing rpc on %v", seed)
+		lastTryError = kronoshttp.ForDuration(
+			timeout,
+			func() error {
+				c, err := kronoshttp.NewClusterClient(seed,
+					tlsInfo)
+				if err != nil {
+					log.Errorf(ctx, "Failed to create cluster client, error: %v", err)
+					return err
+				}
+				defer c.Close()
+				ctxWithTimeout, cancelFunc := context.WithTimeout(ctx, clusterRequestTimeout)
+				defer cancelFunc()
+				err = rpc(ctxWithTimeout, c)
+				if err != nil {
+					log.Errorf(ctx, "Seed RPC to %v failed with error: %v",
+						seed, err)
+					return errors.Wrapf(err,
+						"Seed RPC to %v failed", seed)
+				}
+				return nil
+			},
+		)
+		if lastTryError != nil {
+			log.Errorf(ctx, "Failed to execute rpc on %v, error: %v", seed,
+				lastTryError)
+			continue
+		}
+		break
+	}
+	return lastTryError
+}
+
+func (rc *raftNode) checkDuplicate(ctx context.Context,
+	nodes []kronoshttp.Node) {
+	for _, node := range nodes {
+		if node.IsRemoved {
+			continue
+		}
+		if proto.Equal(node.RaftAddr, rc.localAddr) && node.
+			NodeID != rc.nodeID {
+			// There is already a kronos node with a different nodeID
+			// with the same raft addr
+			log.Fatalf(ctx,
+				"There is already a node %v with the same raft"+
+					" address %v. Remove it from the cluster before"+
+					" adding this node with a new ID.", node.NodeID,
+				node.RaftAddr)
+		}
+	}
+}
+
 // startRaft replays the existing WAL and joins the raft cluster
 func (rc *raftNode) startRaft(
 	ctx context.Context,
@@ -773,55 +837,37 @@ func (rc *raftNode) startRaft(
 		// Raft cluster had already been initialized
 		rc.node = raft.RestartNode(c)
 	} else {
-		if !isFirstSH {
+		if isFirstSH {
+			var nodesIncludingRemoved []kronoshttp.Node
+			err = rc.seedRpc(ctx, tlsInfo, 1*time.Second,
+				func(ctx context.
+					Context,
+					client *kronoshttp.
+						ClusterClient) error {
+					var err error
+					nodesIncludingRemoved, err = client.Nodes(ctx)
+					return err
+				})
+
+			if err != nil {
+				rc.checkDuplicate(ctx, nodesIncludingRemoved)
+			}
+		} else {
 			// Add all hosts to cluster formed by the first seedHost.
-			if err := kronoshttp.ForDuration(
-				time.Minute,
-				func() error {
-					// try on both the seedHosts to maintain one seedHost failure tolerance
-					for _, seed := range rc.seedHosts {
-						// The second seedHost tries AddNode on the first seed host only
-						// during the start of the cluster.
-						// This is based on the assumption that the first seedHost will not
-						// fail when the cluster is being bootstrapped for the first time.
-						// We don't guarantee seedHost failure tolerance for bootstrap which
-						// is one time event in the lifetime of the cluster.
-						if proto.Equal(seed, rc.localAddr) {
-							continue
-						}
-						c, err := kronoshttp.NewClusterClient(seed, tlsInfo)
-						if err != nil {
-							log.Errorf(
-								ctx,
-								"Failed to create clusterClient for host %v, error: %v",
-								seed,
-								err,
-							)
-							continue
-						}
-						defer c.Close()
-						request := &kronoshttp.AddNodeRequest{
-							NodeID:  rc.nodeID,
-							Address: kronosutil.NodeAddrToString(rc.localAddr),
-						}
-						ctxWithTimeout, cancelFunc := context.WithTimeout(ctx, clusterRequestTimeout)
-						defer cancelFunc()
-						err = c.AddNode(ctxWithTimeout, request)
-						if err != nil {
-							log.Errorf(
-								ctxWithTimeout,
-								"Failed to addNode, request: %v, error: %v",
-								request,
-								err,
-							)
-							continue
-						}
-						// Add node request succeeded without errors.
-						return nil
+			if err := rc.seedRpc(ctx, tlsInfo,
+				time.Minute, func(ctx context.Context,
+					client *kronoshttp.ClusterClient) error {
+					request := &kronoshttp.AddNodeRequest{
+						NodeID:  rc.nodeID,
+						Address: kronosutil.NodeAddrToString(rc.localAddr),
 					}
-					return errors.New("add node request failed on all the seed hosts")
-				},
-			); err != nil {
+					nodesIncludingRemoved, err := client.Nodes(ctx)
+					if err != nil {
+						return err
+					}
+					rc.checkDuplicate(ctx, nodesIncludingRemoved)
+					return client.AddNode(ctx, request)
+				}); err != nil {
 				log.Fatalf(ctx, "Failed to post add node request to %v, err: %v", rc.seedHosts[0], err)
 			}
 		}
@@ -890,18 +936,11 @@ func (rc *raftNode) startRaft(
 	if !isFirstSH {
 		var nodesIncludingRemoved []kronoshttp.Node
 		var lastTryError error
-		// try on both the seedHosts to maintain one seedHost failure tolerance
-		for _, seed := range rc.seedHosts {
-			if proto.Equal(seed, rc.localAddr) {
-				continue
-			}
-			nodesIncludingRemoved, lastTryError = rc.getNodesIncludingRemoved(ctx, seed)
-			if lastTryError != nil {
-				log.Errorf(ctx, "Failed to get nodes from %v, error: %v", seed, lastTryError)
-				continue
-			}
-			break
-		}
+		lastTryError = rc.seedRpc(ctx, tlsInfo, time.Minute,
+			func(ctx context.Context, client *kronoshttp.ClusterClient) error {
+				nodesIncludingRemoved, lastTryError = client.Nodes(ctx)
+				return lastTryError
+			})
 		if lastTryError != nil {
 			if !isNodeInitialized {
 				log.Fatalf(ctx, "Failed to get nodes from %v, err: %v", rc.seedHosts, err)
