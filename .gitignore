@@ -1,3 +1,5 @@
 # Goreman used by kronos testcluster
 /goreman
 /kronos
+.vscode/
+arc.log.txt

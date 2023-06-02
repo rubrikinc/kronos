@@ -2,6 +2,7 @@ package oracle
 
 import (
 	"context"
+	"sync"
 
 	"github.com/rubrikinc/kronos/protoutil"
 
@@ -43,6 +44,11 @@ type RaftStateMachine struct {
 	stateMachine *inMemStateMachine
 	// channel to signal blocking/unblocking a snapshot
 	getSnapshotC chan struct{}
+
+	// closeMu protects closed-state marker
+	closeMu sync.Mutex
+	// true if state machine is closed
+	closed bool
 	// closer is a cleanup function
 	closer func()
 }
@@ -77,8 +83,12 @@ func NewRaftStateMachine(ctx context.Context, rc *RaftConfig) StateMachine {
 		snapshotter:  <-snapshotterReady,
 		stateMachine: NewMemStateMachine().(*inMemStateMachine),
 		getSnapshotC: make(chan struct{}),
+		closed:       false,
 	}
 	raftStateMachine.closer = func() {
+		raftStateMachine.closeMu.Lock()
+		defer raftStateMachine.closeMu.Unlock()
+		raftStateMachine.closed = true
 		close(proposeC)
 	}
 
@@ -108,7 +118,11 @@ func (s *RaftStateMachine) SubmitProposal(ctx context.Context, proposal *kronosp
 	if err != nil {
 		log.Fatalf(ctx, "Failed to marshal proposal: %v, err: %v", proposal, err)
 	}
-	s.proposeC <- string(encodedProposal)
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if !s.closed {
+		s.proposeC <- string(encodedProposal)
+	}
 }
 
 // readCommits reads committed messages in raft and applies the messages to
