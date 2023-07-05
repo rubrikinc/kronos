@@ -42,6 +42,7 @@ func SSLCreds(certsDir string) (credentials.TransportCredentials, error) {
 		Certificates: []tls.Certificate{certificate},
 		ClientCAs:    certPool,
 		RootCAs:      certPool,
+		MinVersion:   tls.VersionTLS12,
 	})
 	return creds, nil
 }
