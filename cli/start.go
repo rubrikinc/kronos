@@ -18,21 +18,22 @@ import (
 
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/oracle"
-	"github.com/rubrikinc/kronos/pb"
+	kronospb "github.com/rubrikinc/kronos/pb"
 	"github.com/rubrikinc/kronos/server"
 	"github.com/rubrikinc/kronos/tm"
 )
 
 const (
-	advertiseHostFlag            = "advertise-host"
-	dataDirFlag                  = "data-dir"
-	grpcPortFlag                 = "grpc-port"
-	manageOracleTickIntervalFlag = "manage-oracle-tick-interval"
-	oracleTimeCapDeltaFlag       = "oracle-time-cap-delta"
-	oracleUptimeCapDeltaFlag     = "oracle-uptime-cap-delta"
-	raftPortFlag                 = "raft-port"
-	raftSnapCountFlag            = "raft-snap-count"
-	seedHostsFlag                = "seed-hosts"
+	advertiseHostFlag                  = "advertise-host"
+	dataDirFlag                        = "data-dir"
+	grpcPortFlag                       = "grpc-port"
+	manageOracleTickIntervalFlag       = "manage-oracle-tick-interval"
+	oracleTimeCapDeltaFlag             = "oracle-time-cap-delta"
+	oracleUptimeCapDeltaFlag           = "oracle-uptime-cap-delta"
+	raftPortFlag                       = "raft-port"
+	raftSnapCountFlag                  = "raft-snap-count"
+	seedHostsFlag                      = "seed-hosts"
+	StaleMembershipCleanupIntervalFlag = "stale-membership-cleanup-interval"
 )
 
 var startCtx struct {
@@ -51,6 +52,7 @@ var startCtx struct {
 		startConfigFile string
 		enable          bool
 	}
+	staleMembershipCleanupInterval time.Duration
 }
 
 var startCmd = &cobra.Command{
@@ -175,6 +177,13 @@ func init() {
 		"Address to enable pprof on. Empty string disables pprof",
 	)
 
+	startCmd.Flags().DurationVar(
+		&startCtx.staleMembershipCleanupInterval,
+		StaleMembershipCleanupIntervalFlag,
+		4*time.Hour,
+		"Minimum time-period after which a membership may be considered "+
+			"stale and purged",
+	)
 }
 
 func initHTTPPprof(ctx context.Context) {
@@ -261,6 +270,7 @@ func runStart() {
 			SeedHosts: strings.Split(startCtx.seedHosts, ","),
 			SnapCount: startCtx.raftSnapCount,
 		},
+		StaleMembershipCleanupInterval: startCtx.staleMembershipCleanupInterval,
 	}
 	server, err := server.NewKronosServer(ctx, config)
 	if err != nil {

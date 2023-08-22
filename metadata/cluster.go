@@ -58,6 +58,7 @@ func (c *Cluster) activeNodesLocked() map[string]*kronospb.Node {
 	activeNodes := make(map[string]*kronospb.Node)
 	for id, node := range c.mu.cluster.AllNodes {
 		if !node.IsRemoved {
+			protoutil.Clone(node)
 			activeNodes[id] = protoutil.Clone(node).(*kronospb.Node)
 		}
 	}

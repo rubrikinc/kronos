@@ -1,12 +1,20 @@
 GO      ?= go
 PATH	?= PATH
-GO_BUILD := $(GO) build
+GO_BUILD   := $(GO) build
 GO_INSTALL := $(GO) install
+IDL_DIR    := pb
 .PHONY: build install test acceptance goreman clean
-build:
+
+idl_clean:
+	$(MAKE) -C $(IDL_DIR) clean
+
+idl_generate:
+	$(MAKE) -C $(IDL_DIR) generate
+
+build: idl_generate
 	@$(GO_BUILD) -v ./cmd/...
 
-install:
+install: idl_generate
 	@$(GO_INSTALL) -v ./cmd/...
 
 goreman:
@@ -16,8 +24,8 @@ goreman:
 acceptance: install goreman
 	PATH=$(shell $(GO) env GOPATH)/bin:$(PATH) $(GO) test -p 1 -v ./acceptance/... --tags=acceptance --timeout 30m
 
-test:
+test: idl_generate
 	$(GO) test -v ./...
 
-clean:
+clean: idl_clean
 	rm -f goreman kronos

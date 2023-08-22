@@ -363,6 +363,18 @@ func (rc *raftNode) updateClusterFromConfState(ctx context.Context) {
 	}
 }
 
+func (rn *raftNode) housekeeping(ctx context.Context) {
+	cleanupCh := time.NewTicker(k.staleMemberCleanupDelay).C
+	switch {
+	case <-rn.proposeC:
+		// ignore
+	case <-cleanupCh:
+		rn.
+	}
+	
+	
+}
+
 var _ rafthttp.Raft = &raftNode{}
 
 // newRaftNode initiates a raft instance and returns a committed log entry
@@ -405,6 +417,7 @@ func newRaftNode(
 		// rest of structure populated after WAL replay
 	}
 	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort)
+	go rn.housekeeping(ctx)
 	return commitC, errorC, rn.snapshotterReady
 }
 
@@ -775,7 +788,7 @@ func (rc *raftNode) checkDuplicate(ctx context.Context,
 		if node.IsRemoved {
 			continue
 		}
-		if proto.Equal(node.RaftAddr, rc.localAddr) && node.
+		if false && proto.Equal(node.RaftAddr, rc.localAddr) && node.
 			NodeID != rc.nodeID {
 			// There is already a kronos node with a different nodeID
 			// with the same raft addr

@@ -26,10 +26,11 @@ import (
 	"github.com/rubrikinc/kronos/syncutil"
 
 	"github.com/rubrikinc/kronos/acceptance/testutil"
+	"github.com/rubrikinc/kronos/cli"
 	"github.com/rubrikinc/kronos/kronosutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/metadata"
-	"github.com/rubrikinc/kronos/pb"
+	kronospb "github.com/rubrikinc/kronos/pb"
 	"github.com/rubrikinc/kronos/server"
 )
 
@@ -114,6 +115,9 @@ func (t *testNode) kronosStartCmd(
 		"--seed-hosts", strings.Join(seedHosts, ","),
 		"--manage-oracle-tick-interval", manageOracleTickInterval.String(),
 		"--raft-snap-count", fmt.Sprint(raftSnapCount),
+		"--" + cli.StaleMembershipCleanupDelayFlag, "10ms",
+		fmt.Sprintf("1>>%s/out.log", t.logDir),
+		fmt.Sprintf("2>>%s/err.out", t.logDir),
 	}
 
 	if len(certsDir) > 0 {
@@ -258,6 +262,34 @@ func (tc *TestCluster) GetClockConfig(ctx context.Context, nodeIdx int) *kronosp
 	return tc.Nodes[nodeIdx].driftConfig
 }
 
+// ClusterNode describes a kronos-test-cluster node
+type ClusterNode struct {
+	// Idx is test-cluster node-index
+	Idx int
+	// Id is kronos node-id
+	Id string
+	// Node describes the node details
+	Node *kronospb.Node
+}
+
+// ListNodes lists nodes in the cluster
+func (tc *TestCluster) ListNodes(ctx context.Context, nodeIdx int) ([]*ClusterNode, error) {
+	c, err := metadata.LoadCluster(tc.Nodes[nodeIdx].dataDir, true /* readOnly */)
+	if err != nil {
+		return nil, err
+	}
+	nodes := c.NodesIncludingRemoved()
+	var ret []*ClusterNode
+	for id, node := range nodes {
+		for idx, testNode := range tc.Nodes {
+			if node.RaftAddr.Port == testNode.raftPort {
+				ret = append(ret, &ClusterNode{idx, id, node})
+			}
+		}
+	}
+	return ret, nil
+}
+
 // Time is used to get kronos time of node nodeIdx.
 func (tc *TestCluster) Time(ctx context.Context, nodeIdx int) (int64, error) {
 	timeClient := server.NewGRPCClient(tc.CertsDir)
@@ -393,6 +425,15 @@ func (tc *TestCluster) RemoveNode(ctx context.Context, idx int, nodeToRunRemoveF
 	} else {
 		return nil
 	}
+}
+
+// WipeStore wipes store-dir of a stopped node
+func (tc *TestCluster) WipeStore(ctx context.Context, idx int) error {
+	if tc.Nodes[idx].isRunning {
+		return fmt.Errorf("Can't wipe store of running node %d", idx)
+	}
+
+	return tc.fs.RemoveAll(tc.Nodes[idx].dataDir)
 }
 
 // AddNode adds a new node to testCluster and returns the newly assigned NodeID.

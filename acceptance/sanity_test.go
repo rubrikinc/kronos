@@ -19,7 +19,7 @@ import (
 	"github.com/rubrikinc/kronos/kronosutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/metadata"
-	"github.com/rubrikinc/kronos/pb"
+	kronospb "github.com/rubrikinc/kronos/pb"
 )
 
 const (
@@ -419,6 +419,108 @@ func TestKronosSanityAddRemove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func op(
+	ctx context.Context,
+	t *testing.T,
+	tc *cluster.TestCluster,
+	op cluster.Operation,
+	idxs ...int,
+) {
+	if err := tc.RunOperation(ctx, op, idxs...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertNoErr(t *testing.T, err error) {
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKronosWipeAndReinsert(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+
+	fs := afero.NewOsFs()
+	numNodes := 4
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			NumNodes:                 numNodes,
+			RaftSnapCount:            2,
+		},
+	)
+	assertNoErr(t, err)
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+
+	nodesWithId := func(
+		idx int,
+	) []*cluster.ClusterNode {
+		allNodes, err := tc.ListNodes(ctx, 0)
+		assertNoErr(t, err)
+
+		var matchingEntries []*cluster.ClusterNode
+		for _, n := range allNodes {
+			if n.Idx == idx {
+				matchingEntries = append(matchingEntries, n)
+			}
+		}
+		return matchingEntries
+	}
+
+	// give some time to elect the oracle
+	time.Sleep(kronosStabilizationBufferTime)
+
+	nodeToRemove := 2
+	targetNodeSlice := nodesWithId(nodeToRemove)
+	assert.Equal(t, 1, len(targetNodeSlice))
+	nodeToBeRemoved := targetNodeSlice[0]
+
+	op(ctx, t, tc, cluster.Stop, nodeToRemove)
+
+	_, err = tc.Time(ctx, nodeToRemove)
+	if err == nil {
+		t.Fatalf("unexpected nil err")
+	}
+
+	time.Sleep(kronosStabilizationBufferTime)
+	_, _, err = tc.ValidateTimeInConsensus(
+		ctx,
+		validationThreshold,
+		true, /*checkOnlyRunningNodes*/
+	)
+	assertNoErr(t, err)
+
+	assert.NoError(t, tc.WipeStore(ctx, nodeToRemove))
+
+	// node should not have been removed yet, it is not necessarily stale
+	assert.Equal(t, 1, len(nodesWithId(nodeToRemove)))
+
+	time.Sleep(kronosStabilizationBufferTime)
+	_, err = tc.AddNode(ctx, 2)
+	assertNoErr(t, err)
+
+	// wait for 2 to get initialized
+	time.Sleep(kronosStabilizationBufferTime)
+	_, _, err = tc.ValidateTimeInConsensus(
+		ctx,
+		validationThreshold,
+		false, /*checkOnlyRunningNodes*/
+	)
+	assertNoErr(t, err)
+
+	// node should have been removed by now, we waited long enough and it is
+	// definitely stale now that another node has joined with the same address
+	assert.Equal(t, 1, len(nodesWithId(nodeToRemove)))
+
+	// A new node replaced it (becuase 2's store was wiped)
+	assert.NotEqual(t, nodeToBeRemoved.Id, nodesWithId(nodeToRemove)[0].Id)
+
+	tc.ListNodes(ctx, 0)
 }
 
 func TestKronosSanityDeadNode(t *testing.T) {

@@ -18,7 +18,7 @@ import (
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/metadata"
 	"github.com/rubrikinc/kronos/oracle"
-	"github.com/rubrikinc/kronos/pb"
+	kronospb "github.com/rubrikinc/kronos/pb"
 	"github.com/rubrikinc/kronos/tm"
 )
 
@@ -74,6 +74,8 @@ type Server struct {
 	// Metrics records kronos metrics
 	Metrics *kronosstats.KronosMetrics
 
+	staleMembershipCleanupInterval time.Duration
+
 	mu struct {
 		syncutil.RWMutex
 		// lastKronosTime is the last served KronosTime. This is used to
@@ -124,6 +126,11 @@ func (k *Server) Status(
 	}, nil
 }
 
+func (k *Server) isOracle(ctx context.Context) bool {
+	oracleData := k.OracleSM.State(ctx)
+	return oracleData == nil || proto.Equal(oracleData.Oracle, k.GRPCAddr)
+}
+
 // OracleTime returns the current KronosTime if the this server is the elected
 // oracle.
 // If an error is returned, this oracle may be overthrown by another kronos
@@ -131,11 +138,10 @@ func (k *Server) Status(
 func (k *Server) OracleTime(
 	ctx context.Context, request *kronospb.OracleTimeRequest,
 ) (*kronospb.OracleTimeResponse, error) {
-	oracleData := k.OracleSM.State(ctx)
-	if oracleData == nil || !proto.Equal(oracleData.Oracle, k.GRPCAddr) {
+	if !k.isOracle(ctx) {
 		return nil, errors.Errorf(
 			"server (%s) is not oracle, current oracle state: %s",
-			k.GRPCAddr, oracleData,
+			k.GRPCAddr, k.OracleSM.State(ctx),
 		)
 	}
 
@@ -666,6 +672,35 @@ func (k *Server) NewClusterClient() (*kronoshttp.ClusterClient, error) {
 	return kronoshttp.NewClusterClient(k.raftAddr, tlsInfo)
 }
 
+func (k *Server) autoCleanStaleMemberships(ctx context.Context) {
+	tick := time.NewTicker(k.staleMembershipCleanupInterval).C
+	for {
+		select {
+		case <-k.StopC:
+			return
+		case <-tick:
+			cluster, err := metadata.LoadCluster(k.dataDir, true /*readOnly*/)
+			if err != nil {
+				log.Warningf(
+					ctx,
+					"Couldn't check for stale-membership entries, err: +%v",
+					err)
+				continue
+			}
+			nodes := cluster.ActiveNodes()
+			if k.isOracle(ctx) {
+
+			}
+
+		}
+	}
+
+}
+
+func (k *Server) startHousekeeping(ctx context.Context) {
+	go k.autoCleanStaleMemberships(ctx)
+}
+
 // RunServer starts a Kronos GRPC server
 func (k *Server) RunServer(ctx context.Context) error {
 	if k.server != nil {
@@ -695,6 +730,8 @@ func (k *Server) RunServer(ctx context.Context) error {
 	k.server = server
 	t := time.NewTicker(k.manageOracleTickInterval)
 	defer t.Stop()
+	k.startHousekeeping(ctx)
+
 	go k.ManageOracle(t.C, nil)
 
 	return server.Serve(lis)
@@ -728,6 +765,9 @@ type Config struct {
 	Clock tm.Clock
 	// Metrics
 	Metrics *kronosstats.KronosMetrics
+	// StaleMembershipCleanupInterval controls the polling interval for
+	// discovering and automatically purging stale memberships
+	StaleMembershipCleanupInterval time.Duration
 }
 
 // NewKronosServer returns an instance of Server based on given
@@ -739,17 +779,18 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 	}
 
 	return &Server{
-		Clock:                    config.Clock,
-		OracleSM:                 oracleSM,
-		Client:                   NewGRPCClient(config.CertsDir),
-		GRPCAddr:                 config.GRPCHostPort,
-		raftAddr:                 config.RaftHostPort,
-		certsDir:                 config.CertsDir,
-		dataDir:                  config.DataDir,
-		StopC:                    make(chan struct{}),
-		OracleTimeCapDelta:       config.OracleTimeCapDelta,
-		OracleUptimeCapDelta:     config.OracleUptimeCapDelta,
-		manageOracleTickInterval: config.ManageOracleTickInterval,
-		Metrics:                  config.Metrics,
+		Clock:                          config.Clock,
+		OracleSM:                       oracleSM,
+		Client:                         NewGRPCClient(config.CertsDir),
+		GRPCAddr:                       config.GRPCHostPort,
+		raftAddr:                       config.RaftHostPort,
+		certsDir:                       config.CertsDir,
+		dataDir:                        config.DataDir,
+		StopC:                          make(chan struct{}),
+		OracleTimeCapDelta:             config.OracleTimeCapDelta,
+		OracleUptimeCapDelta:           config.OracleUptimeCapDelta,
+		manageOracleTickInterval:       config.ManageOracleTickInterval,
+		Metrics:                        config.Metrics,
+		staleMembershipCleanupInterval: config.StaleMembershipCleanupInterval,
 	}, nil
 }

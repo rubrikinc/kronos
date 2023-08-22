@@ -1,4 +1,7 @@
 syntax = "proto3";
+import "gogo.proto";
+option (gogoproto.marshaler_all) = true;
+option (gogoproto.unmarshaler_all) = true;
 
 package kronospb;
 option go_package = "kronospb";
@@ -56,6 +59,8 @@ enum ServerStatus {
 }
 
 message OracleTimeRequest {
+   // Node-id of the caller (optional, set if it is a memeber of the cluster)
+   string node_id = 1;
 }
 
 message OracleTimeResponse {
