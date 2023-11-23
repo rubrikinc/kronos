@@ -6,7 +6,7 @@ require (
 	github.com/coreos/pkg v0.0.0-20180108230652-97fdf19511ea
 	github.com/gogo/protobuf v1.1.1
 	github.com/pkg/errors v0.8.0
-	github.com/scaledata/etcd v4.0.0-rubrik+incompatible
+	github.com/scaledata/etcd v4.0.1-rubrik+incompatible
 	github.com/spf13/afero v1.1.1
 	github.com/spf13/cobra v0.0.3
 	github.com/stretchr/testify v1.2.2
@@ -20,7 +20,7 @@ require (
 	github.com/coreos/go-semver v0.2.0 // indirect
 	github.com/coreos/go-systemd v0.0.0-20180511133405-39ca1b05acc7 // indirect
 	github.com/golang/glog v1.0.0 // indirect
-	github.com/golang/protobuf v1.5.2 // indirect
+	github.com/golang/protobuf v1.5.2
 	github.com/inconshreveable/mousetrap v1.0.0 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
 	github.com/petermattis/goid v0.0.0-20180202154549-b0b1615b78e5
