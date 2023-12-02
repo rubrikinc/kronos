@@ -132,7 +132,7 @@ func (s *RaftStateMachine) readCommits(
 ) {
 	for data := range commitC {
 		switch data {
-		case replayedWALMsg:
+		case replayedCommitsFromWALMsg:
 			// WAL is replayed synchronously when a server restarts
 			log.Info(ctx, "Done replaying WAL entries on state machine.")
 			return

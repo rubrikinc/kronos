@@ -115,7 +115,7 @@ func (r *logFormatter) Flush() {
 // We use special hardcoded messages to indicate replay done, and signal loading
 // a snapshot. We know that these hardcoded values will not conflict with other
 // serialized entries that we send and receive from raft in our application.
-var replayedWALMsg = "__kronos_replay_done"
+var replayedCommitsFromWALMsg = "__kronos_replay_done"
 var loadSnapshotMsg = "__kronos_load_snapshot"
 var unblockSnapshotMsg = "__kronos_unblock_snapshot"
 
@@ -187,9 +187,9 @@ type raftNode struct {
 	cluster   *metadata.Cluster // cluster metadata that is also persisted to a file
 
 	getSnapshot func() ([]byte, error)
-	// last index of the replay log at startup, this is used to determine when we
-	// are done replaying the existing log entries.
-	lastIndex uint64
+	// last committed index of the replay log at startup, this is used to determine when we
+	// are done replaying the existing committed log entries.
+	lastCommittedIndex uint64
 
 	confState     sdraftpb.ConfState
 	snapshotIndex uint64
@@ -368,7 +368,7 @@ var _ rafthttp.Raft = &raftNode{}
 // newRaftNode initiates a raft instance and returns a committed log entry
 // channel and error channel. Proposals for log updates are sent over the
 // proposal channel proposeC. All log entries are replayed over the
-// commit channel, followed by the replayedWALMsg message (to indicate the
+// commit channel, followed by the replayedCommitsFromWALMsg message (to indicate the
 // channel is current), then new log entries. To shutdown, close proposeC and
 // read errorC.
 func newRaftNode(
@@ -679,20 +679,26 @@ func (rc *raftNode) replayWAL(ctx context.Context) *wal.WAL {
 		log.Fatal(ctx, err)
 	}
 
-	log.Infof(ctx, "There are %d entries to be replayed", len(ents))
-	if len(ents) > 0 {
-		// if there are entries to be replayed, note the last index so that we can
+	if len(ents) > 0 && st.Commit >= ents[0].Index {
+		// if there are committed entries to be replayed, note the last index so that we can
 		// tell when all past entries are published in the raft loop, and indicate
-		// that to the client. replayedWALMsg is pushed to commitC by publishEntries
+		// that to the client. replayedCommitsFromWALMsg is pushed to commitC by publishEntries
 		// when all the entries found here are replayed.
-		rc.lastIndex = ents[len(ents)-1].Index
+		// Replaying upto the last committed index is sufficient (and necessary) as the
+		// following invariant holds for any past runs of the process:
+		// applied_index <= commit_index(on persisted WAL)
+		// This is sufficient to ensure we don't go back in terms of the state visible
+		// to the kronos time-server.
+		rc.lastCommittedIndex = st.Commit
+		log.Infof(ctx, "There are %d WAL entries to be replayed. lastCommittedIndex: %d",
+			st.Commit-ents[0].Index+1, rc.lastCommittedIndex)
 	} else {
 		// if there is nothing to replay, indicate to the client that replay is
-		// already done. also explicitly initialize lastIndex to 0, so that it never
-		// matches an entry index later and the replayedWALMsg is not sent again
+		// already done. also explicitly initialize lastCommittedIndex to 0, so that it never
+		// matches an entry index later and the replayedCommitsFromWALMsg is not sent again
 		// (first entry we ever receive from raft has Index 1.)
-		rc.lastIndex = 0
-		rc.commitC <- replayedWALMsg
+		rc.lastCommittedIndex = 0
+		rc.commitC <- replayedCommitsFromWALMsg
 	}
 
 	return w
@@ -1168,15 +1174,15 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 				rc.stop()
 				return
 			}
-			if appliedIndexBeforePublishing < rc.lastIndex {
+			if appliedIndexBeforePublishing < rc.lastCommittedIndex {
 				// Only log if we are catching up, to prevent spam.
 				log.Infof(ctx, "Published %d entries", len(ents))
 			}
 			// If the publish moved us ahead or at par to the state at startup, send
-			// the special replayedWALMsg on commit channel to signal replay has
+			// the special replayedCommitsFromWALMsg on commit channel to signal replay has
 			// finished.
-			if appliedIndexBeforePublishing < rc.lastIndex && rc.appliedIndex >= rc.lastIndex {
-				rc.commitC <- replayedWALMsg
+			if appliedIndexBeforePublishing < rc.lastCommittedIndex && rc.appliedIndex >= rc.lastCommittedIndex {
+				rc.commitC <- replayedCommitsFromWALMsg
 			}
 
 			rc.maybeTriggerSnapshot(ctx)
