@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/rubrikinc/kronos/protoutil"
+	"github.com/scaledata/etcd/raft"
 
 	"github.com/scaledata/etcd/snap"
 
@@ -44,6 +45,8 @@ type RaftStateMachine struct {
 	stateMachine *inMemStateMachine
 	// channel to signal blocking/unblocking a snapshot
 	getSnapshotC chan struct{}
+	// statusFn is a function that returns the status of the raft node
+	statusFn func() raft.Status
 
 	// closeMu protects closed-state marker
 	closeMu sync.Mutex
@@ -76,13 +79,15 @@ func NewRaftStateMachine(ctx context.Context, rc *RaftConfig) StateMachine {
 	proposeC := make(chan string)
 	getSnapshot := func() ([]byte, error) { return raftStateMachine.GetSnapshot(ctx) }
 	nodeID := metadata.FetchOrAssignNodeID(ctx, rc.DataDir).String()
-	commitC, errorC, snapshotterReady := newRaftNode(rc, getSnapshot, proposeC, nodeID)
+	commitC, errorC, snapshotterReady, statusFn := newRaftNode(rc, getSnapshot,
+		proposeC, nodeID)
 
 	raftStateMachine = &RaftStateMachine{
 		proposeC:     proposeC,
 		snapshotter:  <-snapshotterReady,
 		stateMachine: NewMemStateMachine().(*inMemStateMachine),
 		getSnapshotC: make(chan struct{}),
+		statusFn:     statusFn,
 		closed:       false,
 	}
 	raftStateMachine.closer = func() {
@@ -98,6 +103,10 @@ func NewRaftStateMachine(ctx context.Context, rc *RaftConfig) StateMachine {
 	// read commits from raft into RaftStateMachine
 	go raftStateMachine.readCommits(context.Background(), commitC, errorC)
 	return raftStateMachine
+}
+
+func (s *RaftStateMachine) RaftState() raft.Status {
+	return s.statusFn()
 }
 
 // Close cleans up RaftStateMachine

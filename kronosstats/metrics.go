@@ -33,4 +33,10 @@ type KronosMetrics struct {
 	TimeCap Gauge
 	// TimeCap is an upper bound to kronos uptime.
 	UptimeCap Gauge
+	// Term is the current term of the node.
+	Term Gauge
+	// CommitIndex is the current commit index of the node.
+	CommitIndex Gauge
+	// LastApplied is the last applied index of the node.
+	LastApplied Gauge
 }

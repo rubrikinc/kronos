@@ -547,6 +547,13 @@ func (k *Server) ManageOracle(tickCh <-chan time.Time, tickCallback func()) {
 			oracleState := k.OracleSM.State(ctx)
 			k.Metrics.TimeCap.Update(oracleState.TimeCap)
 			k.Metrics.UptimeCap.Update(oracleState.KronosUptimeCap)
+			raftMachine, ok := k.OracleSM.(*oracle.RaftStateMachine)
+			if ok {
+				raftState := raftMachine.RaftState()
+				k.Metrics.Term.Update(int64(raftState.Term))
+				k.Metrics.CommitIndex.Update(int64(raftState.Commit))
+				k.Metrics.LastApplied.Update(int64(raftState.Applied))
+			}
 			if log.V(1) {
 				log.Infof(ctx, "Oracle state: %s", oracleState)
 			}

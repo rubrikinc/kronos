@@ -373,7 +373,7 @@ var _ rafthttp.Raft = &raftNode{}
 // read errorC.
 func newRaftNode(
 	rc *RaftConfig, getSnapshot func() ([]byte, error), proposeC <-chan string, nodeID string,
-) (<-chan string, <-chan error, <-chan *snap.Snapshotter) {
+) (<-chan string, <-chan error, <-chan *snap.Snapshotter, func() raft.Status) {
 	ctx := context.Background()
 	seedHosts, err := convertToNodeAddrs(rc.SeedHosts)
 	if err != nil {
@@ -405,7 +405,11 @@ func newRaftNode(
 		// rest of structure populated after WAL replay
 	}
 	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort)
-	return commitC, errorC, rn.snapshotterReady
+	return commitC, errorC, rn.snapshotterReady, rn.status
+}
+
+func (rc *raftNode) status() raft.Status {
+	return rc.node.Status()
 }
 
 func (rc *raftNode) purgeFiles(ctx context.Context) {
