@@ -2,6 +2,7 @@ package kronoshttp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
@@ -286,6 +287,8 @@ func TestClusterHandlerServeHTTP(t *testing.T) {
 			done := make(chan struct{})
 			dataDir, err := ioutil.TempDir("", "data_dir")
 			a.NoError(err)
+			metadata.FetchOrAssignClusterUUID(context.Background(), dataDir,
+				false)
 			defer func() { _ = os.RemoveAll(dataDir) }()
 			if tc.clusterBeforeConfChange != nil {
 				a.NoError(updateCluster(dataDir, tc.clusterBeforeConfChange))

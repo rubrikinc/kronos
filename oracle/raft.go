@@ -179,6 +179,7 @@ type raftNode struct {
 	errorC chan<- error
 
 	nodeID    string // client ID for raft session
+	clusterID uint64
 	localAddr *kronospb.NodeAddr
 	seedHosts []*kronospb.NodeAddr
 	waldir    string            // path to WAL directory
@@ -842,6 +843,7 @@ func (rc *raftNode) startRaft(
 		log.Infof(ctx, "Initialized cluster: %v", rc.cluster)
 		// Raft cluster had already been initialized
 		rc.node = raft.RestartNode(c)
+		rc.clusterID = uint64(metadata.FetchOrAssignClusterUUID(ctx, rc.datadir, true))
 	} else {
 		if isFirstSH {
 			var nodesIncludingRemoved []kronoshttp.Node
@@ -858,6 +860,7 @@ func (rc *raftNode) startRaft(
 			if err != nil {
 				rc.checkDuplicate(ctx, nodesIncludingRemoved)
 			}
+			rc.clusterID = uint64(metadata.FetchOrAssignClusterUUID(ctx, rc.datadir, false))
 		} else {
 			// Add all hosts to cluster formed by the first seedHost.
 			if err := rc.seedRpc(ctx, tlsInfo,
@@ -872,7 +875,17 @@ func (rc *raftNode) startRaft(
 						return err
 					}
 					rc.checkDuplicate(ctx, nodesIncludingRemoved)
-					return client.AddNode(ctx, request)
+					clusterID, err := client.AddNode(ctx, request)
+					if err != nil {
+						return err
+					}
+					rc.clusterID = clusterID.ClusterID
+					err = metadata.PersistClusterUUID(ctx, rc.datadir,
+						types.ID(rc.clusterID))
+					if err != nil {
+						return err
+					}
+					return nil
 				}); err != nil {
 				log.Fatalf(ctx, "Failed to post add node request to %v, err: %v", rc.seedHosts[0], err)
 			}
@@ -904,7 +917,7 @@ func (rc *raftNode) startRaft(
 
 	rc.transport = &rafthttp.Transport{
 		ID:          selfID,
-		ClusterID:   0x1000,
+		ClusterID:   types.ID(rc.clusterID),
 		Raft:        rc,
 		ServerStats: stats.NewServerStats("", ""),
 		LeaderStats: stats.NewLeaderStats(fmt.Sprintf("%v", rc.nodeID)),

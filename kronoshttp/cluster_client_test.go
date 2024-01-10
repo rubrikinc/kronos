@@ -89,7 +89,7 @@ func TestClusterClientAddNode(t *testing.T) {
 				a := assert.New(t)
 				a.NoError(err)
 				c := ClusterClient{url: *tsURL, client: http.DefaultClient}
-				err = c.AddNode(ctx, tc.request)
+				_, err = c.AddNode(ctx, tc.request)
 				if tc.expectedErrClient == nil {
 					a.NoError(err)
 				} else {

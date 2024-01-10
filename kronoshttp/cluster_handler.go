@@ -42,6 +42,10 @@ type Node struct {
 	NodeID string `json:"node_id"`
 }
 
+type ClusterID struct {
+	ClusterID uint64 `json:"cluster_id"`
+}
+
 // AddNodeRequest is used by a new node to send the data required to add
 // itself to an existing cluster. The server adds the node with given raft
 // address with raft id NodeID.
@@ -244,6 +248,21 @@ func (h *ClusterHandler) handleAdd(
 		"AddNodeRequest: %v Succeeded",
 		request,
 	)
+	clusterID, err := metadata.FetchClusterUUID(h.dataDir)
+	if err != nil {
+		return http.StatusInternalServerError, httpError{error: err,
+			handler: handler, request: r, event: "fetch-cluster-id"}
+	}
+	respJSON, err := json.Marshal(ClusterID{uint64(clusterID)})
+	if err != nil {
+		return http.StatusInternalServerError,
+			httpError{error: err, handler: handler, request: r, event: "marshal-cluster"}
+	}
+	w.Header().Add("X-Kronos-Protocol-Version", "1")
+	if _, err := w.Write(respJSON); err != nil {
+		return http.StatusInternalServerError,
+			httpError{error: err, handler: handler, request: r, event: "write-response"}
+	}
 	return http.StatusOK, nil
 }
 

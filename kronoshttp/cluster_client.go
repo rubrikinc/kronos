@@ -61,10 +61,11 @@ func NewClusterClient(host *kronospb.NodeAddr, tlsInfo transport.TLSInfo) (*Clus
 
 // AddNode sends a request to add a new node to the raft HTTP server of
 // ClusterClient.
-func (c *ClusterClient) AddNode(ctx context.Context, request *AddNodeRequest) error {
+func (c *ClusterClient) AddNode(ctx context.Context,
+	request *AddNodeRequest) (*ClusterID, error) {
 	requestJSON, err := json.Marshal(request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	addNodeURL := kronosutil.AddToURLPath(c.url, requestTypeAdd)
 	httpReq, err := http.NewRequest(
@@ -73,24 +74,51 @@ func (c *ClusterClient) AddNode(ctx context.Context, request *AddNodeRequest) er
 		bytes.NewReader(requestJSON),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	httpReq = httpReq.WithContext(ctx)
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := ioutil.ReadAll(resp.Body)
-		return errors.Errorf(
+		return nil, errors.Errorf(
 			"add node request %s failed. status: %v, msg: %s",
 			requestJSON,
 			resp.StatusCode,
 			bytes.TrimSpace(msg),
 		)
 	}
-	return nil
+	var clusterID ClusterID
+	clusterID.ClusterID = 0x1000
+	if resp.Body == nil {
+		// New client talking to old server
+		return &clusterID, nil
+	}
+	switch resp.Header.Get("X-Kronos-Protocol-Version") {
+	case "1":
+		// New client talking to new server
+		respJSON, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		if respJSON == nil || len(respJSON) == 0 {
+			return nil, errors.Errorf("empty or nil response body")
+		}
+		err = json.Unmarshal(respJSON, &clusterID)
+		if err != nil {
+			return nil, err
+		}
+	case "":
+		// New client talking to old server
+	default:
+		return nil, errors.Errorf("unknown protocol version in response %s",
+			resp.Header.Get("X-Kronos-Protocol-Version"))
+	}
+
+	return &clusterID, nil
 }
 
 // RemoveNode sends a request to remove a node to the raft HTTP server of

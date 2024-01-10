@@ -610,3 +610,49 @@ func TestKronosSanityDuplicateNodes(t *testing.T) {
 	// of size 1 independent of the other nodes.
 	//WipeAndAdd(0)
 }
+
+func TestKronosStrayMessages(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 5
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			RaftSnapCount:            2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+
+	// give some time to elect the oracle
+	time.Sleep(kronosStabilizationBufferTime)
+	// make sure the seed nodes are not the raft leader
+	a.NoError(tc.RunOperation(ctx, cluster.Stop, 0, 1))
+	a.NoError(tc.RunOperation(ctx, cluster.Start, 0, 1))
+	time.Sleep(kronosStabilizationBufferTime)
+	// Wipe and add nodes 0 and 1
+	a.NoError(tc.RunOperation(ctx, cluster.Stop, 0, 1))
+	WipeAndAdd := func(idx int) {
+		dataDir := tc.Nodes[idx].DataDir()
+		a.NoError(err)
+		a.NoError(fs.RemoveAll(dataDir))
+		_, err := tc.AddNode(ctx, idx)
+		a.NoError(err)
+	}
+	WipeAndAdd(0)
+	WipeAndAdd(1)
+	time.Sleep(2 * kronosStabilizationBufferTime)
+	// node 0 and node 1 are a new cluster now
+	// and should not crash due to stray messages from old cluster
+	for idx := 0; idx < 5; idx++ {
+		_, err = tc.Time(ctx, idx)
+		a.NoError(err)
+	}
+}
