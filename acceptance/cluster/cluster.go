@@ -615,7 +615,7 @@ func (tc *TestCluster) generateProcfile(ctx context.Context) error {
 	for i := 0; i < len(tc.Nodes); i++ {
 		_, err = pf.WriteString(
 			fmt.Sprintf(
-				"%s: %s 2>%s 1>%s\n",
+				"%s: %s 2>>%s 1>>%s\n",
 				tc.Nodes[i].id,
 				tc.Nodes[i].kronosStartCmd(
 					tc.kronosBinary,
