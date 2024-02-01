@@ -18,10 +18,13 @@ import (
 type RaftConfig struct {
 	// RaftHostPort is the host:port of raft HTTP server
 	RaftHostPort *kronospb.NodeAddr
-	// GRPCHostPort is the host:port of raft HTTP server
+	// GRPCHostPort is the host:port of grpc HTTP server
 	GRPCHostPort *kronospb.NodeAddr
 	// SeedHosts is a comma separated list of kronos seed hosts in the cluster
 	SeedHosts []string
+	// GossipSeedHosts is a comma separated list of gossip seed hosts in the
+	// cluster
+	GossipSeedHosts []string
 	// CertsDir is the directory having node and CA certificates / pems
 	CertsDir string
 	// DataDir is the directory where a Kronos server will store its snapshots

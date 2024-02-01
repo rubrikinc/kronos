@@ -97,6 +97,7 @@ func (t *testNode) DataDir() string {
 func (t *testNode) kronosStartCmd(
 	kronosBinary string,
 	seedHosts []string,
+	gossipSeeds []string,
 	manageOracleTickInterval time.Duration,
 	certsDir string,
 	raftSnapCount uint64,
@@ -107,6 +108,7 @@ func (t *testNode) kronosStartCmd(
 		"--advertise-host", localhost,
 		"--raft-port", t.raftPort,
 		"--grpc-port", t.grpcPort,
+		"--gossip-seed-hosts", strings.Join(gossipSeeds, ","),
 		"--use-drift-clock",
 		"--drift-port", t.driftPort,
 		"--data-dir", t.dataDir,
@@ -167,6 +169,7 @@ type TestCluster struct {
 	kronosBinary             string
 	procfile                 string
 	seedHosts                []string
+	gossipSeedHosts          []string
 	goremanCmd               *exec.Cmd
 	goremanPort              string
 }
@@ -620,6 +623,7 @@ func (tc *TestCluster) generateProcfile(ctx context.Context) error {
 				tc.Nodes[i].kronosStartCmd(
 					tc.kronosBinary,
 					tc.seedHosts,
+					tc.gossipSeedHosts,
 					tc.ManageOracleTickInterval,
 					tc.CertsDir,
 					tc.RaftSnapCount,
@@ -657,6 +661,7 @@ func (tc *TestCluster) start(ctx context.Context) error {
 		tc.goremanPort,
 		"-f",
 		tc.procfile,
+		"-exit-on-stop=false",
 		"start",
 	)
 	if err := tc.goremanCmd.Start(); err != nil {
@@ -778,6 +783,8 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 			tc.seedHosts,
 			fmt.Sprintf("%s:%d", localhost, kronosPorts[i]),
 		)
+		tc.gossipSeedHosts = append(tc.gossipSeedHosts, fmt.Sprintf("%s:%d",
+			localhost, kronosPorts[cc.NumNodes+i]))
 	}
 
 	for i := 0; i < cc.NumNodes; i++ {

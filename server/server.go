@@ -8,6 +8,7 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
+	"github.com/rubrikinc/kronos/gossip"
 	"github.com/rubrikinc/kronos/syncutil"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
@@ -73,6 +74,8 @@ type Server struct {
 	OracleUptimeCapDelta time.Duration
 	// Metrics records kronos metrics
 	Metrics *kronosstats.KronosMetrics
+	// Gossip Server
+	GossipServer *gossip.Server
 
 	mu struct {
 		syncutil.RWMutex
@@ -666,6 +669,29 @@ func (k *Server) NewClusterClient() (*kronoshttp.ClusterClient, error) {
 	return kronoshttp.NewClusterClient(k.raftAddr, tlsInfo)
 }
 
+func (k *Server) startGossipping(ctx context.Context) {
+	// Wait till we generate/get the cluster ID and node ID.
+	for {
+		uuid, err := metadata.FetchClusterUUID(k.dataDir)
+		if err != nil {
+			log.Errorf(context.Background(), "failed to fetch cluster uuid: %v", err)
+			time.Sleep(time.Second)
+		} else {
+			k.GossipServer.SetClusterID(uuid.String())
+			break
+		}
+	}
+	nodeId, err := metadata.FetchNodeID(k.dataDir)
+	if err != nil {
+		log.Errorf(context.Background(), "failed to fetch node id: %v", err)
+	} else {
+		k.GossipServer.SetNodeID(nodeId.String())
+	}
+	go k.GossipServer.Start(ctx, k.StopC)
+	go gossip.Liveness(k.GossipServer, k.StopC)
+	go gossip.NodeDescriptor(k.GossipServer, k.StopC)
+}
+
 // RunServer starts a Kronos GRPC server
 func (k *Server) RunServer(ctx context.Context) error {
 	if k.server != nil {
@@ -691,11 +717,13 @@ func (k *Server) RunServer(ctx context.Context) error {
 	}
 	server := grpc.NewServer(opts...)
 	kronospb.RegisterTimeServiceServer(server, k)
+	kronospb.RegisterGossipServer(server, k.GossipServer)
 
 	k.server = server
 	t := time.NewTicker(k.manageOracleTickInterval)
 	defer t.Stop()
 	go k.ManageOracle(t.C, nil)
+	go k.startGossipping(ctx)
 
 	return server.Serve(lis)
 }
@@ -751,5 +779,8 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 		OracleUptimeCapDelta:     config.OracleUptimeCapDelta,
 		manageOracleTickInterval: config.ManageOracleTickInterval,
 		Metrics:                  config.Metrics,
+		GossipServer: gossip.NewServer(config.GRPCHostPort.Host+":"+config.
+			GRPCHostPort.Port,
+			config.GossipSeedHosts),
 	}, nil
 }

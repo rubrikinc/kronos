@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package kronospb;
+option go_package = "kronospb";
+
+message Request {
+  // node_id is the id of the node that sent the request
+  string node_id = 1;
+  // addr is the address of the node that sent the request
+  string advertised_host_port = 2;
+  // cluster_id is the id of the cluster that sent the request
+  string cluster_id = 3;
+  map<string, Info> gossipMap = 4;
+}
+
+message Info {
+  // timestamp is the time at which the info was added
+  int64 timestamp = 1;
+  // data is the actual data
+  bytes data = 2;
+}
+
+message Response {
+  // node_id is the id of the node that sent the response
+  string node_id = 1;
+  map<string, Info> data = 2;
+}
+
+service Gossip {
+  rpc Gossip(Request) returns (Response) {}
+}

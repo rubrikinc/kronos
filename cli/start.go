@@ -33,6 +33,7 @@ const (
 	raftPortFlag                 = "raft-port"
 	raftSnapCountFlag            = "raft-snap-count"
 	seedHostsFlag                = "seed-hosts"
+	gossipSeedHostsFlag          = "gossip-seed-hosts"
 )
 
 var startCtx struct {
@@ -45,6 +46,7 @@ var startCtx struct {
 	pprofAddr                string
 	raftPort                 string
 	seedHosts                string
+	gossipSeedHosts          string
 	raftSnapCount            uint64
 	driftClock               struct {
 		servicePort     string
@@ -90,6 +92,16 @@ func init() {
 		"Comma separated list of kronos seed hosts in the cluster",
 	)
 	if err := startCmd.MarkFlagRequired(seedHostsFlag); err != nil {
+		log.Fatal(ctx, err)
+	}
+
+	startCmd.Flags().StringVar(
+		&startCtx.gossipSeedHosts,
+		gossipSeedHostsFlag,
+		"",
+		"Comma separated list of kronos gossip seed hosts in the cluster",
+	)
+	if err := startCmd.MarkFlagRequired(gossipSeedHostsFlag); err != nil {
 		log.Fatal(ctx, err)
 	}
 
@@ -258,8 +270,9 @@ func runStart() {
 				Host: startCtx.advertiseHost,
 				Port: startCtx.raftPort,
 			},
-			SeedHosts: strings.Split(startCtx.seedHosts, ","),
-			SnapCount: startCtx.raftSnapCount,
+			SeedHosts:       strings.Split(startCtx.seedHosts, ","),
+			GossipSeedHosts: strings.Split(startCtx.gossipSeedHosts, ","),
+			SnapCount:       startCtx.raftSnapCount,
 		},
 	}
 	server, err := server.NewKronosServer(ctx, config)

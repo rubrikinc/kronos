@@ -10,7 +10,7 @@ install:
 	@$(GO_INSTALL) -v ./cmd/...
 
 goreman:
-	@$(GO_INSTALL) github.com/mattn/goreman@v0.1.1
+	@$(GO_INSTALL) github.com/mattn/goreman@v0.3.15
 
 # Run these tests serially to avoid port conflicts.
 acceptance: install goreman
