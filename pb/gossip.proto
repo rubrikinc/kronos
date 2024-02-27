@@ -26,6 +26,15 @@ message Response {
   map<string, Info> data = 2;
 }
 
+message NodeDescriptor {
+  // node_id is the id of the node
+  string node_id = 1;
+  // grpc_addr is the grpc address of the node
+  string grpc_addr = 2;
+  // raft_addr is the raft address of the node
+  string raft_addr = 3;
+}
+
 service Gossip {
   rpc Gossip(Request) returns (Response) {}
 }

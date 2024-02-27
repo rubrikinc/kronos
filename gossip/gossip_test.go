@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/rubrikinc/kronos/acceptance/testutil"
 	leaktest "github.com/rubrikinc/kronos/crdbutils"
@@ -20,12 +21,12 @@ func TestUpdateGossipState(t *testing.T) {
 	t2 := time.Now().Add(time.Second).UnixNano()
 	tests := []struct {
 		name          string
-		upds          []map[string]*kronospb.Info
-		expectedState map[string]*kronospb.Info
+		upds          []map[GossipKey]*kronospb.Info
+		expectedState map[GossipKey]*kronospb.Info
 	}{
 		{
 			name: "Test new keys are getting added",
-			upds: []map[string]*kronospb.Info{
+			upds: []map[GossipKey]*kronospb.Info{
 				{
 					"hostPort-1": {
 						Data:      []byte("hostPort-1"),
@@ -37,7 +38,7 @@ func TestUpdateGossipState(t *testing.T) {
 					},
 				},
 			},
-			expectedState: map[string]*kronospb.Info{
+			expectedState: map[GossipKey]*kronospb.Info{
 				"hostPort-1": {
 					Data:      []byte("hostPort-1"),
 					Timestamp: t1,
@@ -50,7 +51,7 @@ func TestUpdateGossipState(t *testing.T) {
 		},
 		{
 			name: "Test existing keys are getting updated",
-			upds: []map[string]*kronospb.Info{
+			upds: []map[GossipKey]*kronospb.Info{
 				{
 					"hostPort-1": {
 						Data:      []byte("hostPort-1"),
@@ -64,7 +65,7 @@ func TestUpdateGossipState(t *testing.T) {
 					},
 				},
 			},
-			expectedState: map[string]*kronospb.Info{
+			expectedState: map[GossipKey]*kronospb.Info{
 				"hostPort-1": {
 					Data:      []byte("hostPort-1"),
 					Timestamp: t2,
@@ -74,7 +75,7 @@ func TestUpdateGossipState(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			g := NewServer("", nil)
+			g := NewServer("", nil, nil, "")
 			for _, upd := range test.upds {
 				g.updateGossipState(upd)
 			}
@@ -97,32 +98,62 @@ func TestUpdateGossipState(t *testing.T) {
 }
 
 func TestGossipCallBacks(t *testing.T) {
+	nodeDesc1 := &kronospb.NodeDescriptor{
+		NodeId:   "1",
+		GrpcAddr: "127.0.0.1:3002",
+		RaftAddr: "https://127.0.0.1:3002",
+	}
+	nodeDesc2 := &kronospb.NodeDescriptor{
+		NodeId:   "2",
+		GrpcAddr: "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:8080",
+		RaftAddr: "https://[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:8080",
+	}
+	nodeDesc3 := &kronospb.NodeDescriptor{
+		NodeId:   "3",
+		GrpcAddr: "[fe80::204:61ff:fe9d:f156]:3000",
+		RaftAddr: "https://[fe80::204:61ff:fe9d:f156]:3000",
+	}
+	nodeDesc4 := &kronospb.NodeDescriptor{
+		NodeId:   "4",
+		GrpcAddr: "[fe80::%eth0]:80",
+		RaftAddr: "https://[fe80::204:61ff:fe9d:f156]:3000",
+	}
+	nodeDesc5 := &kronospb.NodeDescriptor{
+		NodeId:   "1",
+		GrpcAddr: "127.0.0.1:3004",
+		RaftAddr: "https://127.0.0.1:3004",
+	}
+	bytes1, _ := proto.Marshal(nodeDesc1)
+	bytes2, _ := proto.Marshal(nodeDesc2)
+	bytes3, _ := proto.Marshal(nodeDesc3)
+	bytes4, _ := proto.Marshal(nodeDesc4)
+	bytes5, _ := proto.Marshal(nodeDesc5)
 	tests := []struct {
 		name          string
-		upds          map[string]*kronospb.Info
+		upds          map[GossipKey]*kronospb.Info
 		expectedPeers []string
 	}{
 		{
 			name: "Test peers are getting updated when a hostPort-* key is" +
 				" received",
-			upds: map[string]*kronospb.Info{
+			upds: map[GossipKey]*kronospb.Info{
 				"hostPort-1": {
-					Data:      []byte("127.0.0.1:3002"),
+					Data:      bytes1,
 					Timestamp: time.Now().UnixNano(),
 				},
 				// ipv6 with port
 				"hostPort-2": {
-					Data:      []byte("[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:8080"),
+					Data:      bytes2,
 					Timestamp: time.Now().UnixNano(),
 				},
 				// compressed ipv6 with port
 				"hostPort-3": {
-					Data:      []byte("[fe80::204:61ff:fe9d:f156]:3000"),
+					Data:      bytes3,
 					Timestamp: time.Now().UnixNano(),
 				},
 				// ipv6 link local with port
-				"hostPort-5": {
-					Data:      []byte("[fe80::%eth0]:80"),
+				"hostPort-4": {
+					Data:      bytes4,
 					Timestamp: time.Now().UnixNano(),
 				},
 			},
@@ -138,9 +169,9 @@ func TestGossipCallBacks(t *testing.T) {
 				"* key" +
 				" is" +
 				" received",
-			upds: map[string]*kronospb.Info{
+			upds: map[GossipKey]*kronospb.Info{
 				"nodeee-1": {
-					Data:      []byte("127.0.0.1:3002"),
+					Data:      bytes1,
 					Timestamp: time.Now().UnixNano(),
 				},
 			},
@@ -150,9 +181,20 @@ func TestGossipCallBacks(t *testing.T) {
 			name: "Test peers are not getting updated when a hostPort-* key" +
 				" is" +
 				" received with invalid value",
-			upds: map[string]*kronospb.Info{
+			upds: map[GossipKey]*kronospb.Info{
 				"hostPort-1": {
-					Data:      []byte("hostPort-1"),
+					Data:      []byte("hostPort-1,hostPort-1"),
+					Timestamp: time.Now().UnixNano(),
+				},
+			},
+			expectedPeers: []string{},
+		},
+		{
+			name: "Test peers are getting updated when a hostPort-* key is" +
+				"" + " received with invalid nodeID",
+			upds: map[GossipKey]*kronospb.Info{
+				"hostPort-5": {
+					Data:      bytes5,
 					Timestamp: time.Now().UnixNano(),
 				},
 			},
@@ -161,7 +203,7 @@ func TestGossipCallBacks(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			g := NewServer("", nil)
+			g := NewServer("", nil, nil, "")
 			g.updateGossipState(test.upds)
 			peers := g.GetPeers()
 			if len(peers) != len(test.expectedPeers) {
@@ -192,7 +234,7 @@ func TestGossip(t *testing.T) {
 	t3 := time.Now().Add(2 * time.Second).UnixNano()
 	tests := []struct {
 		name     string
-		data     map[string]*kronospb.Info
+		data     map[GossipKey]*kronospb.Info
 		request  *kronospb.Request
 		response *kronospb.Response
 		err      error
@@ -207,7 +249,7 @@ func TestGossip(t *testing.T) {
 		},
 		{
 			name: "Test gossip returns response when cluster id matches",
-			data: map[string]*kronospb.Info{
+			data: map[GossipKey]*kronospb.Info{
 				"hostPort-1": {
 					Data:      []byte("hostPort-1"),
 					Timestamp: t1,
@@ -236,7 +278,7 @@ func TestGossip(t *testing.T) {
 		},
 		{
 			name: "Test gossip returns response with updated data",
-			data: map[string]*kronospb.Info{
+			data: map[GossipKey]*kronospb.Info{
 				"hostPort-1": {
 					Data:      []byte("hostPort-1"),
 					Timestamp: t1,
@@ -270,13 +312,14 @@ func TestGossip(t *testing.T) {
 			},
 		},
 	}
+	ctx := context.Background()
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			g := NewServer("", nil)
-			g.SetClusterID("cluster-1")
-			g.SetNodeID("hostPort-1")
+			g := NewServer("", nil, nil, "")
+			g.SetClusterID(ctx, "cluster-1")
+			g.SetNodeID(ctx, "hostPort-1")
 			g.updateGossipState(test.data)
-			response, err := g.Gossip(context.Background(), test.request)
+			response, err := g.Gossip(ctx, test.request)
 			if err != nil {
 				if err.Error() != test.err.Error() {
 					t.Errorf("Expected error %v, got %v", test.err, err)
@@ -322,7 +365,10 @@ func TestGossipPropagation(t *testing.T) {
 	gossipServers := make([]*Server, 4)
 	grpcServers := make([]*grpc.Server, 4)
 	for i := 0; i < 4; i++ {
-		gossipServers[i] = NewServer(hosts[i], hosts)
+		gossipServers[i] = NewServer(hosts[i],
+			&kronospb.NodeAddr{Host: "localhost",
+				Port: strconv.Itoa(freePorts[i])},
+			hosts[:2], "")
 		lis, err := net.Listen(
 			"tcp",
 			net.JoinHostPort("localhost", strconv.Itoa(freePorts[i])),
@@ -339,8 +385,8 @@ func TestGossipPropagation(t *testing.T) {
 			}
 		}()
 		grpcServers[i] = server
-		gossipServers[i].SetClusterID("cluster-1")
-		gossipServers[i].SetNodeID("node-" + strconv.Itoa(i))
+		gossipServers[i].SetClusterID(ctx, "cluster-1")
+		gossipServers[i].SetNodeID(ctx, "node-"+strconv.Itoa(i))
 		stopCh[i] = make(chan struct{})
 		go gossipServers[i].Start(ctx, stopCh[i])
 	}
@@ -350,28 +396,28 @@ func TestGossipPropagation(t *testing.T) {
 		time.Now().Add(2 * time.Second).UnixNano(),
 		time.Now().Add(3 * time.Second).UnixNano(),
 	}
-	finalGossipState := map[string]*kronospb.Info{
-		"hostPort-0": {
-			Data:      []byte("hostPort-0"),
+	finalGossipState := map[GossipKey]*kronospb.Info{
+		"key-0": {
+			Data:      []byte("key-0"),
 			Timestamp: timeStamps[0],
 		},
-		"hostPort-1": {
-			Data:      []byte("hostPort-1"),
+		"key-1": {
+			Data:      []byte("key-1"),
 			Timestamp: timeStamps[1],
 		},
-		"hostPort-2": {
-			Data:      []byte("hostPort-2"),
+		"key-2": {
+			Data:      []byte("key-2"),
 			Timestamp: timeStamps[2],
 		},
-		"hostPort-3": {
-			Data:      []byte("hostPort-3"),
+		"key-3": {
+			Data:      []byte("key-3"),
 			Timestamp: timeStamps[3],
 		},
 	}
 	for i := 0; i < 4; i++ {
-		gossipServers[i].updateGossipState(map[string]*kronospb.Info{
-			fmt.Sprintf("hostPort-%v", i): {
-				Data:      []byte(fmt.Sprintf("hostPort-%v", i)),
+		gossipServers[i].updateGossipState(map[GossipKey]*kronospb.Info{
+			GossipKey(fmt.Sprintf("key-%v", i)): {
+				Data:      []byte(fmt.Sprintf("key-%v", i)),
 				Timestamp: timeStamps[i],
 			},
 		})

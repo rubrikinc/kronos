@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/rubrikinc/kronos/pb"
+	"github.com/scaledata/etcd/pkg/types"
 )
 
 // NodeAddr converts address in host:port format to NodeAddr.
@@ -42,4 +43,10 @@ func AddToURLPath(baseURL url.URL, path string) url.URL {
 	addNodeURL := baseURL
 	addNodeURL.Path = filepath.Join(baseURL.Path, path)
 	return addNodeURL
+}
+
+// IsValidRaftAddr checks if the given address is a valid raft address.
+func IsValidRaftAddr(addr string) bool {
+	_, err := types.NewURLs([]string{addr})
+	return err == nil
 }

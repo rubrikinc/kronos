@@ -656,3 +656,54 @@ func TestKronosStrayMessages(t *testing.T) {
 		a.NoError(err)
 	}
 }
+
+func TestExchangeStores(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 5
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			RaftSnapCount:            2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+	// give some time to elect the oracle
+	time.Sleep(kronosStabilizationBufferTime)
+	// validate time across cluster is in similar range
+
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond,
+		false)
+	a.NoError(err)
+
+	oldId1, err := tc.NodeID(0)
+	a.NoError(err)
+
+	oldId2, err := tc.NodeID(1)
+	a.NoError(err)
+
+	a.NoError(tc.ExchangeDataDir(ctx, 0, 1))
+
+	time.Sleep(kronosStabilizationBufferTime)
+
+	newId1, err := tc.NodeID(0)
+	a.NoError(err)
+
+	newId2, err := tc.NodeID(1)
+	a.NoError(err)
+
+	a.Equal(oldId1, newId2, "Node 0 should have the data of node 1")
+	a.Equal(oldId2, newId1, "Node 1 should have the data of node 0")
+
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond,
+		false)
+	a.NoError(err)
+}

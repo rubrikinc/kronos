@@ -3,9 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -18,16 +16,8 @@ import (
 	"github.com/rubrikinc/kronos/metadata"
 )
 
-const (
-	mappingFileFlag = "mapping-file"
-)
-
 var clusterCtx struct {
 	dataDir string
-}
-
-var clusterReIPCtx struct {
-	mappingFile string
 }
 
 var clusterCmd = &cobra.Command{
@@ -39,19 +29,6 @@ Operate on cluster metadata persisted on node.
 	Run: func(cmd *cobra.Command, args []string) {
 		_ = cmd.Usage()
 		os.Exit(1)
-	},
-}
-
-var clusterReIPCmd = &cobra.Command{
-	Use:   "re_ip",
-	Short: "Update addresses of nodes in the cluster",
-	Long: `
-Update addresses of nodes in the kronos cluster. Kronos should not be running on
-any node in the cluster when this operation happens. This operation should be
-done on all the nodes with same mappingFile.
-`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runClusterReIP()
 	},
 }
 
@@ -95,7 +72,6 @@ on this node and may not be the true state at the current time.
 
 func init() {
 	dataDirCmds := []*cobra.Command{
-		clusterReIPCmd,
 		clusterLsCmd,
 		clusterBackupCmd,
 		clusterRestoreCmd,
@@ -110,67 +86,12 @@ func init() {
 		_ = cmd.MarkFlagRequired(dataDirFlag)
 	}
 
-	clusterReIPCmd.Flags().StringVar(
-		&clusterReIPCtx.mappingFile,
-		mappingFileFlag,
-		"",
-		`
-Path to json file which contains mappings of old addresses to new addresses in a
-dict with old addresses as keys and new addresses as values.
-Only hosts should be present in both old and new addresses if only hosts
-should be updated. 
-'host:port' should be present in both old and new addresses if both hosts and
-ports need to be updated.
-Example mappingFile :
-To update only hosts:
-    {
-      "1.2.3.4":"5.6.7.8",
-      "9.10.11.12":"13.14.15.16"
-    }
-
-To update ports also:
-    {
-      "1.2.3.4:5766":"5.6.7.8:5768",
-      "9.10.11.12:9763":"9.10.11.12:6734"
-    }
-`,
-	)
-	_ = clusterReIPCmd.MarkFlagRequired(mappingFileFlag)
-
 	clusterCmd.AddCommand(
-		clusterReIPCmd,
 		clusterLsCmd,
 		clusterRemoveCmd,
 		clusterBackupCmd,
 		clusterRestoreCmd,
 	)
-}
-
-func runClusterReIP() {
-	ctx := context.Background()
-	var oldToNewAddr map[string]string
-	data, err := ioutil.ReadFile(clusterReIPCtx.mappingFile)
-	if err != nil {
-		log.Fatal(ctx, err)
-	}
-	if err = json.Unmarshal(data, &oldToNewAddr); err != nil {
-		log.Fatal(ctx, err)
-	}
-	withPorts, err := validateMapping(oldToNewAddr)
-	if err != nil {
-		log.Fatal(ctx, err)
-	}
-	cluster, err := metadata.LoadCluster(clusterCtx.dataDir, false /*readOnly*/)
-	if err != nil {
-		log.Fatal(ctx, err)
-	}
-	defer kronosutil.CloseWithErrorLog(ctx, cluster)
-	if err := cluster.UpdateAddrs(oldToNewAddr, withPorts); err != nil {
-		log.Fatal(ctx, err)
-	}
-	if err := cluster.Persist(); err != nil {
-		log.Fatal(ctx, err)
-	}
 }
 
 func runCmdWithFatal(ctx context.Context, cmd *exec.Cmd) {

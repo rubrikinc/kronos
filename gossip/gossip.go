@@ -8,29 +8,56 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
+	"github.com/rubrikinc/kronos/kronosutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	kronospb "github.com/rubrikinc/kronos/pb"
 	"google.golang.org/grpc"
 )
 
 var (
-	nodeDescriptorPrefix = "hostPort-"
-	livenessPrefix       = "liveness-"
 	nodeDescriptorPeriod = 10 * time.Minute
 	livenessPeriod       = 1 * time.Second
 	gossipPeriod         = time.Second
 	printGossipPeriod    = time.Second
+	delimiter            = "-"
 )
 
-var gossipCallBacks map[string]func(*Server, *kronospb.Info)
+const (
+	NodeDescriptorPrefix = PrefixKey("hostPort")
+	LivenessPrefix       = PrefixKey("liveness")
+)
 
-func init() {
-	gossipCallBacks = make(map[string]func(*Server, *kronospb.Info))
-	gossipCallBacks[nodeDescriptorPrefix] = func(g *Server, info *kronospb.Info) {
-		g.addPeerLocked(string(info.Data))
-	}
+type PrefixKey string
+type GossipKey string
+
+func (p PrefixKey) String() string {
+	return string(p)
 }
+
+func (p PrefixKey) Encode(id string) GossipKey {
+	return GossipKey(string(p) + delimiter + id)
+}
+
+func (p PrefixKey) Decode(encodedKey GossipKey) string {
+	return string(encodedKey)[len(p)+len(delimiter):]
+}
+
+func (p PrefixKey) isPrefixOf(encodedKey GossipKey) bool {
+	return len(p) <= len(encodedKey) && string(p) == string(encodedKey[:len(p)])
+}
+
+type peerSet map[string]struct{}
+
+func (p peerSet) add(peer string) {
+	p[peer] = struct{}{}
+}
+func (p peerSet) remove(peer string) {
+	delete(p, peer)
+}
+
+type Callback func(*Server, GossipKey, *kronospb.Info)
 
 // Server is the gossip server.
 type Server struct {
@@ -38,8 +65,33 @@ type Server struct {
 	advertisedHostPort string
 	nodeID             string
 	clusterID          string
-	data               map[string]*kronospb.Info
-	knownPeerHostPort  map[string]struct{}
+	certsDir           string
+	raftAddr           *kronospb.NodeAddr
+	data               map[GossipKey]*kronospb.Info
+	peers              peerSet
+	nodeList           map[string]*kronospb.NodeDescriptor
+	connMap            map[string]*grpc.ClientConn
+	callBacks          map[PrefixKey][]Callback
+}
+
+func (g *Server) RegisterCallback(prefix PrefixKey, cb Callback,
+	runOnExistingKeys bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if _, exists := g.callBacks[prefix]; !exists {
+		g.callBacks[prefix] = make([]Callback, 0)
+	}
+
+	g.callBacks[prefix] = append(g.callBacks[prefix], cb)
+
+	if !runOnExistingKeys {
+		return
+	}
+
+	for k, v := range g.data {
+		g.processCallbacksLocked(k, v)
+	}
 }
 
 // Gossip is the RPC handler for gossiping information between nodes in the
@@ -52,66 +104,106 @@ func (g *Server) Gossip(ctx context.Context,
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.updateGossipStateLocked(request.GossipMap)
+	updMap := make(map[GossipKey]*kronospb.Info)
+	for k, v := range request.GossipMap {
+		updMap[GossipKey(k)] = &kronospb.Info{Data: v.Data, Timestamp: v.Timestamp}
+	}
+	g.updateGossipStateLocked(updMap)
 	res := &kronospb.Response{}
 	res.NodeId = g.nodeID
 	// deep copy g.data
 	res.Data = make(map[string]*kronospb.Info)
 	for k, v := range g.data {
-		res.Data[k] = &kronospb.Info{Data: v.Data, Timestamp: v.Timestamp}
+		res.Data[string(k)] = &kronospb.Info{Data: v.Data, Timestamp: v.Timestamp}
 	}
 	return res, nil
 }
 
+func (g *Server) removeConnLocked(ctx context.Context, peer string) {
+	if conn, ok := g.connMap[peer]; ok {
+		err := conn.Close()
+		if err != nil {
+			log.Errorf(ctx, "Error closing connection to peer %s: %v", peer, err)
+			return
+		}
+	}
+	delete(g.connMap, peer)
+}
+
+func (g *Server) removePeerLocked(ctx context.Context, peer string) {
+	g.peers.remove(peer)
+	g.removeConnLocked(ctx, peer)
+}
+
 // AddPeer adds a new peer to the gossip server.
-func (g *Server) addPeerLocked(addr string) {
-	if _, err := netip.ParseAddrPort(addr); err != nil {
-		// not a valid IP
+func (g *Server) addPeerLocked(ctx context.Context,
+	desc *kronospb.NodeDescriptor) {
+	nodeId := desc.NodeId
+	raftAddr := desc.RaftAddr
+	grpcAddr := desc.GrpcAddr
+	if _, err := netip.ParseAddrPort(grpcAddr); err != nil {
+		log.Errorf(ctx, "Invalid grpc addr for nodeID %v: %v", nodeId,
+			grpcAddr)
 		return
 	}
-	if g.advertisedHostPort == addr {
+	if !kronosutil.IsValidRaftAddr(raftAddr) {
+		log.Errorf(ctx, "Invalid raft addr for nodeID %v : %s", nodeId,
+			raftAddr)
 		return
 	}
-	log.Infof(context.Background(), "Adding peer %s", addr)
-	g.knownPeerHostPort[addr] = struct{}{}
+	if nodeId == g.nodeID {
+		return
+	}
+	log.Infof(ctx, "Adding peer %s : %s", nodeId, grpcAddr)
+	g.peers.add(grpcAddr)
+	if oldDesc, ok := g.nodeList[nodeId]; ok {
+		if oldDesc.GrpcAddr != grpcAddr {
+			g.removePeerLocked(ctx, oldDesc.GrpcAddr)
+		}
+	}
+	g.nodeList[nodeId] = desc
 	// TODO: Persist the new peer to disk.
+}
+
+func (g *Server) getPeersLocked() []string {
+	peers := make([]string, 0)
+	for peer, _ := range g.peers {
+		peers = append(peers, peer)
+	}
+	return peers
 }
 
 // GetPeers Return the current list of peers.
 func (g *Server) GetPeers() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	peers := make([]string, 0)
-	for peer := range g.knownPeerHostPort {
-		peers = append(peers, peer)
-	}
-	return peers
+	return g.getPeersLocked()
 }
 
 // SetInfo sets the value for the given key.
-func (g *Server) SetInfo(key string, value []byte) {
+func (g *Server) SetInfo(key GossipKey, value []byte) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.updateGossipStateLocked(map[string]*kronospb.Info{
+	g.updateGossipStateLocked(map[GossipKey]*kronospb.Info{
 		key: {Data: value, Timestamp: time.Now().UnixNano()},
 	})
 }
 
-func (g *Server) SetNodeID(nodeID string) {
+func (g *Server) SetNodeID(ctx context.Context, nodeID string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.nodeID != "" {
-		log.Warningf(context.Background(),
+		log.Warningf(ctx,
 			"Node ID being changed from %s to %s", g.nodeID, nodeID)
 	}
 	g.nodeID = nodeID
 }
 
-func (g *Server) SetClusterID(clusterID string) {
+func (g *Server) SetClusterID(ctx context.Context, clusterID string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.clusterID != "" {
-		log.Warningf(context.Background(),
+		log.Warningf(ctx,
 			"Cluster ID being changed from %s to %s", g.clusterID, clusterID)
 	}
 	g.clusterID = clusterID
@@ -125,13 +217,29 @@ func (g *Server) gossip(ctx context.Context) {
 	}
 	for _, peer := range peerList {
 		func() {
-			// TODO: remove insecure
-			conn, err := grpc.Dial(peer, grpc.WithInsecure())
-			if err != nil {
-				log.Errorf(ctx, "Error dialing peer %s: %v", peer, err)
-				return
+			var conn *grpc.ClientConn
+			if _, ok := g.connMap[peer]; ok {
+				conn = g.connMap[peer]
+			} else {
+				var dialOpts grpc.DialOption
+				if g.certsDir == "" {
+					dialOpts = grpc.WithInsecure()
+				} else {
+					creds, err := kronosutil.SSLCreds(g.certsDir)
+					if err != nil {
+						log.Infof(ctx, "Error creating SSL creds: %v", err)
+						return
+					}
+					dialOpts = grpc.WithTransportCredentials(creds)
+				}
+				var err error
+				conn, err = grpc.Dial(peer, dialOpts)
+				if err != nil {
+					log.Errorf(ctx, "Error dialing peer %s: %v", peer, err)
+					return
+				}
+				g.connMap[peer] = conn
 			}
-			defer conn.Close()
 			client := kronospb.NewGossipClient(conn)
 			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
@@ -139,7 +247,8 @@ func (g *Server) gossip(ctx context.Context) {
 			gossipMap := make(map[string]*kronospb.Info)
 			// deep copy g.data
 			for k, v := range g.data {
-				gossipMap[k] = &kronospb.Info{Data: v.Data, Timestamp: v.Timestamp}
+				gossipMap[string(k)] = &kronospb.Info{Data: v.Data,
+					Timestamp: v.Timestamp}
 			}
 			req := &kronospb.Request{
 				ClusterId:          g.clusterID,
@@ -153,29 +262,35 @@ func (g *Server) gossip(ctx context.Context) {
 				log.Errorf(ctx, "error gossiping with peer %s: %v", peer, err)
 				return
 			}
-			g.updateGossipState(res.Data)
+			updMap := make(map[GossipKey]*kronospb.Info)
+			for k, v := range res.Data {
+				updMap[GossipKey(k)] = &kronospb.Info{Data: v.Data, Timestamp: v.Timestamp}
+			}
+			g.updateGossipState(updMap)
 		}()
 	}
 }
 
-func (g *Server) processCallback(key string, info *kronospb.Info) {
-	for prefix, f := range gossipCallBacks {
-		if len(prefix) <= len(key) && prefix == key[:len(prefix)] {
-			f(g, info)
+func (g *Server) processCallbacksLocked(key GossipKey, info *kronospb.Info) {
+	for prefix, cbs := range g.callBacks {
+		if prefix.isPrefixOf(key) {
+			for _, cb := range cbs {
+				cb(g, key, info)
+			}
 		}
 	}
 }
 
-func (g *Server) updateGossipStateLocked(gossipMap map[string]*kronospb.Info) {
+func (g *Server) updateGossipStateLocked(gossipMap map[GossipKey]*kronospb.Info) {
 	for k, v := range gossipMap {
 		if cur, ok := g.data[k]; !ok || cur.Timestamp < v.Timestamp {
-			g.processCallback(k, v)
+			g.processCallbacksLocked(k, v)
 			g.data[k] = &kronospb.Info{Data: v.Data, Timestamp: v.Timestamp}
 		}
 	}
 }
 
-func (g *Server) updateGossipState(gossipMap map[string]*kronospb.Info) {
+func (g *Server) updateGossipState(gossipMap map[GossipKey]*kronospb.Info) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.updateGossipStateLocked(gossipMap)
@@ -201,7 +316,7 @@ func (g *Server) periodicPrintGossipData(ctx context.Context,
 			g.mu.Lock()
 			defer g.mu.Unlock()
 			logMsg += "Gossip Info\n"
-			logMsg += fmt.Sprintf("peers : %v\n", g.knownPeerHostPort)
+			logMsg += fmt.Sprintf("peers : %v\n", g.getPeersLocked())
 			jsonData, err := json.Marshal(g.data)
 			if err != nil {
 				log.Errorf(ctx, "Error marshalling gossip data: %v", err)
@@ -219,19 +334,41 @@ func (g *Server) periodicPrintGossipData(ctx context.Context,
 }
 
 // NewServer creates a new gossip server.
-func NewServer(advertisedHostPort string, peers []string) *Server {
-	// remove addr from peers
+func NewServer(advertisedHostPort string,
+	raftAddr *kronospb.NodeAddr, peers []string, certsDir string) *Server {
 	s := &Server{
-		data:               make(map[string]*kronospb.Info),
 		advertisedHostPort: advertisedHostPort,
-		knownPeerHostPort:  make(map[string]struct{}),
+		raftAddr:           raftAddr,
+		certsDir:           certsDir,
+		peers:              make(peerSet),
+		data:               make(map[GossipKey]*kronospb.Info),
+		nodeList:           make(map[string]*kronospb.NodeDescriptor),
+		connMap:            make(map[string]*grpc.ClientConn),
+		callBacks:          make(map[PrefixKey][]Callback),
 	}
 	// Remove self from peers
 	for _, p := range peers {
 		if p != advertisedHostPort {
-			s.knownPeerHostPort[p] = struct{}{}
+			s.peers.add(p)
 		}
 	}
+
+	s.RegisterCallback(NodeDescriptorPrefix, func(g *Server, k GossipKey, i *kronospb.Info) {
+		var desc kronospb.NodeDescriptor
+		err := proto.Unmarshal(i.Data, &desc)
+		ctx := context.Background()
+		if err != nil {
+			log.Errorf(ctx, "Error unmarshalling node descriptor: %v", err)
+			return
+		}
+		if NodeDescriptorPrefix.Decode(k) != desc.NodeId {
+			log.Errorf(ctx, "Node ID mismatch: %s != %s",
+				NodeDescriptorPrefix.Decode(k), desc.NodeId)
+			return
+		}
+		g.addPeerLocked(ctx, &desc)
+	}, false)
+
 	return s
 }
 
@@ -243,22 +380,42 @@ func (g *Server) Start(ctx context.Context, stopCh chan struct{}) {
 		g.gossip(ctx)
 	}
 	runPeriodically(stopCh, gossipPeriod, f)
+	// Clean up conns when we are shutting down.
+	peers := g.GetPeers()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, peer := range peers {
+		g.removeConnLocked(ctx, peer)
+	}
 }
 
 // Liveness periodically gossips liveness information to other nodes in the
 // cluster.
-func Liveness(g *Server, stopCh chan struct{}) {
+func Liveness(ctx context.Context, g *Server, stopCh chan struct{}) {
 	f := func() {
-		g.SetInfo(livenessPrefix+g.nodeID, []byte("live"))
+		g.SetInfo(LivenessPrefix.Encode(g.nodeID), []byte("live"))
 	}
 	runPeriodically(stopCh, livenessPeriod, f)
 }
 
 // NodeDescriptor periodically gossips node descriptor information to other
 // nodes in the cluster.
-func NodeDescriptor(g *Server, stopCh chan struct{}) {
+func NodeDescriptor(ctx context.Context, g *Server, stopCh chan struct{}) {
 	f := func() {
-		g.SetInfo(nodeDescriptorPrefix+g.nodeID, []byte(g.advertisedHostPort))
+		secure := g.certsDir != ""
+		url := kronosutil.AddrToURL(g.raftAddr, secure)
+		desc := &kronospb.NodeDescriptor{
+			NodeId:   g.nodeID,
+			RaftAddr: url.String(),
+			GrpcAddr: g.advertisedHostPort,
+		}
+		descBytes, err := proto.Marshal(desc)
+		if err != nil {
+			log.Errorf(ctx,
+				"Error marshalling node descriptor : %v", err)
+			return
+		}
+		g.SetInfo(NodeDescriptorPrefix.Encode(g.nodeID), descBytes)
 	}
 	runPeriodically(stopCh, nodeDescriptorPeriod, f)
 }

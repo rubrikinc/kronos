@@ -3,7 +3,6 @@ package cluster
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"net"
@@ -336,16 +335,11 @@ func (tc *TestCluster) OracleForNode(ctx context.Context, nodeIdx int) (int, err
 // NodeID returns the raft id of the idx node. It reads cluster
 // metadata of idx node to get the same.
 func (tc *TestCluster) NodeID(idx int) (string, error) {
-	c, err := metadata.LoadCluster(tc.Nodes[idx].dataDir, true /*readOnly*/)
+	id, err := metadata.FetchNodeID(tc.Nodes[idx].dataDir)
 	if err != nil {
 		return "", err
 	}
-	for id, node := range c.ActiveNodes() {
-		if node.RaftAddr.Port == tc.Nodes[idx].raftPort {
-			return id, nil
-		}
-	}
-	return "", errors.Errorf("nodeIdx %d not found in cluster metadata", idx)
+	return id.String(), nil
 }
 
 // RemoveNode removes a node from testCluster and wipes it's data directory
@@ -529,43 +523,7 @@ func (tc *TestCluster) ReIP(ctx context.Context) error {
 		newSeedHosts = append(newSeedHosts, oldToNewAddr[seed])
 	}
 	tc.seedHosts = newSeedHosts
-	tempFile, err := afero.TempFile(tc.fs, "", "mappingFile")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tc.fs.Remove(tempFile.Name()) }()
-	data, err := json.Marshal(oldToNewAddr)
-	if err != nil {
-		return err
-	}
-	for written := 0; written < len(data); {
-		n, err := tempFile.Write(data[written:])
-		written += n
-		if err != nil {
-			return err
-		}
-	}
-	for _, node := range tc.Nodes {
-		_, err := afero.TempDir(tc.fs, node.logDir, "reIp")
-		if err != nil {
-			return err
-		}
-		reIPArgs := []string{
-			//"--log-dir", reIPLogDir,
-			"cluster",
-			"re_ip",
-			"--mapping-file", tempFile.Name(),
-			"--data-dir", node.dataDir,
-		}
-		reIPCmd := exec.Command(tc.kronosBinary, reIPArgs...)
-		if err := reIPCmd.Run(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				log.Error(ctx, reIPArgs, exitErr.Stderr)
-				return errors.Wrap(err, string(exitErr.Stderr))
-			}
-			return err
-		}
-	}
+
 	if err = tc.generateProcfile(ctx); err != nil {
 		return err
 	}
@@ -899,4 +857,34 @@ func (tc *TestCluster) validateTimeInConsensus(
 		return nil, nil, err
 	}
 	return timeOnNodes, uptimeOnNodes, nil
+}
+
+func (tc *TestCluster) ExchangeDataDir(ctx context.Context, id1 int,
+	id2 int) error {
+	err := tc.RunOperation(ctx, Stop, id1, id2)
+	if err != nil {
+		return err
+	}
+
+	// Exchange data dir
+	tmpDataDir := tc.Nodes[id1].dataDir + "_tmp"
+	err = tc.fs.Rename(tc.Nodes[id1].dataDir, tmpDataDir)
+	if err != nil {
+		return err
+	}
+	err = tc.fs.Rename(tc.Nodes[id2].dataDir, tc.Nodes[id1].dataDir)
+	if err != nil {
+		return err
+	}
+	err = tc.fs.Rename(tmpDataDir, tc.Nodes[id2].dataDir)
+	if err != nil {
+		return err
+	}
+
+	err = tc.RunOperation(ctx, Start, id1, id2)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

@@ -677,7 +677,7 @@ func (k *Server) startGossipping(ctx context.Context) {
 			log.Errorf(context.Background(), "failed to fetch cluster uuid: %v", err)
 			time.Sleep(time.Second)
 		} else {
-			k.GossipServer.SetClusterID(uuid.String())
+			k.GossipServer.SetClusterID(ctx, uuid.String())
 			break
 		}
 	}
@@ -685,11 +685,11 @@ func (k *Server) startGossipping(ctx context.Context) {
 	if err != nil {
 		log.Errorf(context.Background(), "failed to fetch node id: %v", err)
 	} else {
-		k.GossipServer.SetNodeID(nodeId.String())
+		k.GossipServer.SetNodeID(ctx, nodeId.String())
 	}
 	go k.GossipServer.Start(ctx, k.StopC)
-	go gossip.Liveness(k.GossipServer, k.StopC)
-	go gossip.NodeDescriptor(k.GossipServer, k.StopC)
+	go gossip.Liveness(ctx, k.GossipServer, k.StopC)
+	go gossip.NodeDescriptor(ctx, k.GossipServer, k.StopC)
 }
 
 // RunServer starts a Kronos GRPC server
@@ -761,12 +761,17 @@ type Config struct {
 // NewKronosServer returns an instance of Server based on given
 // configurations
 func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
-	oracleSM := oracle.NewRaftStateMachine(ctx, config.RaftConfig)
+	g := gossip.NewServer(net.JoinHostPort(config.GRPCHostPort.Host,
+		config.GRPCHostPort.Port),
+		config.RaftHostPort,
+		config.GossipSeedHosts, config.CertsDir)
+
+	oracleSM := oracle.NewRaftStateMachine(ctx, config.RaftConfig, g)
 	if config.Metrics == nil {
 		config.Metrics = kronosstats.NewTestMetrics()
 	}
 
-	return &Server{
+	s := &Server{
 		Clock:                    config.Clock,
 		OracleSM:                 oracleSM,
 		Client:                   NewGRPCClient(config.CertsDir),
@@ -779,8 +784,8 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 		OracleUptimeCapDelta:     config.OracleUptimeCapDelta,
 		manageOracleTickInterval: config.ManageOracleTickInterval,
 		Metrics:                  config.Metrics,
-		GossipServer: gossip.NewServer(config.GRPCHostPort.Host+":"+config.
-			GRPCHostPort.Port,
-			config.GossipSeedHosts),
-	}, nil
+		GossipServer:             g,
+	}
+
+	return s, nil
 }

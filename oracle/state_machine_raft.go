@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/rubrikinc/kronos/gossip"
 	"github.com/rubrikinc/kronos/protoutil"
 
 	"github.com/scaledata/etcd/snap"
@@ -74,12 +75,14 @@ var _ StateMachine = &RaftStateMachine{}
 
 // NewRaftStateMachine returns an instance of a distributed oracle state
 // machine managed by raft
-func NewRaftStateMachine(ctx context.Context, rc *RaftConfig) StateMachine {
+func NewRaftStateMachine(ctx context.Context, rc *RaftConfig,
+	g *gossip.Server) StateMachine {
 	var raftStateMachine *RaftStateMachine
 	proposeC := make(chan string)
 	getSnapshot := func() ([]byte, error) { return raftStateMachine.GetSnapshot(ctx) }
 	nodeID := metadata.FetchOrAssignNodeID(ctx, rc.DataDir).String()
-	commitC, errorC, snapshotterReady := newRaftNode(rc, getSnapshot, proposeC, nodeID)
+	commitC, errorC, snapshotterReady := newRaftNode(rc, getSnapshot,
+		proposeC, nodeID, g)
 
 	raftStateMachine = &RaftStateMachine{
 		proposeC:     proposeC,

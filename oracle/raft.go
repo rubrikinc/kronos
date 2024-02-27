@@ -14,6 +14,7 @@ import (
 	"github.com/coreos/pkg/capnslog"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
+	"github.com/rubrikinc/kronos/gossip"
 	"github.com/scaledata/etcd/etcdserver/stats"
 	"github.com/scaledata/etcd/pkg/fileutil"
 	"github.com/scaledata/etcd/pkg/transport"
@@ -373,7 +374,8 @@ var _ rafthttp.Raft = &raftNode{}
 // channel is current), then new log entries. To shutdown, close proposeC and
 // read errorC.
 func newRaftNode(
-	rc *RaftConfig, getSnapshot func() ([]byte, error), proposeC <-chan string, nodeID string,
+	rc *RaftConfig, getSnapshot func() ([]byte, error),
+	proposeC <-chan string, nodeID string, g *gossip.Server,
 ) (<-chan string, <-chan error, <-chan *snap.Snapshotter) {
 	ctx := context.Background()
 	seedHosts, err := convertToNodeAddrs(rc.SeedHosts)
@@ -405,7 +407,7 @@ func newRaftNode(
 		snapshotterReady:  make(chan *snap.Snapshotter, 1),
 		// rest of structure populated after WAL replay
 	}
-	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort)
+	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort, g)
 	return commitC, errorC, rn.snapshotterReady
 }
 
@@ -795,12 +797,31 @@ func (rc *raftNode) checkDuplicate(ctx context.Context,
 	}
 }
 
+func (rc *raftNode) maybeAddRemote(ctx context.Context,
+	desc *kronospb.NodeDescriptor) {
+	if !kronosutil.IsValidRaftAddr(desc.RaftAddr) {
+		log.Errorf(ctx, "Invalid raft address for node %v : %v",
+			desc.NodeId, desc.RaftAddr)
+		return
+	}
+	typedNodeId, err := types.IDFromString(desc.NodeId)
+	if err != nil {
+		log.Errorf(ctx, "Failed to convert node id to raft id, error: %v", err)
+		return
+	}
+	if rc.transport != nil {
+		rc.transport.AddRemote(typedNodeId, []string{desc.RaftAddr})
+		rc.transport.UpdatePeer(typedNodeId, []string{desc.RaftAddr})
+	}
+}
+
 // startRaft replays the existing WAL and joins the raft cluster
 func (rc *raftNode) startRaft(
 	ctx context.Context,
 	confChangeC chan<- sdraftpb.ConfChange,
 	certsDir string,
 	grpcAddr *kronospb.NodeAddr,
+	g *gossip.Server,
 ) {
 	if !fileutil.Exist(rc.snapdir) {
 		if err := os.Mkdir(rc.snapdir, 0750); err != nil {
@@ -846,20 +867,6 @@ func (rc *raftNode) startRaft(
 		rc.clusterID = uint64(metadata.FetchOrAssignClusterUUID(ctx, rc.datadir, true))
 	} else {
 		if isFirstSH {
-			var nodesIncludingRemoved []kronoshttp.Node
-			err = rc.seedRpc(ctx, tlsInfo, 1*time.Second,
-				func(ctx context.
-					Context,
-					client *kronoshttp.
-						ClusterClient) error {
-					var err error
-					nodesIncludingRemoved, err = client.Nodes(ctx)
-					return err
-				})
-
-			if err != nil {
-				rc.checkDuplicate(ctx, nodesIncludingRemoved)
-			}
 			rc.clusterID = uint64(metadata.FetchOrAssignClusterUUID(ctx, rc.datadir, false))
 		} else {
 			// Add all hosts to cluster formed by the first seedHost.
@@ -925,71 +932,25 @@ func (rc *raftNode) startRaft(
 		DialTimeout: 5 * time.Second,
 		TLSInfo:     tlsInfo,
 	}
+
 	if err := rc.transport.Start(); err != nil {
 		log.Fatalf(ctx, "Failed to start raft transport, error: %v", err)
 	}
 
+	g.RegisterCallback(gossip.NodeDescriptorPrefix, func(
+		g *gossip.Server, key gossip.GossipKey, info *kronospb.Info) {
+		var desc kronospb.NodeDescriptor
+		if err := proto.Unmarshal(info.Data, &desc); err != nil {
+			log.Errorf(ctx, "Failed to unmarshal node descriptor, error: %v", err)
+			return
+		}
+		if desc.NodeId == rc.nodeID {
+			return
+		}
+		rc.maybeAddRemote(ctx, &desc)
+	}, true)
+
 	log.Infof(ctx, "Raft Address: %v, raft Id: %v", rc.localAddr, rc.nodeID)
-	secure := !rc.transport.TLSInfo.Empty()
-
-	// Add other nodes as seen by the cluster metadata as raft transport peers.
-	for nodeID, nodeData := range rc.cluster.ActiveNodes() {
-		if nodeID != rc.nodeID {
-			raftID := raftID(nodeID)
-			hostURL := kronosutil.AddrToURL(nodeData.RaftAddr, secure)
-			// In case of an already initialized node, wal and thus some old
-			// confChange entries might get replayed. Replay of old confChange
-			// entries would add the node with addresses which could be stale due to
-			// re-ip. AddPeer won't have any effect as it doesn't update the address
-			// of a peer if it already existed. Also, UpdatePeer is noop if the peer
-			// doesn't exist.
-			// Therefore, AddPeer and then UpdatePeer to handle re_ip where the id
-			// might already exist as peer with old address.
-			rc.transport.AddPeer(raftID, []string{hostURL.String()})
-			rc.transport.UpdatePeer(raftID, []string{hostURL.String()})
-		}
-	}
-
-	// Add existing cluster as remote to make this node catch up with the raft
-	// cluster.
-	if !isFirstSH {
-		var nodesIncludingRemoved []kronoshttp.Node
-		var lastTryError error
-		lastTryError = rc.seedRpc(ctx, tlsInfo, time.Minute,
-			func(ctx context.Context, client *kronoshttp.ClusterClient) error {
-				nodesIncludingRemoved, lastTryError = client.Nodes(ctx)
-				return lastTryError
-			})
-		if lastTryError != nil {
-			if !isNodeInitialized {
-				log.Fatalf(ctx, "Failed to get nodes from %v, err: %v", rc.seedHosts, err)
-			}
-			// Initialized nodes have non-empty cluster metadata implying they would
-			// have added those nodes as peers. Don't fatal over here as they are
-			// somewhat connected to the cluster through peers.
-			log.Errorf(ctx, "Failed to get nodes from %v, err: %v", rc.seedHosts, err)
-		}
-
-		// Add existing cluster as remote to make this node catch up with the raft
-		// cluster.
-		for _, node := range nodesIncludingRemoved {
-			if node.IsRemoved {
-				if rc.nodeID == node.NodeID {
-					log.Fatalf(ctx, "This node (%v) has been removed from the cluster", rc.nodeID)
-				} else {
-					rc.cluster.RemoveNode(node.NodeID)
-				}
-				continue
-			}
-			// node still part of the cluster
-			if node.NodeID != rc.nodeID {
-				raftID := raftID(node.NodeID)
-				hostURL := kronosutil.AddrToURL(node.RaftAddr, secure)
-				// AddRemote is noop if the node exists as a peer.
-				rc.transport.AddRemote(raftID, []string{hostURL.String()})
-			}
-		}
-	}
 
 	// At this point both snapdir and waldir must have already been created, so we
 	// can start the purge goroutines.
