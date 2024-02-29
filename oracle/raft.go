@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -201,6 +202,8 @@ type raftNode struct {
 	node        raft.Node
 	raftStorage *raft.MemoryStorage
 	wal         *wal.WAL
+
+	gossip *gossip.Server
 
 	snapshotter      *snap.Snapshotter
 	snapshotterReady chan *snap.Snapshotter // signals when snapshotter is ready
@@ -405,9 +408,11 @@ func newRaftNode(
 		httpdonec:         make(chan struct{}),
 		snapTriggerConfig: newSnapTriggerConfig(rc.SnapCount),
 		snapshotterReady:  make(chan *snap.Snapshotter, 1),
+		gossip:            g,
 		// rest of structure populated after WAL replay
 	}
-	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort, g)
+	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort,
+		rc.WaitBeforeBootstrap, rc.SeedRpcRetryTimeout)
 	return commitC, errorC, rn.snapshotterReady
 }
 
@@ -547,6 +552,7 @@ func (rc *raftNode) publishEntries(ctx context.Context, ents []sdraftpb.Entry) b
 				log.Infof(ctx, "Processing remove node conf change %v", cc)
 				nodeID := types.ID(cc.NodeID).String()
 				rc.removeNode(nodeID)
+
 				if err := rc.cluster.Persist(); err != nil {
 					log.Errorf(
 						ctx,
@@ -821,7 +827,8 @@ func (rc *raftNode) startRaft(
 	confChangeC chan<- sdraftpb.ConfChange,
 	certsDir string,
 	grpcAddr *kronospb.NodeAddr,
-	g *gossip.Server,
+	waitBeforeBootstrap time.Duration,
+	seedRpcRetryTimeout time.Duration,
 ) {
 	if !fileutil.Exist(rc.snapdir) {
 		if err := os.Mkdir(rc.snapdir, 0750); err != nil {
@@ -866,36 +873,81 @@ func (rc *raftNode) startRaft(
 		rc.node = raft.RestartNode(c)
 		rc.clusterID = uint64(metadata.FetchOrAssignClusterUUID(ctx, rc.datadir, true))
 	} else {
-		if isFirstSH {
-			rc.clusterID = uint64(metadata.FetchOrAssignClusterUUID(ctx, rc.datadir, false))
-		} else {
-			// Add all hosts to cluster formed by the first seedHost.
-			if err := rc.seedRpc(ctx, tlsInfo,
-				time.Minute, func(ctx context.Context,
-					client *kronoshttp.ClusterClient) error {
-					request := &kronoshttp.AddNodeRequest{
-						NodeID:  rc.nodeID,
-						Address: kronosutil.NodeAddrToString(rc.localAddr),
-					}
-					nodesIncludingRemoved, err := client.Nodes(ctx)
-					if err != nil {
-						return err
-					}
-					rc.checkDuplicate(ctx, nodesIncludingRemoved)
-					clusterID, err := client.AddNode(ctx, request)
-					if err != nil {
-						return err
-					}
-					rc.clusterID = clusterID.ClusterID
-					err = metadata.PersistClusterUUID(ctx, rc.datadir,
-						types.ID(rc.clusterID))
-					if err != nil {
-						return err
-					}
-					return nil
-				}); err != nil {
-				log.Fatalf(ctx, "Failed to post add node request to %v, err: %v", rc.seedHosts[0], err)
+		// wait for a few rounds of gossip to get the nodes in the gossip network.
+		log.Infof(ctx, "Waiting for %v before bootstrapping", waitBeforeBootstrap)
+		rc.gossip.WaitForNRoundsofGossip(waitBeforeBootstrap, 2)
+		log.Infof(ctx, "Gossip network is ready")
+		nodes := rc.gossip.GetNodeList()
+		for _, node := range nodes {
+			parsedUrl, _ := url.Parse(node.RaftAddr)
+			if err != nil {
+				continue
 			}
+			alreadyExists := false
+			for _, seed := range rc.seedHosts {
+				if proto.Equal(seed, &kronospb.NodeAddr{
+					Host: parsedUrl.Hostname(),
+					Port: parsedUrl.Port(),
+				}) {
+					alreadyExists = true
+					break
+				}
+			}
+			if !alreadyExists {
+				rc.seedHosts = append(rc.seedHosts, &kronospb.NodeAddr{
+					Host: parsedUrl.Hostname(),
+					Port: parsedUrl.Port(),
+				})
+			}
+		}
+
+		timeout := seedRpcRetryTimeout
+		if !isFirstSH {
+			timeout *= 2
+		}
+
+		// Add all hosts to cluster formed by the first seedHost.
+		var err error
+		if err = rc.seedRpc(ctx, tlsInfo,
+			timeout, func(ctx context.Context,
+				client *kronoshttp.ClusterClient) error {
+				request := &kronoshttp.AddNodeRequest{
+					NodeID:  rc.nodeID,
+					Address: kronosutil.NodeAddrToString(rc.localAddr),
+				}
+				nodesIncludingRemoved, err := client.Nodes(ctx)
+				if err != nil {
+					return err
+				}
+				rc.checkDuplicate(ctx, nodesIncludingRemoved)
+				clusterID, err := client.AddNode(ctx, request)
+				if err != nil {
+					return err
+				}
+				rc.clusterID = clusterID.ClusterID
+				err = metadata.PersistClusterUUID(ctx, rc.datadir,
+					types.ID(rc.clusterID))
+				if err != nil {
+					return err
+				}
+				return nil
+			}); err != nil && !isFirstSH {
+			// If the first seed host fails to add itself to the cluster, then
+			// it means that the cluster is not yet formed. In this case, we
+			// should bootstrap a new cluster with itself.
+			log.Fatalf(ctx, "Failed to post add node request to %v, err: %v", rc.seedHosts[0], err)
+		}
+		if err == nil {
+			log.Infof(ctx, "Successfully added %s to the cluster", rc.nodeID)
+		}
+
+		isBootStrap := false
+		if isFirstSH && err != nil {
+			isBootStrap = true
+			log.Infof(ctx, "Bootstrapping a new cluster")
+			// This is the first seed host and it failed to add itself to the cluster.
+			// form a new cluster with itself.
+			rc.clusterID = uint64(metadata.FetchOrAssignClusterUUID(ctx, rc.datadir, false))
 		}
 
 		// Create an empty cluster. This will be populated by confChange entries/
@@ -906,7 +958,7 @@ func (rc *raftNode) startRaft(
 		}
 
 		var startingPeers []raft.Peer
-		if isFirstSH {
+		if isFirstSH && isBootStrap {
 			// only first seed host makes starts the initial cluster first time,
 			// and thus only that has non-nil peers in start node.
 			raftID := raftID(rc.nodeID)
@@ -937,7 +989,7 @@ func (rc *raftNode) startRaft(
 		log.Fatalf(ctx, "Failed to start raft transport, error: %v", err)
 	}
 
-	g.RegisterCallback(gossip.NodeDescriptorPrefix, func(
+	rc.gossip.RegisterCallback(gossip.NodeDescriptorPrefix, func(
 		g *gossip.Server, key gossip.GossipKey, info *kronospb.Info) {
 		var desc kronospb.NodeDescriptor
 		if err := proto.Unmarshal(info.Data, &desc); err != nil {

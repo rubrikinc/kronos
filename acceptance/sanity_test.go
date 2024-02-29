@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	kronosStabilizationBufferTime = 10 * time.Second
+	kronosStabilizationBufferTime = 15 * time.Second
 	manageOracleTickInterval      = time.Second
 	validationThreshold           = 50 * time.Millisecond
 	testTimeout                   = 5 * time.Minute
@@ -49,7 +49,7 @@ func TestKronosSanity(t *testing.T) {
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 
 	// give some time to elect the oracle
-	time.Sleep(kronosStabilizationBufferTime)
+	time.Sleep(bootstrapTime)
 	// PreCheck - validate time across cluster is in similar range
 	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
@@ -199,7 +199,7 @@ func TestKronosInsecureCluster(t *testing.T) {
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 
 	// give some time to elect the oracle
-	time.Sleep(10 * manageOracleTickInterval)
+	time.Sleep(bootstrapTime)
 	// PreCheck - validate time across cluster is in similar range
 	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
@@ -232,7 +232,7 @@ func TestKronosSanityReIP(t *testing.T) {
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 
 	// give some time to elect the oracle
-	time.Sleep(kronosStabilizationBufferTime)
+	time.Sleep(bootstrapTime)
 	// PreCheck - validate time across cluster is in similar range
 	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
@@ -285,7 +285,7 @@ func TestKronosSanityBackupRestore(t *testing.T) {
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 
 	// give some time to elect the oracle
-	time.Sleep(kronosStabilizationBufferTime)
+	time.Sleep(bootstrapTime)
 	// PreCheck - validate time across cluster is in similar range
 	_, _, err = tc.ValidateTimeInConsensus(
 		ctx,
@@ -381,7 +381,7 @@ func TestKronosSanityAddRemove(t *testing.T) {
 	}
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 	// give some time to elect the oracle
-	time.Sleep(kronosStabilizationBufferTime)
+	time.Sleep(bootstrapTime)
 
 	// remove node 2
 	nodeToRemove := 2
@@ -464,7 +464,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 		}
 	}
 	// Need more time to initialize more 7 nodes cluster.
-	time.Sleep(2 * kronosStabilizationBufferTime)
+	time.Sleep(bootstrapTime)
 	if _, _, err = tc.ValidateTimeInConsensus(
 		ctx,
 		validationThreshold,
@@ -577,7 +577,7 @@ func TestKronosSanityDuplicateNodes(t *testing.T) {
 	}
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 	// give some time to elect the oracle
-	time.Sleep(kronosStabilizationBufferTime)
+	time.Sleep(bootstrapTime)
 
 	WipeAndAdd := func(idx int) {
 		dataDir := tc.Nodes[idx].DataDir()
@@ -632,7 +632,7 @@ func TestKronosStrayMessages(t *testing.T) {
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 
 	// give some time to elect the oracle
-	time.Sleep(kronosStabilizationBufferTime)
+	time.Sleep(bootstrapTime)
 	// make sure the seed nodes are not the raft leader
 	a.NoError(tc.RunOperation(ctx, cluster.Stop, 0, 1))
 	a.NoError(tc.RunOperation(ctx, cluster.Start, 0, 1))
@@ -649,9 +649,12 @@ func TestKronosStrayMessages(t *testing.T) {
 	WipeAndAdd(0)
 	WipeAndAdd(1)
 	time.Sleep(2 * kronosStabilizationBufferTime)
-	// node 0 and node 1 are a new cluster now
-	// and should not crash due to stray messages from old cluster
-	for idx := 0; idx < 5; idx++ {
+	// node 0 will crash because there is a node with the same raft-addr
+	for idx := 0; idx < 2; idx++ {
+		_, err = tc.Time(ctx, idx)
+		a.Error(err)
+	}
+	for idx := 2; idx < 5; idx++ {
 		_, err = tc.Time(ctx, idx)
 		a.NoError(err)
 	}
@@ -677,7 +680,7 @@ func TestExchangeStores(t *testing.T) {
 	}
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 	// give some time to elect the oracle
-	time.Sleep(kronosStabilizationBufferTime)
+	time.Sleep(bootstrapTime)
 	// validate time across cluster is in similar range
 
 	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond,
@@ -706,4 +709,50 @@ func TestExchangeStores(t *testing.T) {
 	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond,
 		false)
 	a.NoError(err)
+}
+
+func TestFirstSeedDoesntFormNewCluster(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 5
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			RaftSnapCount:            2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+	time.Sleep(bootstrapTime)
+
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
+
+	RemoveAndAdd := func(idx int) {
+		// remove the first seed node
+		a.NoError(tc.RemoveNode(ctx, idx, -1, ""))
+
+		// add the first seed node back
+		_, err = tc.AddNode(ctx, idx)
+
+		// wait for the node to come up
+		time.Sleep(kronosStabilizationBufferTime)
+		// validate the first node didn't form a new cluster
+		_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+		a.NoError(err)
+
+		data, err := tc.Status(idx, false /*local*/)
+		a.NoError(err)
+		nodeInfos := nodeInfosFromBytes(data, a)
+		a.Equal(len(tc.Nodes), len(nodeInfos))
+	}
+	RemoveAndAdd(0)
+	RemoveAndAdd(1)
 }

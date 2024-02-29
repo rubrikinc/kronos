@@ -21,6 +21,13 @@ import (
 	"github.com/rubrikinc/kronos/pb"
 )
 
+func nodeInfosFromBytes(b []byte, a *assert.Assertions) []cli.NodeInfo {
+	var nodeInfos []cli.NodeInfo
+	err := json.Unmarshal(b, &nodeInfos)
+	a.NoError(err)
+	return nodeInfos
+}
+
 func TestKronosStatus(t *testing.T) {
 	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
 	defer cancelFunc()
@@ -41,11 +48,6 @@ func TestKronosStatus(t *testing.T) {
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 	a := assert.New(t)
 
-	nodeInfosFromBytes := func(b []byte) (nodeInfos []cli.NodeInfo) {
-		a.NoError(json.Unmarshal(b, &nodeInfos))
-		return
-	}
-
 	// give some time to elect the oracle
 	time.Sleep(kronosStabilizationBufferTime)
 	a.NoError(runPolicy(ctx, tc, newTimeValidator(defaultValidationThreshold), &chaos.DriftAllPolicy{}))
@@ -63,7 +65,7 @@ func TestKronosStatus(t *testing.T) {
 	a.NoError(tc.RemoveNode(ctx, len(tc.Nodes)-1, -1, ""))
 	data, err := tc.Status(rand.Intn(len(tc.Nodes)-1), false /*local*/)
 	a.NoError(err)
-	nodeInfos := nodeInfosFromBytes(data)
+	nodeInfos := nodeInfosFromBytes(data, a)
 	// removed node should not be shown in status
 	a.Equal(len(tc.Nodes)-1, len(nodeInfos))
 	numDifferentOracles := 0
@@ -95,7 +97,8 @@ func TestKronosStatus(t *testing.T) {
 	// verify that --local flag is respected
 	data, err = tc.Status(rand.Intn(len(tc.Nodes)-1), true /*local*/)
 	a.NoError(err)
-	nodeInfos = nodeInfosFromBytes(data)
+	nodeInfos = nodeInfosFromBytes(data, a)
+
 	a.Equal(1, len(nodeInfos))
 	// Verify that all the values are present and sensible.
 	for _, nodeInfo := range nodeInfos {

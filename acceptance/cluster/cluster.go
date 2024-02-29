@@ -101,6 +101,8 @@ func (t *testNode) kronosStartCmd(
 	certsDir string,
 	raftSnapCount uint64,
 ) string {
+	bootstrapTime := 5 * time.Second
+	seedRpcRetryTimeout := 5 * time.Second
 	kronosCmd := []string{
 		kronosBinary,
 		"start",
@@ -115,6 +117,8 @@ func (t *testNode) kronosStartCmd(
 		"--seed-hosts", strings.Join(seedHosts, ","),
 		"--manage-oracle-tick-interval", manageOracleTickInterval.String(),
 		"--raft-snap-count", fmt.Sprint(raftSnapCount),
+		"--wait-before-bootstrap", bootstrapTime.String(),
+		"--seed-rpc-retry-timeout", seedRpcRetryTimeout.String(),
 	}
 
 	if len(certsDir) > 0 {

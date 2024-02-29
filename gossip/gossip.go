@@ -71,6 +71,7 @@ type Server struct {
 	peers              peerSet
 	nodeList           map[string]*kronospb.NodeDescriptor
 	connMap            map[string]*grpc.ClientConn
+	numGossip          uint64
 	callBacks          map[PrefixKey][]Callback
 }
 
@@ -98,7 +99,8 @@ func (g *Server) RegisterCallback(prefix PrefixKey, cb Callback,
 // cluster.
 func (g *Server) Gossip(ctx context.Context,
 	request *kronospb.Request) (*kronospb.Response, error) {
-	if request.ClusterId != g.clusterID {
+	if request.ClusterId != g.clusterID && request.ClusterId != "" && g.
+		clusterID != "" {
 		return nil, errors.Errorf("cluster id mismatch: %s != %s",
 			request.ClusterId, g.clusterID)
 	}
@@ -180,6 +182,17 @@ func (g *Server) GetPeers() []string {
 	return g.getPeersLocked()
 }
 
+// GetNodeList returns the current list of nodes.
+func (g *Server) GetNodeList() []*kronospb.NodeDescriptor {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	nodes := make([]*kronospb.NodeDescriptor, 0)
+	for _, desc := range g.nodeList {
+		nodes = append(nodes, desc)
+	}
+	return nodes
+}
+
 // SetInfo sets the value for the given key.
 func (g *Server) SetInfo(key GossipKey, value []byte) {
 	g.mu.Lock()
@@ -241,6 +254,7 @@ func (g *Server) gossip(ctx context.Context) {
 				g.connMap[peer] = conn
 			}
 			client := kronospb.NewGossipClient(conn)
+			// TODO: make this timeout configurable.
 			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			g.mu.Lock()
@@ -282,6 +296,7 @@ func (g *Server) processCallbacksLocked(key GossipKey, info *kronospb.Info) {
 }
 
 func (g *Server) updateGossipStateLocked(gossipMap map[GossipKey]*kronospb.Info) {
+	g.numGossip++
 	for k, v := range gossipMap {
 		if cur, ok := g.data[k]; !ok || cur.Timestamp < v.Timestamp {
 			g.processCallbacksLocked(k, v)
@@ -302,6 +317,7 @@ func runPeriodically(stopCh chan struct{}, period time.Duration, f func()) {
 		f()
 		select {
 		case <-stopCh:
+			f() // Run one last time before returning to take care of removal.
 			return
 		case <-ticker.C:
 		}
@@ -418,4 +434,17 @@ func NodeDescriptor(ctx context.Context, g *Server, stopCh chan struct{}) {
 		g.SetInfo(NodeDescriptorPrefix.Encode(g.nodeID), descBytes)
 	}
 	runPeriodically(stopCh, nodeDescriptorPeriod, f)
+}
+
+func (g *Server) WaitForNRoundsofGossip(timeout time.Duration, n uint64) {
+	// no need to lock here as numGossip is only written in the gossip
+	// function.
+	startGossip := g.numGossip
+	startTime := time.Now()
+	for time.Since(startTime) < timeout {
+		if g.numGossip-startGossip >= n {
+			return
+		}
+		time.Sleep(gossipPeriod)
+	}
 }

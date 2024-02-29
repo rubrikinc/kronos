@@ -21,6 +21,7 @@ import (
 )
 
 const (
+	bootstrapTime = 30 * time.Second
 	chaosInterval = 5 * time.Second
 	// defaultValidationThreshold is the threshold describing the maximum
 	// difference allowed between times on the nodes in the cluster.
@@ -116,7 +117,8 @@ func TestKronosChaos(t *testing.T) {
 	defer kronosutil.CloseWithErrorLog(ctx, tc)
 	log.Info(ctx, "Initialized Test Cluster.")
 
-	time.Sleep(3 * chaosInterval)
+	time.Sleep(bootstrapTime)
+
 	nodeIdxToTimes, nodeIdxToUptimes, err := tc.ValidateTimeInConsensus(
 		ctx,
 		50*time.Millisecond,
