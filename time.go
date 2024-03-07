@@ -13,6 +13,8 @@ import (
 )
 
 var kronosServer *server.Server
+var IsCockroachInitialized = false
+var CockroachTimeCalls = 0
 
 // Initialize initializes the kronos server.
 // After Initialization, Now() in this package returns kronos time.
@@ -55,6 +57,7 @@ func IsActive() bool {
 // Now returns Kronos time if Kronos is initialized, otherwise returns
 // system time
 func Now() int64 {
+	CockroachTimeCalls++
 	if kronosServer == nil {
 		log.Fatalf(context.TODO(), "Kronos server is not initialized")
 	}
@@ -67,7 +70,7 @@ func Now() int64 {
 
 	for {
 		kt, err := kronosServer.KronosTimeNow(ctx)
-		if err != nil {
+		if err != nil || !IsCockroachInitialized {
 			// We print the first 10 retries, then every 10th retry until 200 retries, and then every 100th retry
 			if count < 10 || (count < 200 && count%10 == 0) || count%100 == 0 {
 				log.Errorf(
