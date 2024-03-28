@@ -112,6 +112,8 @@ type Server struct {
 		oracle *kronospb.NodeAddr
 		err    error
 	}
+
+	bootstrapReqCh chan kronospb.BootstrapRequest
 }
 
 var _ kronospb.TimeServiceServer = &Server{}
@@ -670,6 +672,19 @@ func (k *Server) NewClusterClient() (*kronoshttp.ClusterClient, error) {
 }
 
 func (k *Server) startGossipping(ctx context.Context) {
+	go k.GossipServer.Start(ctx, k.StopC)
+
+	for {
+		nodeId, err := metadata.FetchNodeID(k.dataDir)
+		if err != nil {
+			log.Errorf(context.Background(), "failed to fetch node id: %v", err)
+		} else {
+			k.GossipServer.SetNodeID(ctx, nodeId.String())
+			break
+		}
+	}
+	go gossip.Liveness(ctx, k.GossipServer, k.StopC)
+	go gossip.NodeDescriptor(ctx, k.GossipServer, k.StopC)
 	// Wait till we generate/get the cluster ID and node ID.
 	for {
 		uuid, err := metadata.FetchClusterUUID(k.dataDir)
@@ -681,15 +696,6 @@ func (k *Server) startGossipping(ctx context.Context) {
 			break
 		}
 	}
-	nodeId, err := metadata.FetchNodeID(k.dataDir)
-	if err != nil {
-		log.Errorf(context.Background(), "failed to fetch node id: %v", err)
-	} else {
-		k.GossipServer.SetNodeID(ctx, nodeId.String())
-	}
-	go k.GossipServer.Start(ctx, k.StopC)
-	go gossip.Liveness(ctx, k.GossipServer, k.StopC)
-	go gossip.NodeDescriptor(ctx, k.GossipServer, k.StopC)
 }
 
 // RunServer starts a Kronos GRPC server
@@ -718,6 +724,7 @@ func (k *Server) RunServer(ctx context.Context) error {
 	server := grpc.NewServer(opts...)
 	kronospb.RegisterTimeServiceServer(server, k)
 	kronospb.RegisterGossipServer(server, k.GossipServer)
+	kronospb.RegisterBootstrapServer(server, k)
 
 	k.server = server
 	t := time.NewTicker(k.manageOracleTickInterval)
@@ -766,7 +773,8 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 		config.RaftHostPort,
 		config.GossipSeedHosts, config.CertsDir)
 
-	oracleSM := oracle.NewRaftStateMachine(ctx, config.RaftConfig, g)
+	oracleSM, bootstrapReqCh := oracle.NewRaftStateMachine(ctx,
+		config.RaftConfig, g)
 	if config.Metrics == nil {
 		config.Metrics = kronosstats.NewTestMetrics()
 	}
@@ -785,6 +793,7 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 		manageOracleTickInterval: config.ManageOracleTickInterval,
 		Metrics:                  config.Metrics,
 		GossipServer:             g,
+		bootstrapReqCh:           bootstrapReqCh,
 	}
 
 	return s, nil

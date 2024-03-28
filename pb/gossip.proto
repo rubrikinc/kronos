@@ -33,8 +33,23 @@ message NodeDescriptor {
   string grpc_addr = 2;
   // raft_addr is the raft address of the node
   string raft_addr = 3;
+  // is_bootstrapped is true if the node is bootstrapped
+  bool is_bootstrapped = 4;
+  // is_removed is true if the node is removed
+  bool is_removed = 5;
+  // last_heartbeat is the last time the node sent a heartbeat
+  int64 last_heartbeat = 6;
+  // cluster_id is the id of the cluster
+  string cluster_id = 7;
+}
+
+message NodeLsRequest {}
+
+message NodeLsResponse {
+  repeated NodeDescriptor nodes = 1;
 }
 
 service Gossip {
   rpc Gossip(Request) returns (Response) {}
+  rpc NodeLs(NodeLsRequest) returns (NodeLsResponse) {}
 }

@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package kronospb;
+option go_package = "kronospb";
+
+message BootstrapRequest {
+  int32 expectedNodeCount = 1;
+}
+
+
+message BootstrapResponse {
+  string clusterId = 1;
+  int32 nodeCount = 2;
+}
+
+service Bootstrap {
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse) {}
+}

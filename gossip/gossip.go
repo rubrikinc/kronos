@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	nodeDescriptorPeriod = 10 * time.Minute
+	nodeDescriptorPeriod = 1 * time.Second
 	livenessPeriod       = 1 * time.Second
 	gossipPeriod         = time.Second
 	printGossipPeriod    = time.Second
@@ -73,6 +73,19 @@ type Server struct {
 	connMap            map[string]*grpc.ClientConn
 	numGossip          uint64
 	callBacks          map[PrefixKey][]Callback
+	isBootstrapped     bool
+	isRemoved          bool
+}
+
+func (g *Server) NodeLs(ctx context.Context,
+	request *kronospb.NodeLsRequest) (*kronospb.NodeLsResponse, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	nodes := make([]*kronospb.NodeDescriptor, 0)
+	for _, desc := range g.nodeList {
+		nodes = append(nodes, desc)
+	}
+	return &kronospb.NodeLsResponse{Nodes: nodes}, nil
 }
 
 func (g *Server) RegisterCallback(prefix PrefixKey, cb Callback,
@@ -163,6 +176,7 @@ func (g *Server) addPeerLocked(ctx context.Context,
 			g.removePeerLocked(ctx, oldDesc.GrpcAddr)
 		}
 	}
+	log.Infof(ctx, "Adding node %s : %+v to nodeList", nodeId, *desc)
 	g.nodeList[nodeId] = desc
 	// TODO: Persist the new peer to disk.
 }
@@ -219,7 +233,27 @@ func (g *Server) SetClusterID(ctx context.Context, clusterID string) {
 		log.Warningf(ctx,
 			"Cluster ID being changed from %s to %s", g.clusterID, clusterID)
 	}
+	log.Infof(ctx, "Setting cluster ID to %s", clusterID)
 	g.clusterID = clusterID
+}
+
+func (g *Server) SetBootstrapped(ctx context.Context, isBootstrapped bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.isRemoved && isBootstrapped {
+		log.Fatalf(ctx, "Cannot set bootstrapped on a removed node")
+	}
+	log.Infof(ctx, "Setting bootstrapped to %v", isBootstrapped)
+	g.isBootstrapped = isBootstrapped
+}
+
+func (g *Server) SetRemoved(ctx context.Context, isRemoved bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.isBootstrapped && isRemoved {
+		log.Fatalf(ctx, "Cannot set removed on a non-bootstrapped node")
+	}
+	g.isRemoved = isRemoved
 }
 
 func (g *Server) gossip(ctx context.Context) {
@@ -421,9 +455,13 @@ func NodeDescriptor(ctx context.Context, g *Server, stopCh chan struct{}) {
 		secure := g.certsDir != ""
 		url := kronosutil.AddrToURL(g.raftAddr, secure)
 		desc := &kronospb.NodeDescriptor{
-			NodeId:   g.nodeID,
-			RaftAddr: url.String(),
-			GrpcAddr: g.advertisedHostPort,
+			NodeId:         g.nodeID,
+			RaftAddr:       url.String(),
+			GrpcAddr:       g.advertisedHostPort,
+			IsBootstrapped: g.isBootstrapped,
+			IsRemoved:      g.isRemoved,
+			LastHeartbeat:  time.Now().UnixNano(),
+			ClusterId:      g.clusterID,
 		}
 		descBytes, err := proto.Marshal(desc)
 		if err != nil {
@@ -447,4 +485,18 @@ func (g *Server) WaitForNRoundsofGossip(timeout time.Duration, n uint64) {
 		}
 		time.Sleep(gossipPeriod)
 	}
+}
+
+func (g *Server) RemovePeer(id string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	node := g.nodeList[id]
+	if node != nil {
+		g.removePeerLocked(context.Background(), node.GrpcAddr)
+	}
+}
+
+func IsNodeLive(desc *kronospb.NodeDescriptor) bool {
+	return desc != nil && desc.IsRemoved == false && desc.
+		LastHeartbeat > time.Now().Add(-10*nodeDescriptorPeriod).UnixNano()
 }

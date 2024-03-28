@@ -278,6 +278,16 @@ func (tc *TestCluster) Time(ctx context.Context, nodeIdx int) (int64, error) {
 	return tr.Time, nil
 }
 
+// Bootstrap is used to bootstrap the kronos cluster
+func (tc *TestCluster) Bootstrap(ctx context.Context, nodeIdx int) error {
+	bootstrapClient := server.NewGRPCClient(tc.CertsDir)
+	defer bootstrapClient.Close()
+	_, err := bootstrapClient.Bootstrap(ctx,
+		&kronospb.NodeAddr{Host: localhost, Port: tc.Nodes[nodeIdx].
+			grpcPort}, &kronospb.BootstrapRequest{ExpectedNodeCount: int32(len(tc.Nodes))})
+	return err
+}
+
 // ValidateTimeInConsensus validates time across the cluster(difference between
 // maxTime and minTime) is within maxDiffAllowed for the running nodes. It
 // returns ClusterTime and uptime which is a map of NodeID to time / uptime.
@@ -775,6 +785,11 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 
 	if err = tc.start(ctx); err != nil {
 		return nil, err
+	}
+
+	for err = tc.Bootstrap(ctx, 0); err != nil; err = tc.Bootstrap(ctx, 0) {
+		log.Infof(ctx, "Waiting for the cluster to bootstrap err : %v", err)
+		time.Sleep(time.Second)
 	}
 
 	return tc, nil

@@ -35,4 +35,10 @@ type Client interface {
 		ctx context.Context,
 		server *kronospb.NodeAddr,
 	) (*kronospb.StatusResponse, error)
+
+	Bootstrap(
+		ctx context.Context,
+		server *kronospb.NodeAddr,
+		req *kronospb.BootstrapRequest,
+	) (*kronospb.BootstrapResponse, error)
 }

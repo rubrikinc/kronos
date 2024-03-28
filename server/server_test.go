@@ -438,6 +438,10 @@ type simpleMockClient struct {
 	err      error
 }
 
+func (c *simpleMockClient) Bootstrap(ctx context.Context, server *kronospb.NodeAddr, req *kronospb.BootstrapRequest) (*kronospb.BootstrapResponse, error) {
+	return nil, nil
+}
+
 func (c *simpleMockClient) KronosTime(
 	ctx context.Context, server *kronospb.NodeAddr,
 ) (*kronospb.KronosTimeResponse, error) {

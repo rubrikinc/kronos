@@ -134,6 +134,28 @@ func ForDuration(duration time.Duration, fn func() error) error {
 	return lastErr
 }
 
+func RetryUntil(ctx context.Context, duration time.Duration,
+	fn func() error) error {
+	deadline := time.Now().Add(duration)
+	var lastErr error
+	for wait := time.Millisecond; time.Now().Before(deadline); wait *= 2 {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if wait > time.Second {
+			log.Errorf(ctx, "Error while executing fn : %v", lastErr)
+			wait = time.Second
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return lastErr
+}
+
 // tryConfChange proposes a confChange cc to confChangeC and retries till verify
 // returns true.
 // ConfChanges can fail as etcd/raft only allows one pending confChange at a

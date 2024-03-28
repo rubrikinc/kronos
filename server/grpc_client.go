@@ -21,10 +21,11 @@ const rpcTimeout = 30 * time.Second
 // grpcClient caches the last connection it made so subsequent queries
 // made to the same server will not create new connections
 type grpcClient struct {
-	server     *kronospb.NodeAddr
-	conn       *grpc.ClientConn
-	grpcClient kronospb.TimeServiceClient
-	certsDir   string
+	server          *kronospb.NodeAddr
+	conn            *grpc.ClientConn
+	grpcClient      kronospb.TimeServiceClient
+	bootstrapClient kronospb.BootstrapClient
+	certsDir        string
 }
 
 var _ Client = &grpcClient{}
@@ -63,6 +64,7 @@ func (c *grpcClient) connect(ctx context.Context, server *kronospb.NodeAddr) err
 		}
 
 		c.grpcClient = kronospb.NewTimeServiceClient(c.conn)
+		c.bootstrapClient = kronospb.NewBootstrapClient(c.conn)
 		c.server = server
 	}
 	return nil
@@ -139,6 +141,17 @@ func (c *grpcClient) Status(
 	return c.grpcClient.Status(
 		ctx,
 		&kronospb.StatusRequest{},
+	)
+}
+
+// Bootstrap implements the Client interface.
+func (c *grpcClient) Bootstrap(ctx context.Context, server *kronospb.NodeAddr, req *kronospb.BootstrapRequest) (*kronospb.BootstrapResponse, error) {
+	if err := c.connect(ctx, server); err != nil {
+		return nil, err
+	}
+	return c.bootstrapClient.Bootstrap(
+		ctx,
+		req,
 	)
 }
 

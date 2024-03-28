@@ -22,6 +22,10 @@ type Client struct {
 	Latency time.Duration
 }
 
+func (c *Client) Bootstrap(ctx context.Context, server *kronospb.NodeAddr, req *kronospb.BootstrapRequest) (*kronospb.BootstrapResponse, error) {
+	return nil, nil
+}
+
 func (c *Client) KronosUptime(ctx context.Context, server *kronospb.NodeAddr) (*kronospb.KronosUptimeResponse, error) {
 	node, err := c.node(ctx, server)
 	if err != nil {

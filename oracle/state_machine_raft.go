@@ -78,18 +78,22 @@ var _ StateMachine = &RaftStateMachine{}
 
 // NewRaftStateMachine returns an instance of a distributed oracle state
 // machine managed by raft
-func NewRaftStateMachine(ctx context.Context, rc *RaftConfig,
-	g *gossip.Server) StateMachine {
+func NewRaftStateMachine(
+	ctx context.Context,
+	rc *RaftConfig,
+	g *gossip.Server,
+) (StateMachine, chan kronospb.BootstrapRequest) {
 	var raftStateMachine *RaftStateMachine
 	proposeC := make(chan string)
 	getSnapshot := func() ([]byte, error) { return raftStateMachine.GetSnapshot(ctx) }
 	nodeID := metadata.FetchOrAssignNodeID(ctx, rc.DataDir).String()
-	commitC, errorC, snapshotterReady := newRaftNode(rc, getSnapshot,
+	nodeInfo := newRaftNode(rc,
+		getSnapshot,
 		proposeC, nodeID, g)
 
 	raftStateMachine = &RaftStateMachine{
 		proposeC:     proposeC,
-		snapshotter:  <-snapshotterReady,
+		snapshotter:  <-nodeInfo.SnapshotterReady,
 		stateMachine: NewMemStateMachine().(*inMemStateMachine),
 		getSnapshotC: make(chan struct{}),
 		closed:       false,
@@ -103,10 +107,11 @@ func NewRaftStateMachine(ctx context.Context, rc *RaftConfig,
 
 	// replay existing commits synchronously so that that the state machine is at
 	// the last known state before initializing.
-	raftStateMachine.readCommits(ctx, commitC, errorC)
+	raftStateMachine.readCommits(ctx, nodeInfo.CommitC, nodeInfo.ErrorC)
 	// read commits from raft into RaftStateMachine
-	go raftStateMachine.readCommits(context.Background(), commitC, errorC)
-	return raftStateMachine
+	go raftStateMachine.readCommits(context.Background(), nodeInfo.CommitC,
+		nodeInfo.ErrorC)
+	return raftStateMachine, nodeInfo.BootstrapReqC
 }
 
 // Close cleans up RaftStateMachine
