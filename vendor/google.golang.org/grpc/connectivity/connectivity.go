@@ -22,9 +22,12 @@
 package connectivity
 
 import (
-	"golang.org/x/net/context"
+	"context"
+
 	"google.golang.org/grpc/grpclog"
 )
+
+var logger = grpclog.Component("core")
 
 // State indicates the state of connectivity.
 // It can be the state of a ClientConn or SubConn.
@@ -43,7 +46,7 @@ func (s State) String() string {
 	case Shutdown:
 		return "SHUTDOWN"
 	default:
-		grpclog.Errorf("unknown connectivity state: %d", s)
+		logger.Errorf("unknown connectivity state: %d", s)
 		return "Invalid-State"
 	}
 }
@@ -51,7 +54,7 @@ func (s State) String() string {
 const (
 	// Idle indicates the ClientConn is idle.
 	Idle State = iota
-	// Connecting indicates the ClienConn is connecting.
+	// Connecting indicates the ClientConn is connecting.
 	Connecting
 	// Ready indicates the ClientConn is ready for work.
 	Ready

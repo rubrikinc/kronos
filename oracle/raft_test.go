@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/scaledata/etcd/raft"
-	"github.com/scaledata/etcd/raft/sdraftpb"
 	"github.com/stretchr/testify/assert"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 
 	"github.com/rubrikinc/kronos/metadata"
 	"github.com/rubrikinc/kronos/pb"
@@ -278,7 +278,7 @@ func TestSnapTriggerConfig(t *testing.T) {
 
 func TestPublishEntries(t *testing.T) {
 	ctx := context.TODO()
-	confChangeC := make(chan sdraftpb.ConfChange)
+	confChangeC := make(chan raftpb.ConfChange)
 	rn := raftNode{
 		confChangeC:       confChangeC,
 		snapTriggerConfig: newSnapTriggerConfig(100),
@@ -293,13 +293,13 @@ func TestPublishEntries(t *testing.T) {
 		MaxSizePerMsg:   16 * 1024,
 		MaxInflightMsgs: 64,
 	}
-	rn.node = raft.StartNode(c, []raft.Peer{})
+	rn.node = raft.StartNode(c, []raft.Peer{{ID: 1}})
 	// Starting node -> no confChange entries -> confChangeSinceLastSnap = false
 	assert.Equal(t, rn.snapTriggerConfig.confChangeSinceLastSnap, false)
 	// normal entry should not update the confChangeSinceLastSnap
-	rn.publishEntries(ctx, []sdraftpb.Entry{{Type: sdraftpb.EntryNormal}})
+	rn.publishEntries(ctx, []raftpb.Entry{{Type: raftpb.EntryNormal}})
 	assert.Equal(t, rn.snapTriggerConfig.confChangeSinceLastSnap, false)
 	// confChange entry should update the confChangeSinceLastSnap
-	rn.publishEntries(ctx, []sdraftpb.Entry{{Type: sdraftpb.EntryConfChange}})
+	rn.publishEntries(ctx, []raftpb.Entry{{Type: raftpb.EntryConfChange}})
 	assert.Equal(t, rn.snapTriggerConfig.confChangeSinceLastSnap, true)
 }

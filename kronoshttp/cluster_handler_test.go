@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	"github.com/scaledata/etcd/raft/sdraftpb"
 	"github.com/stretchr/testify/assert"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 
 	"github.com/rubrikinc/kronos/metadata"
 	"github.com/rubrikinc/kronos/pb"
@@ -35,7 +35,7 @@ func TestClusterHandlerServeHTTP(t *testing.T) {
 		// requestType eg.: requestTypeAdd, requestTypeRemove
 		requestType string
 		// confChange entry that we expect to receive on confChangeC.
-		expectedConfChange *sdraftpb.ConfChange
+		expectedConfChange *raftpb.ConfChange
 		// expected http status code.
 		expectedCode int
 		// expectedRespGenerator generates the expected http response from the
@@ -119,9 +119,9 @@ func TestClusterHandlerServeHTTP(t *testing.T) {
 					"1": {RaftAddr: &kronospb.NodeAddr{Host: "127.0.0.1", Port: "1"}},
 				},
 			},
-			expectedConfChange: &sdraftpb.ConfChange{
+			expectedConfChange: &raftpb.ConfChange{
 				NodeID:  1,
-				Type:    sdraftpb.ConfChangeAddNode,
+				Type:    raftpb.ConfChangeAddNode,
 				Context: []byte("127.0.0.1:1"),
 			},
 			expectedCode: http.StatusOK,
@@ -152,9 +152,9 @@ func TestClusterHandlerServeHTTP(t *testing.T) {
 					"2": {RaftAddr: &kronospb.NodeAddr{Host: "127.0.0.1", Port: "2"}},
 				},
 			},
-			expectedConfChange: &sdraftpb.ConfChange{
+			expectedConfChange: &raftpb.ConfChange{
 				NodeID:  1,
-				Type:    sdraftpb.ConfChangeAddNode,
+				Type:    raftpb.ConfChangeAddNode,
 				Context: []byte("127.0.0.1:1"),
 			},
 			// expect StatusRequestTimeout, as the node being added is not in the
@@ -204,8 +204,8 @@ func TestClusterHandlerServeHTTP(t *testing.T) {
 					"2": {RaftAddr: &kronospb.NodeAddr{Host: "127.0.0.1", Port: "2"}},
 				},
 			},
-			expectedConfChange: &sdraftpb.ConfChange{
-				Type:   sdraftpb.ConfChangeRemoveNode,
+			expectedConfChange: &raftpb.ConfChange{
+				Type:   raftpb.ConfChangeRemoveNode,
 				NodeID: 1,
 			},
 			expectedCode: http.StatusOK,
@@ -238,8 +238,8 @@ func TestClusterHandlerServeHTTP(t *testing.T) {
 					"1": {RaftAddr: &kronospb.NodeAddr{Host: "127.0.0.1", Port: "1"}, IsRemoved: true},
 				},
 			},
-			expectedConfChange: &sdraftpb.ConfChange{
-				Type:   sdraftpb.ConfChangeRemoveNode,
+			expectedConfChange: &raftpb.ConfChange{
+				Type:   raftpb.ConfChangeRemoveNode,
 				NodeID: 1,
 			},
 			expectedCode: http.StatusOK,
@@ -270,8 +270,8 @@ func TestClusterHandlerServeHTTP(t *testing.T) {
 					"1": {RaftAddr: &kronospb.NodeAddr{Host: "127.0.0.1", Port: "1"}},
 				},
 			},
-			expectedConfChange: &sdraftpb.ConfChange{
-				Type:   sdraftpb.ConfChangeRemoveNode,
+			expectedConfChange: &raftpb.ConfChange{
+				Type:   raftpb.ConfChangeRemoveNode,
 				NodeID: 1,
 			},
 			// expect StatusRequestTimeout, as the node being removed is in the
@@ -283,7 +283,7 @@ func TestClusterHandlerServeHTTP(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			a := assert.New(t)
-			confChangeC := make(chan sdraftpb.ConfChange, 10)
+			confChangeC := make(chan raftpb.ConfChange, 10)
 			done := make(chan struct{})
 			dataDir, err := ioutil.TempDir("", "data_dir")
 			a.NoError(err)

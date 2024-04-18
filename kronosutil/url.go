@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/rubrikinc/kronos/pb"
-	"github.com/scaledata/etcd/pkg/types"
+	"go.etcd.io/etcd/pkg/v3/types"
 )
 
 // NodeAddr converts address in host:port format to NodeAddr.

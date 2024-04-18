@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/rubrikinc/kronos/kronosutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	kronospb "github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/protoutil"
 	"google.golang.org/grpc"
 )
 
@@ -405,7 +405,7 @@ func NewServer(advertisedHostPort string,
 
 	s.RegisterCallback(NodeDescriptorPrefix, func(g *Server, k GossipKey, i *kronospb.Info) {
 		var desc kronospb.NodeDescriptor
-		err := proto.Unmarshal(i.Data, &desc)
+		err := protoutil.Unmarshal(i.Data, &desc)
 		ctx := context.Background()
 		if err != nil {
 			log.Errorf(ctx, "Error unmarshalling node descriptor: %v", err)
@@ -463,7 +463,7 @@ func NodeDescriptor(ctx context.Context, g *Server, stopCh chan struct{}) {
 			LastHeartbeat:  time.Now().UnixNano(),
 			ClusterId:      g.clusterID,
 		}
-		descBytes, err := proto.Marshal(desc)
+		descBytes, err := protoutil.Marshal(desc)
 		if err != nil {
 			log.Errorf(ctx,
 				"Error marshalling node descriptor : %v", err)

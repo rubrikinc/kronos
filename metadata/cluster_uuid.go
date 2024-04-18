@@ -7,7 +7,7 @@ import (
 
 	"github.com/rubrikinc/kronos/checksumfile"
 	"github.com/rubrikinc/kronos/kronosutil/log"
-	"github.com/scaledata/etcd/pkg/types"
+	"go.etcd.io/etcd/pkg/v3/types"
 )
 
 const (

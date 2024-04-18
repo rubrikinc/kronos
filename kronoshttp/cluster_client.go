@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/scaledata/etcd/pkg/transport"
+	"go.etcd.io/etcd/pkg/v3/transport"
 
 	"github.com/rubrikinc/kronos/kronosutil"
 	"github.com/rubrikinc/kronos/pb"

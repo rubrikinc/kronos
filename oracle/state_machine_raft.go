@@ -8,7 +8,7 @@ import (
 	"github.com/rubrikinc/kronos/gossip"
 	"github.com/rubrikinc/kronos/protoutil"
 
-	"github.com/scaledata/etcd/snap"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 
 	"github.com/rubrikinc/kronos/kronosutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"

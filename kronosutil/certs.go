@@ -8,7 +8,7 @@ import (
 	"io/ioutil"
 	"path/filepath"
 
-	"github.com/scaledata/etcd/pkg/transport"
+	"go.etcd.io/etcd/pkg/v3/transport"
 	"google.golang.org/grpc/credentials"
 )
 
@@ -54,8 +54,8 @@ func TLSInfo(certsDir string) transport.TLSInfo {
 		return transport.TLSInfo{}
 	}
 	return transport.TLSInfo{
-		CertFile: filepath.Join(certsDir, NodeCert),
-		KeyFile:  filepath.Join(certsDir, NodeKey),
-		CAFile:   filepath.Join(certsDir, CACert),
+		CertFile:      filepath.Join(certsDir, NodeCert),
+		KeyFile:       filepath.Join(certsDir, NodeKey),
+		TrustedCAFile: filepath.Join(certsDir, CACert),
 	}
 }

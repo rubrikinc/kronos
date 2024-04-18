@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/scaledata/etcd/raft"
+	"go.etcd.io/etcd/raft/v3"
 
 	"github.com/rubrikinc/kronos/kronosutil/log"
 )

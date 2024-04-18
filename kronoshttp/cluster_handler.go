@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/scaledata/etcd/pkg/types"
-	"github.com/scaledata/etcd/raft/sdraftpb"
+	"go.etcd.io/etcd/pkg/v3/types"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 
 	"github.com/rubrikinc/kronos/kronosutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
@@ -91,7 +91,7 @@ func removeNodeRequestFromReader(r io.ReadCloser) (*RemoveNodeRequest, error) {
 // ClusterHandler handles cluster operations via to http requests.
 type ClusterHandler struct {
 	// confChangeC is used to pass the configuration changes to the cluster.
-	confChangeC chan<- sdraftpb.ConfChange
+	confChangeC chan<- raftpb.ConfChange
 	// dataDir is the data directory of the raft node. It is used to get the
 	// cluster metadata, which is by default stored in cluster-info file in
 	// data directory.
@@ -106,7 +106,7 @@ type ClusterHandler struct {
 // NewClusterHandler returns a cluster handler which handles cluster requests
 // and sends the corresponding confChanges to confChangeC.
 func NewClusterHandler(
-	confChangeC chan<- sdraftpb.ConfChange, dataDir string, grpcAddr *kronospb.NodeAddr,
+	confChangeC chan<- raftpb.ConfChange, dataDir string, grpcAddr *kronospb.NodeAddr,
 ) *ClusterHandler {
 	// DefaultConfChangeTotalTimeout represents the total time for which we retry the
 	// confChange.
@@ -176,8 +176,8 @@ func RetryUntil(ctx context.Context, duration time.Duration,
 // In case of removeNode, the confChange entry just deletes the nodeID from the
 // map, making it idempotent.
 func tryConfChange(
-	confChangeC chan<- sdraftpb.ConfChange,
-	cc sdraftpb.ConfChange,
+	confChangeC chan<- raftpb.ConfChange,
+	cc raftpb.ConfChange,
 	timeout time.Duration,
 	verify func() bool,
 ) error {
@@ -245,8 +245,8 @@ func (h *ClusterHandler) handleAdd(
 	// tryConfChange and retry till it gets reflected in the cluster metadata.
 	if err := tryConfChange(
 		h.confChangeC,
-		sdraftpb.ConfChange{
-			Type:    sdraftpb.ConfChangeAddNode,
+		raftpb.ConfChange{
+			Type:    raftpb.ConfChangeAddNode,
 			NodeID:  uint64(id),
 			Context: []byte(request.Address),
 		},
@@ -311,8 +311,8 @@ func (h *ClusterHandler) handleRemove(
 	// tryConfChange and retry till it gets reflected in the cluster metadata.
 	if err := tryConfChange(
 		h.confChangeC,
-		sdraftpb.ConfChange{
-			Type:   sdraftpb.ConfChangeRemoveNode,
+		raftpb.ConfChange{
+			Type:   raftpb.ConfChangeRemoveNode,
 			NodeID: uint64(nodeID),
 		},
 		h.confChangeTotalTimeout,

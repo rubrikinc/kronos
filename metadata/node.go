@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/scaledata/etcd/pkg/types"
+	"go.etcd.io/etcd/pkg/v3/types"
 
 	"github.com/rubrikinc/kronos/checksumfile"
 	"github.com/rubrikinc/kronos/kronosutil/log"

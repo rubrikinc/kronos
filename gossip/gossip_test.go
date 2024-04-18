@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/rubrikinc/kronos/acceptance/testutil"
 	leaktest "github.com/rubrikinc/kronos/crdbutils"
 	kronospb "github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/protoutil"
 	"google.golang.org/grpc"
 )
 
@@ -123,11 +123,11 @@ func TestGossipCallBacks(t *testing.T) {
 		GrpcAddr: "127.0.0.1:3004",
 		RaftAddr: "https://127.0.0.1:3004",
 	}
-	bytes1, _ := proto.Marshal(nodeDesc1)
-	bytes2, _ := proto.Marshal(nodeDesc2)
-	bytes3, _ := proto.Marshal(nodeDesc3)
-	bytes4, _ := proto.Marshal(nodeDesc4)
-	bytes5, _ := proto.Marshal(nodeDesc5)
+	bytes1, _ := protoutil.Marshal(nodeDesc1)
+	bytes2, _ := protoutil.Marshal(nodeDesc2)
+	bytes3, _ := protoutil.Marshal(nodeDesc3)
+	bytes4, _ := protoutil.Marshal(nodeDesc4)
+	bytes5, _ := protoutil.Marshal(nodeDesc5)
 	tests := []struct {
 		name          string
 		upds          map[GossipKey]*kronospb.Info

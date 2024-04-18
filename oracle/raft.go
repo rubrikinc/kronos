@@ -16,18 +16,18 @@ import (
 	"github.com/coreos/pkg/capnslog"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
-	"github.com/rubrikinc/kronos/gossip"
-	"github.com/scaledata/etcd/etcdserver/stats"
-	"github.com/scaledata/etcd/pkg/fileutil"
-	"github.com/scaledata/etcd/pkg/transport"
-	"github.com/scaledata/etcd/pkg/types"
-	"github.com/scaledata/etcd/raft"
-	"github.com/scaledata/etcd/raft/sdraftpb"
-	"github.com/scaledata/etcd/rafthttp"
-	"github.com/scaledata/etcd/snap"
-	"github.com/scaledata/etcd/wal"
-	"github.com/scaledata/etcd/wal/sdwalpb"
+	"go.etcd.io/etcd/pkg/v3/fileutil"
+	"go.etcd.io/etcd/pkg/v3/transport"
+	"go.etcd.io/etcd/pkg/v3/types"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
+	stats "go.etcd.io/etcd/server/v3/etcdserver/api/v2stats"
+	"go.etcd.io/etcd/server/v3/wal"
+	"go.etcd.io/etcd/server/v3/wal/walpb"
 
+	"github.com/rubrikinc/kronos/gossip"
 	"github.com/rubrikinc/kronos/kronoshttp"
 	"github.com/rubrikinc/kronos/kronosutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
@@ -175,7 +175,7 @@ type raftNode struct {
 	// proposeC is where proposed messages are read from
 	proposeC <-chan string
 	// confChangeC is where raft configuration changes are read from
-	confChangeC <-chan sdraftpb.ConfChange
+	confChangeC <-chan raftpb.ConfChange
 	// commitC is where entries committed in raft are pushed
 	commitC chan<- string
 	// errorC is where errors in the raft session are pushed
@@ -197,7 +197,7 @@ type raftNode struct {
 	// are done replaying the existing committed log entries.
 	lastCommittedIndex uint64
 
-	confState     sdraftpb.ConfState
+	confState     raftpb.ConfState
 	snapshotIndex uint64
 	appliedIndex  uint64
 
@@ -285,7 +285,7 @@ func (rc *raftNode) removeNode(id string) {
 	// This can happen if AddNode conf change has been snapshotted and
 	// merged into conf state but remove node conf change is still a part
 	// of WAL which is replayed.
-	if rc.transport.PeerExists(raftID) {
+	if rc.transport.Get(raftID) != nil {
 		rc.transport.RemovePeer(raftID)
 	}
 }
@@ -307,9 +307,10 @@ func (rc *raftNode) addNode(id string, addr *kronospb.NodeAddr) error {
 // cluster metadata. It also removes the nodeIDs present in the cluster metadata
 // but not in the confState.
 func (rc *raftNode) updateClusterFromConfState(ctx context.Context) {
-	log.Infof(ctx, "Raft confstate: %v", rc.confState.Nodes)
+	log.Infof(ctx, "Raft confstate: %v", rc.confState.Voters)
 	// remove nodes extra in activeNodes and add nodes extra in confstate.
-	nodesToRemove, nodesToAdd := extraNodes(rc.cluster.ActiveNodes(), rc.confState.Nodes)
+	nodesToRemove, nodesToAdd := extraNodes(rc.cluster.ActiveNodes(),
+		rc.confState.Voters)
 
 	// remove all the IDs not in confstate from cluster metadata and transport
 	// peers as raft only talks to the nodes present in confstate.
@@ -402,7 +403,7 @@ func newRaftNode(
 	}
 	commitC := make(chan string)
 	errorC := make(chan error)
-	confChangeC := make(chan sdraftpb.ConfChange)
+	confChangeC := make(chan raftpb.ConfChange)
 	if rc.SnapCount <= 0 {
 		rc.SnapCount = numEntriesPerSnap
 	}
@@ -433,8 +434,10 @@ func newRaftNode(
 }
 
 func (rc *raftNode) purgeFiles(ctx context.Context) {
-	snaperrc := fileutil.PurgeFile(rc.snapdir, snapFileSuffix, maxSnapFiles, fileGCInterval, rc.stopc)
-	walerrc := fileutil.PurgeFile(rc.waldir, walFileSuffix, maxWALFiles, fileGCInterval, rc.stopc)
+	snaperrc := fileutil.PurgeFile(nil, rc.snapdir, snapFileSuffix,
+		maxSnapFiles, fileGCInterval, rc.stopc)
+	walerrc := fileutil.PurgeFile(nil, rc.waldir, walFileSuffix, maxWALFiles,
+		fileGCInterval, rc.stopc)
 	select {
 	case e := <-snaperrc:
 		log.Fatalf(ctx, "Failed to purge snap files, err: %v", e)
@@ -446,11 +449,11 @@ func (rc *raftNode) purgeFiles(ctx context.Context) {
 }
 
 // saveSnap saves the given snapshot
-func (rc *raftNode) saveSnap(snap sdraftpb.Snapshot) error {
+func (rc *raftNode) saveSnap(snap raftpb.Snapshot) error {
 	// must save the snapshot index to the WAL before saving the
 	// snapshot to maintain the invariant that we only Open the
 	// wal at previously-saved snapshot indexes.
-	walSnap := sdwalpb.Snapshot{
+	walSnap := walpb.Snapshot{
 		Index: snap.Metadata.Index,
 		Term:  snap.Metadata.Term,
 	}
@@ -466,8 +469,8 @@ func (rc *raftNode) saveSnap(snap sdraftpb.Snapshot) error {
 // entriesToApply returns the entries to apply to the raft node from the
 // raft log based on committed entries
 func (rc *raftNode) entriesToApply(
-	ctx context.Context, committedEntries []sdraftpb.Entry,
-) (nents []sdraftpb.Entry) {
+	ctx context.Context, committedEntries []raftpb.Entry,
+) (nents []raftpb.Entry) {
 	if len(committedEntries) == 0 {
 		return
 	}
@@ -489,13 +492,16 @@ func (rc *raftNode) entriesToApply(
 
 // publishEntries writes committed log entries to commit channel and returns
 // whether all entries could be published.
-func (rc *raftNode) publishEntries(ctx context.Context, ents []sdraftpb.Entry) bool {
+func (rc *raftNode) publishEntries(
+	ctx context.Context,
+	ents []raftpb.Entry,
+) bool {
 	// This is the only function where rc.cluster is being modified while the
 	// raft node is active. This is called synchronously by the caller. So there
 	// is no need to provide thread-safety to cluster.
 	for i := range ents {
 		switch ents[i].Type {
-		case sdraftpb.EntryNormal:
+		case raftpb.EntryNormal:
 			if len(ents[i].Data) == 0 {
 				// ignore empty messages
 				break
@@ -507,14 +513,14 @@ func (rc *raftNode) publishEntries(ctx context.Context, ents []sdraftpb.Entry) b
 				return false
 			}
 
-		case sdraftpb.EntryConfChange:
-			var cc sdraftpb.ConfChange
+		case raftpb.EntryConfChange:
+			var cc raftpb.ConfChange
 			if err := protoutil.Unmarshal(ents[i].Data, &cc); err != nil {
 				log.Fatal(ctx, err)
 			}
 			rc.confState = *rc.node.ApplyConfChange(cc)
 			switch cc.Type {
-			case sdraftpb.ConfChangeAddNode:
+			case raftpb.ConfChangeAddNode:
 				log.Infof(ctx, "Processing add node conf change: %v", cc)
 				if len(cc.Context) > 0 {
 					nodeID := types.ID(cc.NodeID).String()
@@ -564,7 +570,7 @@ func (rc *raftNode) publishEntries(ctx context.Context, ents []sdraftpb.Entry) b
 					}
 					log.Infof(ctx, "Successfully added node %v", nodeID)
 				}
-			case sdraftpb.ConfChangeRemoveNode:
+			case raftpb.ConfChangeRemoveNode:
 				log.Infof(ctx, "Processing remove node conf change %v", cc)
 				nodeID := types.ID(cc.NodeID).String()
 				rc.removeNode(nodeID)
@@ -601,7 +607,7 @@ func (rc *raftNode) publishEntries(ctx context.Context, ents []sdraftpb.Entry) b
 }
 
 // loadSnapshot returns the latest valid snapshot
-func (rc *raftNode) loadSnapshot(ctx context.Context) *sdraftpb.Snapshot {
+func (rc *raftNode) loadSnapshot(ctx context.Context) *raftpb.Snapshot {
 	snapshot, err := rc.snapshotter.Load()
 	if err != nil && err != snap.ErrNoSnapshot {
 		log.Fatalf(ctx, "Error loading snapshot (%v)", err)
@@ -613,14 +619,14 @@ func (rc *raftNode) loadSnapshot(ctx context.Context) *sdraftpb.Snapshot {
 // ErrUnexpectedEOF errors in WAL files which can arise if there were past
 // records that were only partially flushed (and therefore never synced.)
 func (rc *raftNode) readWAL(
-	ctx context.Context, snap *sdraftpb.Snapshot,
-) (w *wal.WAL, st sdraftpb.HardState, ents []sdraftpb.Entry) {
+	ctx context.Context, snap *raftpb.Snapshot,
+) (w *wal.WAL, st raftpb.HardState, ents []raftpb.Entry) {
 	var err error
 	if !wal.Exist(rc.waldir) {
 		if err = os.Mkdir(rc.waldir, 0750); err != nil {
 			log.Fatalf(ctx, "Cannot create dir for wal, err: %v", err)
 		}
-		w, err = wal.Create(rc.waldir, nil)
+		w, err = wal.Create(nil, rc.waldir, nil)
 		if err != nil {
 			log.Fatalf(ctx, "Create wal err: %v", err)
 		}
@@ -630,7 +636,7 @@ func (rc *raftNode) readWAL(
 		log.Infof(ctx, "Created wal dir %s", rc.waldir)
 	}
 
-	walsnap := sdwalpb.Snapshot{}
+	walsnap := walpb.Snapshot{}
 	if snap != nil {
 		walsnap.Index, walsnap.Term = snap.Metadata.Index, snap.Metadata.Term
 	}
@@ -643,7 +649,7 @@ func (rc *raftNode) readWAL(
 
 	repaired := false
 	for {
-		if w, err = wal.Open(rc.waldir, walsnap); err != nil {
+		if w, err = wal.Open(nil, rc.waldir, walsnap); err != nil {
 			log.Fatalf(ctx, "Failed to open wal, err: %v", err)
 		}
 		if _, st, ents, err = w.ReadAll(); err != nil {
@@ -659,7 +665,7 @@ func (rc *raftNode) readWAL(
 			if err := w.Close(); err != nil {
 				log.Errorf(ctx, "Ignoring close wal err: %v", err)
 			}
-			if !wal.Repair(rc.waldir) {
+			if !wal.Repair(nil, rc.waldir) {
 				log.Fatalf(ctx, "Failed to repair WAL")
 			} else {
 				log.Infof(ctx, "Successfully repaired WAL")
@@ -939,6 +945,7 @@ func (rc *raftNode) tryJoin(ctx context.Context, joinCh chan struct{}, tlsInfo t
 					return nil
 				})
 			if err == nil {
+				log.Infof(ctx, "Successfully joined node %v", node)
 				close(joinCh)
 				return
 			} else {
@@ -979,7 +986,7 @@ func (rc *raftNode) tryBootstrap(
 // startRaft replays the existing WAL and joins the raft cluster
 func (rc *raftNode) startRaft(
 	ctx context.Context,
-	confChangeC chan<- sdraftpb.ConfChange,
+	confChangeC chan<- raftpb.ConfChange,
 	certsDir string,
 	grpcAddr *kronospb.NodeAddr,
 	waitBeforeBootstrap time.Duration,
@@ -990,7 +997,7 @@ func (rc *raftNode) startRaft(
 			log.Fatalf(ctx, "Cannot create dir for snapshot (%v)", err)
 		}
 	}
-	rc.snapshotter = snap.New(rc.snapdir)
+	rc.snapshotter = snap.New(nil, rc.snapdir)
 	rc.snapshotterReady <- rc.snapshotter
 
 	rc.wal = rc.replayWAL(ctx)
@@ -1056,7 +1063,11 @@ func (rc *raftNode) startRaft(
 		if err != nil {
 			log.Fatalf(ctx, "Error creating cluster metadata using data from seed host: %v", err)
 		}
-		rc.node = raft.StartNode(c, startingPeers)
+		if len(startingPeers) > 0 {
+			rc.node = raft.StartNode(c, startingPeers)
+		} else {
+			rc.node = raft.RestartNode(c)
+		}
 	}
 
 	rc.transport = &rafthttp.Transport{
@@ -1064,7 +1075,7 @@ func (rc *raftNode) startRaft(
 		ClusterID:   types.ID(rc.clusterID),
 		Raft:        rc,
 		ServerStats: stats.NewServerStats("", ""),
-		LeaderStats: stats.NewLeaderStats(fmt.Sprintf("%v", rc.nodeID)),
+		LeaderStats: stats.NewLeaderStats(nil, fmt.Sprintf("%v", rc.nodeID)),
 		ErrorC:      make(chan error),
 		DialTimeout: 5 * time.Second,
 		TLSInfo:     tlsInfo,
@@ -1112,7 +1123,7 @@ func (rc *raftNode) stopHTTP() {
 
 // publishSnapshot publishes the given snapshot and requests the state machine
 // to load a snapshot
-func (rc *raftNode) publishSnapshot(ctx context.Context, snap sdraftpb.Snapshot) {
+func (rc *raftNode) publishSnapshot(ctx context.Context, snap raftpb.Snapshot) {
 	if raft.IsEmptySnap(snap) {
 		return
 	}
@@ -1312,7 +1323,8 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 
 // serveRaft runs the raft HTTP server
 func (rc *raftNode) serveRaft(
-	ctx context.Context, confChangeC chan<- sdraftpb.ConfChange, grpcAddr *kronospb.NodeAddr,
+	ctx context.Context, confChangeC chan<- raftpb.ConfChange,
+	grpcAddr *kronospb.NodeAddr,
 ) {
 	// Listen on all interfaces
 	host := net.JoinHostPort("", rc.localAddr.Port)
@@ -1357,7 +1369,7 @@ func (rc *raftNode) serveRaft(
 }
 
 // Process processes the given raft message
-func (rc *raftNode) Process(ctx context.Context, m sdraftpb.Message) error {
+func (rc *raftNode) Process(ctx context.Context, m raftpb.Message) error {
 	return rc.node.Step(ctx, m)
 }
 
