@@ -25,6 +25,7 @@ import (
 
 const (
 	advertiseHostFlag            = "advertise-host"
+	listenHostFlag               = "listen-addr"
 	dataDirFlag                  = "data-dir"
 	grpcPortFlag                 = "grpc-port"
 	manageOracleTickIntervalFlag = "manage-oracle-tick-interval"
@@ -40,6 +41,7 @@ const (
 
 var startCtx struct {
 	advertiseHost            string
+	listenHost               string
 	dataDir                  string
 	grpcPort                 string
 	manageOracleTickInterval time.Duration
@@ -76,9 +78,19 @@ func init() {
 		&startCtx.advertiseHost,
 		advertiseHostFlag,
 		"",
-		"advertise-host of kronos",
+		"advertise-host is the IP address advertised by kronos to peers and clients",
 	)
 	if err := startCmd.MarkFlagRequired(advertiseHostFlag); err != nil {
+		log.Fatal(ctx, err)
+	}
+
+	startCmd.Flags().StringVar(
+		&startCtx.listenHost,
+		listenHostFlag,
+		"0.0.0.0",
+		"the IP-address kronos host must bind to for listening, listens to all addresses if not set",
+	)
+	if err := startCmd.MarkFlagRequired(listenHostFlag); err != nil {
 		log.Fatal(ctx, err)
 	}
 
@@ -213,7 +225,7 @@ func initHTTPPprof(ctx context.Context) {
 	}
 	log.Infof(ctx, "Starting http pprof. To see debug info go to http://%s/debug/pprof", startCtx.pprofAddr)
 	go func() {
-		if err := http.ListenAndServe(startCtx.pprofAddr, nil); err != nil {
+		if err := http.ListenAndServe(net.JoinHostPort(startCtx.listenHost, startCtx.pprofAddr), nil); err != nil {
 			log.Fatal(ctx, "HTTP pprof ListenAndServer error", err)
 		}
 	}()
@@ -240,7 +252,7 @@ func runStart() {
 	if startCtx.driftClock.enable {
 		lis, err := net.Listen(
 			"tcp",
-			net.JoinHostPort(startCtx.advertiseHost, startCtx.driftClock.servicePort),
+			net.JoinHostPort(startCtx.listenHost, startCtx.driftClock.servicePort),
 		)
 		if err != nil {
 			log.Fatalf(ctx, "Failed to listen: %v", err)
@@ -293,6 +305,7 @@ func runStart() {
 			SnapCount:           startCtx.raftSnapCount,
 			WaitBeforeBootstrap: startCtx.waitBeforeBootstrap,
 			SeedRpcRetryTimeout: startCtx.seedRpcRetryTimeout,
+			ListenHost:          startCtx.listenHost,
 		},
 	}
 	server, err := server.NewKronosServer(ctx, config)

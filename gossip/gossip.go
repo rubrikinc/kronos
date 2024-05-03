@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/netip"
 	"sync"
 	"time"
 
@@ -154,18 +153,7 @@ func (g *Server) removePeerLocked(ctx context.Context, peer string) {
 func (g *Server) addPeerLocked(ctx context.Context,
 	desc *kronospb.NodeDescriptor) {
 	nodeId := desc.NodeId
-	raftAddr := desc.RaftAddr
 	grpcAddr := desc.GrpcAddr
-	if _, err := netip.ParseAddrPort(grpcAddr); err != nil {
-		log.Errorf(ctx, "Invalid grpc addr for nodeID %v: %v", nodeId,
-			grpcAddr)
-		return
-	}
-	if !kronosutil.IsValidRaftAddr(raftAddr) {
-		log.Errorf(ctx, "Invalid raft addr for nodeID %v : %s", nodeId,
-			raftAddr)
-		return
-	}
 	if nodeId == g.nodeID {
 		return
 	}

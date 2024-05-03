@@ -6,10 +6,11 @@ require (
 	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f
 	github.com/gogo/protobuf v1.3.2
 	github.com/pkg/errors v0.9.1
+	github.com/rubrikinc/failure-test-utils v0.0.0-20240416184422-0c36f1376e1c
 	github.com/spf13/afero v1.1.2
 	github.com/spf13/cobra v1.1.1
 	github.com/stretchr/testify v1.8.4
-	go.uber.org/atomic v1.7.0
+	go.uber.org/atomic v1.10.0
 	golang.org/x/sync v0.0.0-20220513210516-0976fa681c29
 	google.golang.org/grpc v1.32.0
 )
@@ -31,6 +32,7 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.0 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
+	github.com/google/uuid v1.3.0 // indirect
 	github.com/inconshreveable/mousetrap v1.0.0 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
@@ -55,6 +57,9 @@ require (
 // Using cockroachdb fork of etcd to play well with cockroachdb
 
 replace go.etcd.io/etcd/api/v3 => github.com/cockroachdb/etcd/api/v3 v3.0.0-20230718104326-dbe02a550754
+
 replace go.etcd.io/etcd/server/v3 => github.com/cockroachdb/etcd/server/v3 v3.0.0-20230718104326-dbe02a550754
+
 replace go.etcd.io/etcd/pkg/v3 => github.com/cockroachdb/etcd/pkg/v3 v3.0.0-20230718104326-dbe02a550754
+
 replace go.etcd.io/etcd/raft/v3 => github.com/cockroachdb/etcd/raft/v3 v3.0.0-20230718104326-dbe02a550754

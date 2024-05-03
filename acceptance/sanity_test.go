@@ -497,6 +497,7 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	addNode(5)
 	nodeIDForNewNode := addNode(6)
 	startTime := time.Now()
+	time.Sleep(4 * kronosStabilizationBufferTime)
 	for time.Since(startTime) < time.Minute {
 		if _, _, err = tc.ValidateTimeInConsensus(
 			ctx,

@@ -37,6 +37,7 @@ type RaftConfig struct {
 	SnapCount           uint64
 	WaitBeforeBootstrap time.Duration
 	SeedRpcRetryTimeout time.Duration
+	ListenHost          string
 }
 
 // RaftStateMachine is a distributed state machine managed by raft.

@@ -217,6 +217,7 @@ type raftNode struct {
 	httpdonec chan struct{} // signals http server shutdown complete
 	// snapTriggerConfig is used to check when to trigger a snapshot.
 	snapTriggerConfig *snapTriggerConfig
+	listenHost        string
 
 	bootstrappedStatus struct {
 		sync.Mutex
@@ -426,6 +427,7 @@ func newRaftNode(
 		snapshotterReady:  make(chan *snap.Snapshotter, 1),
 		gossip:            g,
 		bootstrapReqC:     make(chan kronospb.BootstrapRequest),
+		listenHost:        rc.ListenHost,
 		// rest of structure populated after WAL replay
 	}
 	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort,
@@ -1327,7 +1329,7 @@ func (rc *raftNode) serveRaft(
 	grpcAddr *kronospb.NodeAddr,
 ) {
 	// Listen on all interfaces
-	host := net.JoinHostPort("", rc.localAddr.Port)
+	host := net.JoinHostPort(rc.listenHost, rc.localAddr.Port)
 	ln, err := kronosutil.NewStoppableListener(host, rc.httpstopc)
 	if err != nil {
 		log.Fatalf(ctx, "Failed to listen rafthttp (%v)", err)

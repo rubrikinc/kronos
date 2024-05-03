@@ -58,6 +58,8 @@ type Server struct {
 	GRPCAddr *kronospb.NodeAddr
 	// raftAddr is the address of the raft HTTP server
 	raftAddr *kronospb.NodeAddr
+	// listenHost is the address to listen on for grpc and raft
+	listenHost string
 	// OracleDelta is the delta of this server with respect to KronosTime
 	OracleDelta atomic.Int64
 	// OracleUptimeDelta is the delta of this server with respect to KronosUptime
@@ -707,7 +709,7 @@ func (k *Server) RunServer(ctx context.Context) error {
 	// Listen on all interfaces
 	lis, err := net.Listen(
 		"tcp",
-		net.JoinHostPort("", k.GRPCAddr.Port),
+		net.JoinHostPort(k.listenHost, k.GRPCAddr.Port),
 	)
 	if err != nil {
 		log.Fatalf(ctx, "failed to listen: %v", err)
@@ -794,6 +796,7 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 		Metrics:                  config.Metrics,
 		GossipServer:             g,
 		bootstrapReqCh:           bootstrapReqCh,
+		listenHost:               config.ListenHost,
 	}
 
 	return s, nil
