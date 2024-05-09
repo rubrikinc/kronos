@@ -253,8 +253,8 @@ github.com/prometheus/tsdb v0.7.1/go.mod h1:qhTCs0VvXwvX/y3TZrWD7rabWM+ijKTux40T
 github.com/rogpeppe/fastuuid v0.0.0-20150106093220-6724a57986af/go.mod h1:XWv6SoW27p1b0cqNHllgS5HIMJraePCO15w5zCzIWYg=
 github.com/rogpeppe/fastuuid v1.2.0/go.mod h1:jVj6XXZzXRy/MSR5jhDC/2q6DgLz+nrA6LYCDYWNEvQ=
 github.com/rogpeppe/go-internal v1.3.0/go.mod h1:M8bDsm7K2OlrFYOpmOWEs/qY81heoFRclV5y23lUDJ4=
-github.com/rubrikinc/failure-test-utils v0.0.0-20240416184422-0c36f1376e1c h1:d7gzZw02If8LCdBjWXaXB5+asavPlNljo433hn5LhQM=
-github.com/rubrikinc/failure-test-utils v0.0.0-20240416184422-0c36f1376e1c/go.mod h1:bUFEMAffg3+HUC5mmgd5ZfKQ64794R3666HJXL4eYvU=
+github.com/rubrikinc/failure-test-utils v0.0.0-20240509175610-a4013588db1c h1:6EOnDp0KhAmtFkSLqdhEgZwdxP6tjQNze6KAi65seKs=
+github.com/rubrikinc/failure-test-utils v0.0.0-20240509175610-a4013588db1c/go.mod h1:bUFEMAffg3+HUC5mmgd5ZfKQ64794R3666HJXL4eYvU=
 github.com/russross/blackfriday/v2 v2.0.1/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
 github.com/ryanuber/columnize v0.0.0-20160712163229-9b3edd62028f/go.mod h1:sm1tb6uqfes/u+d4ooFouqFdy9/2g9QGwK3SQygK0Ts=
 github.com/sasha-s/go-deadlock v0.2.0 h1:lMqc+fUb7RrFS3gQLtoQsJ7/6TV/pAIFvBsqX73DK8Y=

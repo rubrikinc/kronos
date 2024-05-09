@@ -106,8 +106,6 @@ func (t *testNode) kronosStartCmd(
 	certsDir string,
 	raftSnapCount uint64,
 ) string {
-	bootstrapTime := 5 * time.Second
-	seedRpcRetryTimeout := 5 * time.Second
 	kronosCmd := []string{
 		"KRONOS_NODE_ID=" + t.id,
 		"GODEBUG=netdns=cgo",
@@ -126,8 +124,6 @@ func (t *testNode) kronosStartCmd(
 		"--seed-hosts", strings.Join(seedHosts, ","),
 		"--manage-oracle-tick-interval", manageOracleTickInterval.String(),
 		"--raft-snap-count", fmt.Sprint(raftSnapCount),
-		"--wait-before-bootstrap", bootstrapTime.String(),
-		"--seed-rpc-retry-timeout", seedRpcRetryTimeout.String(),
 	}
 
 	if len(certsDir) > 0 {
@@ -1005,4 +1001,18 @@ func (tc *TestCluster) ExchangeDataDir(ctx context.Context, id1 int,
 	}
 
 	return nil
+}
+
+func (tc *TestCluster) Disconnect(oracle int, i int) {
+	tc.raftProxy[oracle][i].BlockIncomingConns()
+	tc.grpcProxy[oracle][i].BlockIncomingConns()
+	tc.raftProxy[i][oracle].BlockIncomingConns()
+	tc.grpcProxy[i][oracle].BlockIncomingConns()
+}
+
+func (tc *TestCluster) Connect(oracle int, i int) {
+	tc.raftProxy[oracle][i].UnblockIncomingConns()
+	tc.grpcProxy[oracle][i].UnblockIncomingConns()
+	tc.raftProxy[i][oracle].UnblockIncomingConns()
+	tc.grpcProxy[i][oracle].UnblockIncomingConns()
 }

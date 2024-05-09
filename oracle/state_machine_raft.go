@@ -2,11 +2,9 @@ package oracle
 
 import (
 	"context"
-	"sync"
-	"time"
-
 	"github.com/rubrikinc/kronos/gossip"
 	"github.com/rubrikinc/kronos/protoutil"
+	"sync"
 
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 
@@ -34,10 +32,8 @@ type RaftConfig struct {
 	DataDir string
 	// SnapCount is the number of raft entries after which a raft snapshot is
 	// triggered.
-	SnapCount           uint64
-	WaitBeforeBootstrap time.Duration
-	SeedRpcRetryTimeout time.Duration
-	ListenHost          string
+	SnapCount  uint64
+	ListenHost string
 }
 
 // RaftStateMachine is a distributed state machine managed by raft.

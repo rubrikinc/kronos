@@ -19,7 +19,7 @@ func TestSingleNodeKronos(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	a := assert.New(t)
 	ctx := context.TODO()
-	cluster := mock.NewKronosCluster(1)
+	cluster := mock.NewKronosCluster(1, 15*time.Second, 5*time.Second)
 	defer cluster.Stop()
 	node := cluster.Node(0)
 	a.NotNil(node)
@@ -134,7 +134,7 @@ func TestSingleNodeKronos(t *testing.T) {
 func TestMultiNodeClientStatus(t *testing.T) {
 	a := assert.New(t)
 	ctx := context.TODO()
-	cluster, nodes := mock.InitializeCluster(a, 2)
+	cluster, nodes := mock.InitializeCluster(a, 2, 15*time.Second, 5*time.Second)
 	defer cluster.Stop()
 	// This is the first ever oracle so after one Tick it should have proposed
 	// itself.
@@ -165,7 +165,7 @@ func TestMultiNodeClientStatus(t *testing.T) {
 func TestMultiNodeServerStatus(t *testing.T) {
 	a := assert.New(t)
 	ctx := context.TODO()
-	cluster, nodes := mock.InitializeCluster(a, 3)
+	cluster, nodes := mock.InitializeCluster(a, 3, 15*time.Second, 5*time.Second)
 	defer cluster.Stop()
 	for _, node := range nodes {
 		a.Equal(
@@ -225,7 +225,9 @@ func TestMultiNodeBackwardJump(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a := assert.New(t)
-			cluster, nodes := mock.InitializeCluster(a, 3)
+			timeCapDelta := 15 * time.Second
+			upTimeCapDelta := 5 * time.Second
+			cluster, nodes := mock.InitializeCluster(a, 3, timeCapDelta, upTimeCapDelta)
 			defer cluster.Stop()
 
 			// Time Server needs 2 ticks to initialize
@@ -286,7 +288,10 @@ func TestMultiNodeBackwardJump(t *testing.T) {
 			// Node waits for 4 ticks before state machine management so that an
 			// initialized Server can become the oracle
 			cluster.TickN(newOracle, 4)
-
+			if !tc.isSameOracle {
+				// The node needs to wait till time cap to ensure old oracle is not serving time
+				time.Sleep(timeCapDelta)
+			}
 			cluster.Tick(newOracle)
 			if !tc.isSameOracle {
 				// Time Server needs two ticks to initialize after overthrowing oracle
@@ -349,7 +354,7 @@ func TestMultiNodesDeltaComputation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	a := assert.New(t)
 	ctx := context.TODO()
-	cluster, nodes := mock.InitializeCluster(a, 3)
+	cluster, nodes := mock.InitializeCluster(a, 3, 15*time.Second, 5*time.Second)
 	defer cluster.Stop()
 
 	a.Equal(int64(0), nodes[0].Server.Metrics.IsOracle.Value())
@@ -574,7 +579,8 @@ func TestMultiNodeHighRTT(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	a := assert.New(t)
 	ctx := context.TODO()
-	cluster, nodes := mock.InitializeCluster(a, 3)
+	timeCapDelta := 5 * time.Second
+	cluster, nodes := mock.InitializeCluster(a, 3, timeCapDelta, 5*time.Second)
 	defer cluster.Stop()
 
 	// Time Server needs 2 ticks to initialize
@@ -591,7 +597,9 @@ func TestMultiNodeHighRTT(t *testing.T) {
 	a.Equal(kronospb.ServerStatus_NOT_INITIALIZED, nodes[2].Server.ServerStatus())
 	//a.Equal(int64(0), nodes[2].Server.Metrics.RTT.Snapshot().ValueAtQuantile(100))
 	// Node 2 will wait for two errors (high rtt) before attempting to become
-	// oracle.
+	// oracle and also wait till time cap to ensure old oracle is not serving time
+	time.Sleep(timeCapDelta)
+
 	cluster.Tick(nodes[2])
 	cluster.Tick(nodes[2])
 	//a.Equal(int64(2), nodes[2].Server.Metrics.SyncFailureCount.Count())
@@ -685,7 +693,7 @@ func TestMultiNodeClusterSync(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	a := assert.New(t)
 	ctx := context.TODO()
-	cluster, nodes := mock.InitializeCluster(a, 3)
+	cluster, nodes := mock.InitializeCluster(a, 3, 15*time.Second, 5*time.Second)
 	defer cluster.Stop()
 
 	// Time Server needs 2 ticks to initialize
@@ -725,7 +733,7 @@ func TestMultiNodeExceedsTimeCap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	a := assert.New(t)
 	ctx := context.TODO()
-	cluster, nodes := mock.InitializeCluster(a, 3)
+	cluster, nodes := mock.InitializeCluster(a, 3, 15*time.Second, 5*time.Second)
 	defer cluster.Stop()
 
 	// Time Server needs 2 ticks to initialize
@@ -769,7 +777,7 @@ func TestMultiNodeOracleOverthrow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	a := assert.New(t)
 	ctx := context.TODO()
-	cluster, nodes := mock.InitializeCluster(a, 3)
+	cluster, nodes := mock.InitializeCluster(a, 3, 15*time.Second, 5*time.Second)
 	defer cluster.Stop()
 
 	// Time Server needs 2 ticks to initialize
@@ -815,7 +823,7 @@ func TestKronosTimeWithRetries(t *testing.T) {
 	a := assert.New(t)
 	ctx := context.TODO()
 
-	cluster, nodes := mock.InitializeCluster(a, 3)
+	cluster, nodes := mock.InitializeCluster(a, 3, 15*time.Second, 5*time.Second)
 	// Time Server needs 2 ticks to initialize
 	cluster.Tick(nodes[0])
 	cluster.Tick(nodes[0])

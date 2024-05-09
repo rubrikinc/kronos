@@ -125,7 +125,7 @@ func (tc *Cluster) IsClusterInSync(ctx context.Context, nodes ...*Node) error {
 }
 
 // addNode creates a test kronos Node. It returns the created Node
-func (tc *Cluster) addNode(idx int, isNew bool) *Node {
+func (tc *Cluster) addNode(idx int, isNew bool, oracleTimeCapDelta time.Duration, oracleUpTimeCapDelta time.Duration) *Node {
 	addr := kronospb.NodeAddr{
 		Host: fmt.Sprintf("test_%d", idx),
 		Port: strconv.Itoa(idx),
@@ -144,8 +144,8 @@ func (tc *Cluster) addNode(idx int, isNew bool) *Node {
 		clock,
 		tc.StateMachine,
 		tc.Client,
-		15*time.Second,
-		5*time.Second,
+		oracleTimeCapDelta,
+		oracleUpTimeCapDelta,
 	)
 	tickerCh := make(chan time.Time)
 	tickDoneCh := make(chan struct{})
@@ -199,11 +199,11 @@ func (tc *Cluster) RestartNode(ctx context.Context, testNode *Node) *Node {
 		log.Fatalf(ctx, "Node %v not found", testNode.Server.GRPCAddr)
 	}
 
-	return tc.addNode(nodeIdx, false /* isNew */)
+	return tc.addNode(nodeIdx, false, 15*time.Second, 5*time.Second)
 }
 
 // NewKronosCluster returns a new test kronos cluster
-func NewKronosCluster(numNodes int) *Cluster {
+func NewKronosCluster(numNodes int, timeCapDelta time.Duration, upTimeCapDelta time.Duration) *Cluster {
 	nodes := make(map[string]*Node)
 	addrs := []kronospb.NodeAddr{}
 	client := newInMemClient(nodes).(*Client)
@@ -215,15 +215,15 @@ func NewKronosCluster(numNodes int) *Cluster {
 		Client:       client,
 	}
 	for i := 0; i < numNodes; i++ {
-		cluster.addNode(i, true /* isNew */)
+		cluster.addNode(i, true, timeCapDelta, upTimeCapDelta)
 	}
 
 	return cluster
 }
 
 // InitializeCluster creates a cluster and sets a different time on each Node
-func InitializeCluster(a *assert.Assertions, numNodes int) (cluster *Cluster, nodes []*Node) {
-	cluster = NewKronosCluster(numNodes)
+func InitializeCluster(a *assert.Assertions, numNodes int, timeCapDelta time.Duration, upTimeCapDelta time.Duration) (cluster *Cluster, nodes []*Node) {
+	cluster = NewKronosCluster(numNodes, timeCapDelta, upTimeCapDelta)
 	for i := 0; i < numNodes; i++ {
 		node := cluster.Node(i)
 		a.NotNil(node)

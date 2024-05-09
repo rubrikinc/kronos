@@ -29,8 +29,6 @@ const (
 	dataDirFlag                  = "data-dir"
 	grpcPortFlag                 = "grpc-port"
 	manageOracleTickIntervalFlag = "manage-oracle-tick-interval"
-	waitBeforeBootstrapFlag      = "wait-before-bootstrap"
-	seedRpcRetryTimeoutFlag      = "seed-rpc-retry-timeout"
 	oracleTimeCapDeltaFlag       = "oracle-time-cap-delta"
 	oracleUptimeCapDeltaFlag     = "oracle-uptime-cap-delta"
 	raftPortFlag                 = "raft-port"
@@ -57,8 +55,6 @@ var startCtx struct {
 		startConfigFile string
 		enable          bool
 	}
-	waitBeforeBootstrap time.Duration
-	seedRpcRetryTimeout time.Duration
 }
 
 var startCmd = &cobra.Command{
@@ -149,20 +145,6 @@ func init() {
 		3*time.Second,
 		"manageOracleTickInterval is the period where an action is taken based "+
 			"on the state of the oracle state machine",
-	)
-
-	startCmd.Flags().DurationVar(
-		&startCtx.waitBeforeBootstrap,
-		waitBeforeBootstrapFlag,
-		2*time.Minute,
-		"waitBeforeBootstrap is the time to wait before starting the bootstrap process",
-	)
-
-	startCmd.Flags().DurationVar(
-		&startCtx.seedRpcRetryTimeout,
-		seedRpcRetryTimeoutFlag,
-		time.Minute,
-		"seedRpcRetryTimeout is the timeout for seed rpc retries",
 	)
 
 	startCmd.Flags().DurationVar(
@@ -300,12 +282,10 @@ func runStart() {
 				Host: startCtx.advertiseHost,
 				Port: startCtx.raftPort,
 			},
-			SeedHosts:           strings.Split(startCtx.seedHosts, ","),
-			GossipSeedHosts:     strings.Split(startCtx.gossipSeedHosts, ","),
-			SnapCount:           startCtx.raftSnapCount,
-			WaitBeforeBootstrap: startCtx.waitBeforeBootstrap,
-			SeedRpcRetryTimeout: startCtx.seedRpcRetryTimeout,
-			ListenHost:          startCtx.listenHost,
+			SeedHosts:       strings.Split(startCtx.seedHosts, ","),
+			GossipSeedHosts: strings.Split(startCtx.gossipSeedHosts, ","),
+			SnapCount:       startCtx.raftSnapCount,
+			ListenHost:      startCtx.listenHost,
 		},
 	}
 	server, err := server.NewKronosServer(ctx, config)

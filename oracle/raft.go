@@ -430,8 +430,7 @@ func newRaftNode(
 		listenHost:        rc.ListenHost,
 		// rest of structure populated after WAL replay
 	}
-	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort,
-		rc.WaitBeforeBootstrap, rc.SeedRpcRetryTimeout)
+	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort)
 	return &RaftNodeInfo{commitC, errorC, rn.snapshotterReady, rn.bootstrapReqC}
 }
 
@@ -991,8 +990,6 @@ func (rc *raftNode) startRaft(
 	confChangeC chan<- raftpb.ConfChange,
 	certsDir string,
 	grpcAddr *kronospb.NodeAddr,
-	waitBeforeBootstrap time.Duration,
-	seedRpcRetryTimeout time.Duration,
 ) {
 	if !fileutil.Exist(rc.snapdir) {
 		if err := os.Mkdir(rc.snapdir, 0750); err != nil {

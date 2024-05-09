@@ -115,7 +115,9 @@ type Server struct {
 		err    error
 	}
 
-	bootstrapReqCh chan kronospb.BootstrapRequest
+	bootstrapReqCh                             chan kronospb.BootstrapRequest
+	syncedWithOracleAtleastOnce                atomic.Bool
+	haveWaitedLongEnoughForOracleToStopServing atomic.Bool
 }
 
 var _ kronospb.TimeServiceServer = &Server{}
@@ -274,7 +276,7 @@ func (k *Server) shouldOverthrowOracle(ctx context.Context) bool {
 			" errs: [%v]",
 		numConsecutiveErrsForOverthrow, oracle, strings.Join(errs, "; "),
 	)
-	return true
+	return k.canOverthrowOracleNow(ctx, k.OracleSM.State(ctx))
 }
 
 func (k *Server) syncOrOverthrowOracle(
@@ -282,6 +284,7 @@ func (k *Server) syncOrOverthrowOracle(
 ) (synced bool) {
 	err := k.trySyncWithOracle(ctx, oracleState.Oracle)
 	if err == nil {
+		k.syncedWithOracleAtleastOnce.Store(true)
 		k.Metrics.SyncSuccessCount.Inc(1)
 	} else {
 		k.Metrics.SyncFailureCount.Inc(1)
@@ -407,6 +410,15 @@ func (k *Server) initialize(ctx context.Context, tickCh <-chan time.Time, tickCa
 	// was an initialized server, it would have attempted to overthrow this
 	// oracle.
 	const becomeOracleTickThreshold = numConsecutiveErrsForOverthrow + 1
+
+	go func() {
+		select {
+		case <-k.StopC:
+			return
+		case <-time.After(k.OracleTimeCapDelta):
+		}
+		k.haveWaitedLongEnoughForOracleToStopServing.Store(true)
+	}()
 
 	tickNum := int64(0)
 	for k.ServerStatus() != kronospb.ServerStatus_INITIALIZED {
@@ -746,6 +758,23 @@ func (k *Server) ID() (string, error) {
 	}
 
 	return id.String(), nil
+}
+
+func (k *Server) isOracle(oracleState *kronospb.OracleState) bool {
+	return proto.Equal(oracleState.Oracle, k.GRPCAddr)
+}
+
+func (k *Server) canOverthrowOracleNow(
+	ctx context.Context,
+	curOracle *kronospb.OracleState,
+) bool {
+	if curOracle != nil && !k.isOracle(curOracle) && !k.
+		syncedWithOracleAtleastOnce.Load() && !k.
+		haveWaitedLongEnoughForOracleToStopServing.Load() {
+		return false
+	} else {
+		return true
+	}
 }
 
 // Config is used to initialize a kronos server based on the given parameters
