@@ -1292,7 +1292,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 				log.Fatal(ctx, err)
 			}
 
-			rc.transport.Send(rd.Messages)
+			rc.transport.Send(rc.sanitizeOutgoingMessages(rd.Messages))
 			ents := rc.entriesToApply(ctx, rd.CommittedEntries)
 			if ok := rc.publishEntries(ctx, ents); !ok {
 				rc.stop()
@@ -1397,4 +1397,16 @@ func (rc *raftNode) ReportUnreachable(id uint64) {
 // ReportSnapshot reports the status of the sent snapshot.
 func (rc *raftNode) ReportSnapshot(id uint64, status raft.SnapshotStatus) {
 	rc.node.ReportSnapshot(id, status)
+}
+
+func (rc *raftNode) sanitizeOutgoingMessages(ms []raftpb.Message) []raftpb.Message {
+	for i := 0; i < len(ms); i++ {
+		if ms[i].Type == raftpb.MsgSnap {
+			// When there is a `raftpb.EntryConfChange` after creating the snapshot,
+			// then the confState included in the snapshot is out of date. so We need
+			// to update the confState before sending a snapshot to a follower.
+			ms[i].Snapshot.Metadata.ConfState = rc.confState
+		}
+	}
+	return ms
 }
