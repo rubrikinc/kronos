@@ -39,6 +39,8 @@ github.com/sasha-s/go-deadlock v0.2.0 h1:lMqc+fUb7RrFS3gQLtoQsJ7/6TV/pAIFvBsqX73
 github.com/sasha-s/go-deadlock v0.2.0/go.mod h1:StQn567HiB1fF2yJ44N9au7wOhrPS3iZqiDbRupzT10=
 github.com/scaledata/etcd v4.0.0-rubrik+incompatible h1:JM1Wfhwv2lzlBFJ5CZ0lPLzJeMcSEXiBPgrl8D7vGc0=
 github.com/scaledata/etcd v4.0.0-rubrik+incompatible/go.mod h1:y1nBZicGtX7doKoxXFPN3iOP3PCYqYDcQQSMQBzvK7k=
+github.com/scaledata/etcd v4.0.3-rubrik+incompatible h1:p13e3h28PVHNjED/wCZaSdXJWfVBd4VvQge8q7rrpZY=
+github.com/scaledata/etcd v4.0.3-rubrik+incompatible/go.mod h1:y1nBZicGtX7doKoxXFPN3iOP3PCYqYDcQQSMQBzvK7k=
 github.com/sirupsen/logrus v1.8.1 h1:dJKuHgqk1NNQlqoA6BTlM1Wf9DOH3NBjQyu0h9+AZZE=
 github.com/sirupsen/logrus v1.8.1/go.mod h1:yWOB1SBYBC5VeMP7gHvWumXLIWorT60ONWic61uBYv0=
 github.com/spf13/afero v1.1.1 h1:Lt3ihYMlE+lreX1GS4Qw4ZsNpYQLxIXKBTEOXm3nt6I=
