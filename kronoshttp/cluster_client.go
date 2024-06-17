@@ -225,6 +225,38 @@ func (c *ClusterClient) GRPCAddr(ctx context.Context) (*kronospb.NodeAddr, error
 	return kronosutil.NodeAddr(string(body))
 }
 
+func (c *ClusterClient) RaftStatus(ctx context.Context) (*RaftStatusResp, error) {
+	raftStatusURL := kronosutil.AddToURLPath(c.url, requestTypeRaftStatus)
+	httpReq, err := http.NewRequest(http.MethodGet, raftStatusURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	httpReq = httpReq.WithContext(ctx)
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := ioutil.ReadAll(resp.Body)
+		return nil, errors.Errorf(
+			"raft status request failed. status: %v, msg: %s",
+			resp.StatusCode,
+			bytes.TrimSpace(msg),
+		)
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var raftStatus RaftStatusResp
+	if err := json.Unmarshal(body, &raftStatus); err != nil {
+		return nil, err
+	}
+	return &raftStatus, nil
+}
+
 // Close closes all the idle connections that cluster client has made.
 func (c *ClusterClient) Close() {
 	c.transport.CloseIdleConnections()

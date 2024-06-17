@@ -31,15 +31,19 @@ const (
 // NodeInfo stores the information for a node required by cli commands like
 // status, validate and any errors that occurred while fetching it.
 type NodeInfo struct {
-	ID           string                `json:"id"`
-	RaftAddr     *kronospb.NodeAddr    `json:"raft_addr"`
-	GRPCAddr     *kronospb.NodeAddr    `json:"grpc_addr"`
-	ServerStatus kronospb.ServerStatus `json:"server_status"`
-	OracleState  *kronospb.OracleState `json:"oracle_state"`
-	Delta        int64                 `json:"delta"`
-	Time         int64                 `json:"time"`
-	Uptime       int64                 `json:"uptime"`
-	Err          errMap                `json:"error"`
+	ID             string                `json:"id"`
+	RaftAddr       *kronospb.NodeAddr    `json:"raft_addr"`
+	GRPCAddr       *kronospb.NodeAddr    `json:"grpc_addr"`
+	ServerStatus   kronospb.ServerStatus `json:"server_status"`
+	OracleState    *kronospb.OracleState `json:"oracle_state"`
+	Delta          int64                 `json:"delta"`
+	Time           int64                 `json:"time"`
+	Uptime         int64                 `json:"uptime"`
+	Err            errMap                `json:"error"`
+	RaftLeader     bool                  `json:"raft_leader"`
+	RaftTerm       uint64                `json:"raft_term"`
+	AppliedIndex   uint64                `json:"applied_index"`
+	CommittedIndex uint64                `json:"committed_index"`
 }
 
 func (n *NodeInfo) addError(err error, tag string) {
@@ -76,6 +80,9 @@ func (n nodeInfoFetcher) fetch(
 	infoStores := make([]*NodeInfo, len(activeNodes))
 	var wg sync.WaitGroup
 	certsDir := kronosCertsDir()
+
+	tlsInfo := kronosutil.TLSInfo(kronosCertsDir())
+
 	for i, node := range activeNodes {
 		infoStores[i] = &NodeInfo{
 			ID:       node.NodeID,
@@ -84,6 +91,24 @@ func (n nodeInfoFetcher) fetch(
 		wg.Add(1)
 		go func(ndInfo *NodeInfo) {
 			defer wg.Done()
+
+			client, err := kronoshttp.NewClusterClient(ndInfo.RaftAddr, tlsInfo)
+			if err != nil {
+				ndInfo.addError(err, grpcAddrErrTag)
+				return
+			}
+			defer client.Close()
+			raftStatus, err := client.RaftStatus(ctx)
+			if err != nil {
+				ndInfo.addError(err, statusErrTag)
+				return
+			}
+
+			ndInfo.RaftLeader = raftStatus.RaftLeader
+			ndInfo.RaftTerm = raftStatus.RaftTerm
+			ndInfo.AppliedIndex = raftStatus.AppliedIndex
+			ndInfo.CommittedIndex = raftStatus.CommittedIndex
+
 			grpcAddr, err := fetchGRPCAddr(ctx, ndInfo.RaftAddr, certsDir)
 			if err != nil {
 				ndInfo.addError(err, grpcAddrErrTag)

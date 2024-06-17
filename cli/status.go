@@ -103,65 +103,90 @@ func runStatus() {
 }
 
 const (
-	raftIDHeader       = "Raft ID"
-	raftAddrHeader     = "Raft Address"
-	grpcAddrHeader     = "GRPC Address"
-	serverStatusHeader = "Server Status"
-	oracleAddrHeader   = "Oracle Address"
-	oracleIDHeader     = "Oracle Id"
-	timeCapHeader      = "Time Cap"
-	deltaHeader        = "Delta"
-	timeHeader         = "Time"
+	raftIDHeader         = "Raft ID"
+	raftAddrHeader       = "Raft Address"
+	grpcAddrHeader       = "GRPC Address"
+	serverStatusHeader   = "Server Status"
+	oracleAddrHeader     = "Oracle Address"
+	oracleIDHeader       = "Oracle Id"
+	timeCapHeader        = "Time Cap"
+	deltaHeader          = "Delta"
+	timeHeader           = "Time"
+	raftLeaderHeader     = "Raft Leader"
+	raftTermHeader       = "Raft Term"
+	appliedIndexHeader   = "Applied Index"
+	committedIndexHeader = "Committed Index"
 )
 
 func prettyPrintStatus(
 	outputStream io.Writer, errorStream io.Writer, stores []*NodeInfo, allFields bool,
 ) error {
 	const noValue = "N/A"
+
+	filterErrorsAndPrintField := func(n *NodeInfo, fieldFn func(n *NodeInfo) interface{}, errorTags ...string) string {
+		for _, tag := range errorTags {
+			if err := n.getError(tag); err != nil {
+				return noValue
+			}
+		}
+		return fmt.Sprint(fieldFn(n))
+	}
+
 	valueFn := map[string]func(n *NodeInfo) string{
 		raftIDHeader:   func(n *NodeInfo) string { return n.ID },
 		raftAddrHeader: func(n *NodeInfo) string { return kronosutil.NodeAddrToString(n.RaftAddr) },
 		grpcAddrHeader: func(n *NodeInfo) string {
-			if n.getError(grpcAddrErrTag) != nil {
-				return noValue
-			}
-			return kronosutil.NodeAddrToString(n.GRPCAddr)
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} { return kronosutil.NodeAddrToString(n.GRPCAddr) }, grpcAddrErrTag)
 		},
 		serverStatusHeader: func(n *NodeInfo) string {
-			if n.getError(grpcAddrErrTag) != nil || n.getError(statusErrTag) != nil {
-				return noValue
-			}
-			return fmt.Sprint(n.ServerStatus)
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return n.ServerStatus
+			}, grpcAddrErrTag, statusErrTag)
 		},
 		oracleAddrHeader: func(n *NodeInfo) string {
-			if n.getError(grpcAddrErrTag) != nil || n.getError(statusErrTag) != nil {
-				return noValue
-			}
-			return kronosutil.NodeAddrToString(n.OracleState.Oracle)
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return kronosutil.NodeAddrToString(n.OracleState.Oracle)
+			}, grpcAddrErrTag, statusErrTag)
 		},
 		oracleIDHeader: func(n *NodeInfo) string {
-			if n.getError(grpcAddrErrTag) != nil || n.getError(statusErrTag) != nil {
-				return noValue
-			}
-			return fmt.Sprint(n.OracleState.Id)
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return n.OracleState.Id
+			}, grpcAddrErrTag, statusErrTag)
 		},
 		timeCapHeader: func(n *NodeInfo) string {
-			if n.getError(grpcAddrErrTag) != nil || n.getError(statusErrTag) != nil {
-				return noValue
-			}
-			return fmt.Sprint(n.OracleState.TimeCap)
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return n.OracleState.TimeCap
+			}, grpcAddrErrTag, statusErrTag)
 		},
 		deltaHeader: func(n *NodeInfo) string {
-			if n.getError(grpcAddrErrTag) != nil || n.getError(statusErrTag) != nil {
-				return noValue
-			}
-			return fmt.Sprint(time.Duration(n.Delta))
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return time.Duration(n.Delta)
+			}, grpcAddrErrTag, statusErrTag)
 		},
 		timeHeader: func(n *NodeInfo) string {
-			if n.getError(grpcAddrErrTag) != nil || n.getError(timeErrTag) != nil {
-				return noValue
-			}
-			return fmt.Sprint(n.Time)
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return n.Time
+			}, grpcAddrErrTag, timeErrTag)
+		},
+		raftLeaderHeader: func(n *NodeInfo) string {
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return n.RaftLeader
+			}, statusErrTag)
+		},
+		raftTermHeader: func(n *NodeInfo) string {
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return n.RaftTerm
+			}, statusErrTag)
+		},
+		appliedIndexHeader: func(n *NodeInfo) string {
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return n.AppliedIndex
+			}, statusErrTag)
+		},
+		committedIndexHeader: func(n *NodeInfo) string {
+			return filterErrorsAndPrintField(n, func(n *NodeInfo) interface{} {
+				return n.CommittedIndex
+			}, statusErrTag)
 		},
 	}
 
@@ -186,6 +211,10 @@ func prettyPrintStatus(
 			timeCapHeader,
 			deltaHeader,
 			timeHeader,
+			raftLeaderHeader,
+			raftTermHeader,
+			appliedIndexHeader,
+			committedIndexHeader,
 		}
 	} else {
 		fields = []string{

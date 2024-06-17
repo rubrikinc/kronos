@@ -27,6 +27,7 @@ const (
 	manageOracleTickInterval      = time.Second
 	validationThreshold           = 50 * time.Millisecond
 	testTimeout                   = 5 * time.Minute
+	defaultOracleTimeCapDelta     = time.Minute
 )
 
 func TestKronosSanity(t *testing.T) {
@@ -755,4 +756,110 @@ func TestFirstSeedDoesntFormNewCluster(t *testing.T) {
 	}
 	RemoveAndAdd(0)
 	RemoveAndAdd(1)
+}
+
+func TestCheckQuorum(t *testing.T) {
+
+	/*
+			4 nodes kronos cluster
+			Raft leader (say n1) is partitioned from all nodes except one (say n2) and nodes n3, n4 are stopped for a while.
+			After some time, n3, n4 are started. (meanwhile n1, n2 raft log would have progressed)
+			n1 should not be able to make progress as it doesn't have quorum.
+			One of n2, n3, n4 should be able to make progress as they have quorum.
+			But n2 doesn't contest for leadership as it is receiving AppendEntries from n1.
+			Without CheckQuorum, n1 will not step down as leader which prevents n2 from voting n3 or n4 as leader due to high index
+		    https://decentralizedthoughts.github.io/2020-12-12-raft-liveness-full-omission/
+	*/
+
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 4
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			RaftSnapCount:            2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+
+	time.Sleep(bootstrapTime)
+
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
+
+	// find the raft leader
+	data, err := tc.Status(0, false /*local*/)
+	a.NoError(err)
+	nodeInfos := nodeInfosFromBytes(data, a)
+	leader := -1
+	for _, nodeInfo := range nodeInfos {
+		if nodeInfo.RaftLeader {
+			leader = findNodeWithRaftId(t, tc, nodeInfo.ID)
+		}
+	}
+	oracle, err := tc.OracleForNode(ctx, leader)
+	a.NoError(err)
+	log.Infof(ctx, "leader: %d, oracle: %d", leader, oracle)
+
+	skippedNode := -1
+	// partition the leader from all except one node
+	stoppedNodes := make([]int, 0)
+	for i := 0; i < numNodes; i++ {
+		if i != leader && skippedNode != -1 {
+			tc.Disconnect(leader, i)
+			a.NoError(tc.RunOperation(ctx, cluster.Stop, i))
+			stoppedNodes = append(stoppedNodes, i)
+		} else if i != leader {
+			skippedNode = i
+		}
+	}
+
+	// Wait for sometime for the raft log of leader to progress
+	time.Sleep(3 * manageOracleTickInterval)
+	for _, stoppedNode := range stoppedNodes {
+		a.NoError(tc.RunOperation(ctx, cluster.Start, stoppedNode))
+	}
+	// wait for the restarted nodes to catchup on the raft log
+	time.Sleep(bootstrapTime)
+	// restart skipped node to make sure it is not the leader
+	a.NoError(tc.RunOperation(ctx, cluster.Restart, skippedNode))
+	time.Sleep(defaultOracleTimeCapDelta + manageOracleTickInterval) // wait till timecap expires and one of nodes 3, 4 becomes oracle
+	for i := 0; i < numNodes; i++ {
+		if i != leader {
+			_, err := tc.Time(ctx, i)
+			a.NoError(err)
+		} else {
+			_, err := tc.Time(ctx, i)
+			a.Error(err)
+		}
+	}
+
+	for i := 0; i < numNodes; i++ {
+		if leader != i && i != skippedNode {
+			tc.Connect(leader, i)
+		}
+	}
+
+	time.Sleep(2 * manageOracleTickInterval)
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
+}
+
+func findNodeWithRaftId(t *testing.T, tc *cluster.TestCluster, id string) int {
+	for idx, _ := range tc.Nodes {
+		raftId, _ := tc.NodeID(idx)
+		if raftId == id {
+			return idx
+		}
+	}
+	t.Fatalf("node with id %v not found", id)
+	return -1
 }

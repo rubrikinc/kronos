@@ -40,7 +40,7 @@ func (k *Server) Bootstrap(ctx context.Context, req *kronospb.BootstrapRequest) 
 		log.Infof(ctx,
 			"Waiting for expected number of nodes to join the cluster, "+
 				"current : %v, expected : %v", count, req.ExpectedNodeCount)
-		if count >= (req.ExpectedNodeCount+1)/2 {
+		if count >= req.ExpectedNodeCount/2+1 {
 			bootstrappedNodeCount = count
 			return nil
 		}

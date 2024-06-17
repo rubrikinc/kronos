@@ -157,14 +157,12 @@ func (g *Server) addPeerLocked(ctx context.Context,
 	if nodeId == g.nodeID {
 		return
 	}
-	log.Infof(ctx, "Adding peer %s : %s", nodeId, grpcAddr)
 	g.peers.add(grpcAddr)
 	if oldDesc, ok := g.nodeList[nodeId]; ok {
 		if oldDesc.GrpcAddr != grpcAddr {
 			g.removePeerLocked(ctx, oldDesc.GrpcAddr)
 		}
 	}
-	log.Infof(ctx, "Adding node %s : %+v to nodeList", nodeId, *desc)
 	g.nodeList[nodeId] = desc
 	// TODO: Persist the new peer to disk.
 }
@@ -451,6 +449,7 @@ func NodeDescriptor(ctx context.Context, g *Server, stopCh chan struct{}) {
 			LastHeartbeat:  time.Now().UnixNano(),
 			ClusterId:      g.clusterID,
 		}
+		g.nodeList[g.nodeID] = desc
 		descBytes, err := protoutil.Marshal(desc)
 		if err != nil {
 			log.Errorf(ctx,

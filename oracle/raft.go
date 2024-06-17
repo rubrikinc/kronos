@@ -1007,6 +1007,7 @@ func (rc *raftNode) startRaft(
 		ElectionTick:    15,
 		HeartbeatTick:   5,
 		PreVote:         true,
+		CheckQuorum:     true,
 		Storage:         rc.raftStorage,
 		MaxSizePerMsg:   16 * 1024,
 		MaxInflightMsgs: 64,
@@ -1339,7 +1340,7 @@ func (rc *raftNode) serveRaft(
 	// Add clusterOpsHandler which can be used to do cluster Operations.
 	handler.Handle(
 		fmt.Sprintf("/%s/", kronoshttp.ClusterPath),
-		kronoshttp.NewClusterHandler(confChangeC, rc.datadir, grpcAddr),
+		kronoshttp.NewClusterHandler(confChangeC, rc.datadir, grpcAddr, rc.node),
 	)
 
 	httpServer := &http.Server{Handler: handler}

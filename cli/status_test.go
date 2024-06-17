@@ -41,8 +41,8 @@ func TestPrettyPrintStatus(t *testing.T) {
 			},
 			allFields:     true,
 			inErrorStream: "localhost:5766 Error: Couldn't fetch kronos grpc-addr due to err: timeout\n",
-			inOutputStream: `Raft ID  Raft Address    GRPC Address  Server Status  Oracle Address  Oracle Id  Time Cap  Delta  Time
-1        localhost:5766  N/A           N/A            N/A             N/A        N/A       N/A    N/A
+			inOutputStream: `Raft ID  Raft Address    GRPC Address  Server Status  Oracle Address  Oracle Id  Time Cap  Delta  Time  Raft Leader  Raft Term  Applied Index  Committed Index
+1        localhost:5766  N/A           N/A            N/A             N/A        N/A       N/A    N/A   false        0          0              0
 `,
 		},
 		{
@@ -77,8 +77,8 @@ func TestPrettyPrintStatus(t *testing.T) {
 				},
 			},
 			allFields: true,
-			inOutputStream: `Raft ID  Raft Address    GRPC Address    Server Status  Oracle Address  Oracle Id  Time Cap             Delta  Time
-1        localhost:5766  localhost:5767  INITIALIZED    localhost:5766  43         1534084077586595055  0s     1534084075586595055
+			inOutputStream: `Raft ID  Raft Address    GRPC Address    Server Status  Oracle Address  Oracle Id  Time Cap             Delta  Time                 Raft Leader  Raft Term  Applied Index  Committed Index
+1        localhost:5766  localhost:5767  INITIALIZED    localhost:5766  43         1534084077586595055  0s     1534084075586595055  false        0          0              0
 `,
 		},
 		{
@@ -115,8 +115,8 @@ func TestPrettyPrintStatus(t *testing.T) {
 			},
 			allFields:     true,
 			inErrorStream: "localhost:5766 Error: Couldn't fetch kronos status due to err: timeout\n",
-			inOutputStream: `Raft ID  Raft Address    GRPC Address    Server Status  Oracle Address  Oracle Id  Time Cap  Delta  Time
-1        localhost:5766  localhost:5767  N/A            N/A             N/A        N/A       N/A    1534084075586595055
+			inOutputStream: `Raft ID  Raft Address    GRPC Address    Server Status  Oracle Address  Oracle Id  Time Cap  Delta  Time                 Raft Leader  Raft Term  Applied Index  Committed Index
+1        localhost:5766  localhost:5767  N/A            N/A             N/A        N/A       N/A    1534084075586595055  N/A          N/A        N/A            N/A
 `,
 		},
 		{
@@ -154,8 +154,8 @@ func TestPrettyPrintStatus(t *testing.T) {
 			},
 			allFields:     true,
 			inErrorStream: "localhost:5766 Error: Couldn't fetch kronos time due to err: timeout\n",
-			inOutputStream: `Raft ID  Raft Address    GRPC Address    Server Status  Oracle Address  Oracle Id  Time Cap             Delta  Time
-1        localhost:5766  localhost:5767  INITIALIZED    localhost:5766  43         1534084077586595055  0s     N/A
+			inOutputStream: `Raft ID  Raft Address    GRPC Address    Server Status  Oracle Address  Oracle Id  Time Cap             Delta  Time  Raft Leader  Raft Term  Applied Index  Committed Index
+1        localhost:5766  localhost:5767  INITIALIZED    localhost:5766  43         1534084077586595055  0s     N/A   false        0          0              0
 `,
 		},
 		{
@@ -194,8 +194,8 @@ func TestPrettyPrintStatus(t *testing.T) {
 			inErrorStream: `localhost:5766 Error: Couldn't fetch kronos status due to err: timeout
 localhost:5766 Error: Couldn't fetch kronos time due to err: timeout
 `,
-			inOutputStream: `Raft ID  Raft Address    GRPC Address    Server Status  Oracle Address  Oracle Id  Time Cap  Delta  Time
-1        localhost:5766  localhost:5767  N/A            N/A             N/A        N/A       N/A    N/A
+			inOutputStream: `Raft ID  Raft Address    GRPC Address    Server Status  Oracle Address  Oracle Id  Time Cap  Delta  Time  Raft Leader  Raft Term  Applied Index  Committed Index
+1        localhost:5766  localhost:5767  N/A            N/A             N/A        N/A       N/A    N/A   N/A          N/A        N/A            N/A
 `,
 		},
 		{
@@ -246,9 +246,9 @@ localhost:5766 Error: Couldn't fetch kronos time due to err: timeout
 				},
 			},
 			allFields: true,
-			inOutputStream: `Raft ID  Raft Address     GRPC Address     Server Status  Oracle Address  Oracle Id  Time Cap             Delta  Time
-1        localhost:5766   localhost:5767   INITIALIZED    localhost:5766  43         1534084077586595055  0s     1534084075586595055
-2        remotehost:5766  remotehost:5767  INITIALIZED    localhost:5766  43         1534084077586595055  0s     1534084075586595055
+			inOutputStream: `Raft ID  Raft Address     GRPC Address     Server Status  Oracle Address  Oracle Id  Time Cap             Delta  Time                 Raft Leader  Raft Term  Applied Index  Committed Index
+1        localhost:5766   localhost:5767   INITIALIZED    localhost:5766  43         1534084077586595055  0s     1534084075586595055  false        0          0              0
+2        remotehost:5766  remotehost:5767  INITIALIZED    localhost:5766  43         1534084077586595055  0s     1534084075586595055  false        0          0              0
 `,
 		},
 		{

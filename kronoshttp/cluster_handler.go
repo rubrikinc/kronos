@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go.etcd.io/etcd/raft/v3"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -33,6 +34,8 @@ const (
 	// requestTypeGRPCAddr is the suffix for HTTP endpoint to get the grpc address
 	// of the node.
 	requestTypeGRPCAddr = "grpc_addr"
+	// requestTypeRaftStatus returns the raft status of nodes.
+	requestTypeRaftStatus = "raft_status"
 )
 
 // Node is used to store the metadata for every node that we send in response to
@@ -44,6 +47,13 @@ type Node struct {
 
 type ClusterID struct {
 	ClusterID uint64 `json:"cluster_id"`
+}
+
+type RaftStatusResp struct {
+	RaftLeader     bool   `json:"raft_leader"`
+	RaftTerm       uint64 `json:"raft_term"`
+	AppliedIndex   uint64 `json:"applied_index"`
+	CommittedIndex uint64 `json:"committed_index"`
 }
 
 // AddNodeRequest is used by a new node to send the data required to add
@@ -101,12 +111,14 @@ type ClusterHandler struct {
 	confChangeTotalTimeout time.Duration
 	// grpcAddr is the grpc address of this node
 	grpcAddr *kronospb.NodeAddr
+	// confState is the current configuration state of the node.
+	raftNode raft.Node
 }
 
 // NewClusterHandler returns a cluster handler which handles cluster requests
 // and sends the corresponding confChanges to confChangeC.
 func NewClusterHandler(
-	confChangeC chan<- raftpb.ConfChange, dataDir string, grpcAddr *kronospb.NodeAddr,
+	confChangeC chan<- raftpb.ConfChange, dataDir string, grpcAddr *kronospb.NodeAddr, raftNode raft.Node,
 ) *ClusterHandler {
 	// DefaultConfChangeTotalTimeout represents the total time for which we retry the
 	// confChange.
@@ -116,6 +128,7 @@ func NewClusterHandler(
 		dataDir:                dataDir,
 		confChangeTotalTimeout: DefaultConfChangeTotalTimeout,
 		grpcAddr:               grpcAddr,
+		raftNode:               raftNode,
 	}
 }
 func ForDuration(duration time.Duration, fn func() error) error {
@@ -383,6 +396,26 @@ func (h *ClusterHandler) handleGRPCAddr(
 	return http.StatusOK, nil
 }
 
+func (h *ClusterHandler) handleRaftStatus(ctx context.Context, w http.ResponseWriter, r *http.Request) (int, error) {
+	const handler = "clusterHandler-handleRaftStatus"
+	status := h.raftNode.Status()
+
+	respStatus := RaftStatusResp{
+		RaftLeader:     status.RaftState == raft.StateLeader,
+		RaftTerm:       status.Term,
+		AppliedIndex:   status.Applied,
+		CommittedIndex: status.Commit,
+	}
+	respJson, err := json.Marshal(respStatus)
+	if err != nil {
+		return http.StatusInternalServerError, httpError{error: err, handler: handler, request: r, event: "marshal-confstate"}
+	}
+	if _, err := w.Write(respJson); err != nil {
+		return http.StatusInternalServerError, httpError{error: err, handler: handler, request: r, event: "write-response"}
+	}
+	return http.StatusOK, nil
+}
+
 // ServeHTTP serves HTTP requests using ClusterHandler
 func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := context.TODO()
@@ -426,6 +459,13 @@ func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case requestTypeGRPCAddr:
 			status, err := h.handleGRPCAddr(ctx, w, r)
+			if err != nil {
+				log.Error(ctx, err)
+				http.Error(w, err.Error(), status)
+				return
+			}
+		case requestTypeRaftStatus:
+			status, err := h.handleRaftStatus(ctx, w, r)
 			if err != nil {
 				log.Error(ctx, err)
 				http.Error(w, err.Error(), status)
