@@ -78,6 +78,10 @@ type Server struct {
 	Metrics *kronosstats.KronosMetrics
 	// Gossip Server
 	GossipServer *gossip.Server
+	// TimeCap is the upper bound of KronosTime
+	TimeCap atomic.Int64
+	// UptimeCap is the upper bound of KronosUptime
+	UptimeCap atomic.Int64
 
 	mu struct {
 		syncutil.RWMutex
@@ -118,6 +122,7 @@ type Server struct {
 	bootstrapReqCh                             chan kronospb.BootstrapRequest
 	syncedWithOracleAtleastOnce                atomic.Bool
 	haveWaitedLongEnoughForOracleToStopServing atomic.Bool
+	TestMode                                   bool
 }
 
 var _ kronospb.TimeServiceServer = &Server{}
@@ -186,15 +191,21 @@ func (k *Server) KronosUptime(
 
 	k.mu.Lock()
 	defer k.mu.Unlock()
+
+	if k.isOracle(oracleData) {
+		k.TimeCap.Store(oracleData.TimeCap)
+		k.UptimeCap.Store(oracleData.KronosUptimeCap)
+	}
+
 	t := k.upTime()
 	currentStatus := k.ServerStatus()
 	initialized := currentStatus == kronospb.ServerStatus_INITIALIZED
 	var errorMsg string
 	if !initialized {
 		errorMsg = "kronos server not yet initialized"
-	} else if oracleData.KronosUptimeCap == 0 {
+	} else if k.UptimeCap.Load() == 0 {
 		errorMsg = "kronos up time cap not yet initialized"
-	} else if oracleData.KronosUptimeCap <= t {
+	} else if k.UptimeCap.Load() <= t {
 		errorMsg = "kronos up time is beyond current time cap, time cap is too stale"
 	}
 	if errorMsg != "" {
@@ -221,15 +232,25 @@ func (k *Server) KronosTimeNow(ctx context.Context) (*kronospb.KronosTimeRespons
 
 	k.mu.Lock()
 	defer k.mu.Unlock()
+
+	if k.isOracle(oracleData) {
+		k.TimeCap.Store(oracleData.TimeCap)
+		k.UptimeCap.Store(oracleData.KronosUptimeCap)
+	}
+
+	// We can't directly use oracleData.TimeCap as the time cap because the node
+	// might not have synced with the oracle yet. This can happen in cases where oracle is unreachable
+	// but raft leader is reachable. We use the time cap from the last sync with the oracle.
+
 	t := k.adjustedTime()
 	currentStatus := k.ServerStatus()
 	initialized := currentStatus == kronospb.ServerStatus_INITIALIZED
 	var errorMsg string
 	if !initialized {
 		errorMsg = "kronos server not yet initialized"
-	} else if oracleData.TimeCap == 0 {
+	} else if k.TimeCap.Load() == 0 {
 		errorMsg = "kronos time cap not yet initialized"
-	} else if oracleData.TimeCap <= t {
+	} else if k.TimeCap.Load() <= t {
 		errorMsg = "kronos time is beyond current time cap, time cap is too stale"
 	}
 	if errorMsg != "" {
@@ -284,6 +305,8 @@ func (k *Server) syncOrOverthrowOracle(
 ) (synced bool) {
 	err := k.trySyncWithOracle(ctx, oracleState.Oracle)
 	if err == nil {
+		k.TimeCap.Store(oracleState.TimeCap)
+		k.UptimeCap.Store(oracleState.KronosUptimeCap)
 		k.syncedWithOracleAtleastOnce.Store(true)
 		k.Metrics.SyncSuccessCount.Inc(1)
 	} else {
@@ -511,6 +534,8 @@ func (k *Server) initialize(ctx context.Context, tickCh <-chan time.Time, tickCa
 					time.Duration(k.OracleUptimeDelta.Load()),
 				)
 				k.proposeSelf(ctx, oracleState)
+				k.TimeCap.Store(oracleState.TimeCap)
+				k.UptimeCap.Store(oracleState.KronosUptimeCap)
 				// This server is the oracle. It is now initialized.
 				k.status.Store(kronospb.ServerStatus_INITIALIZED)
 
@@ -581,6 +606,8 @@ func (k *Server) ManageOracle(tickCh <-chan time.Time, tickCallback func()) {
 						time.Duration(k.OracleUptimeDelta.Load()),
 					)
 				}
+				k.TimeCap.Store(oracleState.TimeCap)
+				k.UptimeCap.Store(oracleState.KronosUptimeCap)
 				k.proposeSelf(ctx, oracleState)
 
 			default:
@@ -794,6 +821,8 @@ type Config struct {
 	Clock tm.Clock
 	// Metrics
 	Metrics *kronosstats.KronosMetrics
+	// TestMode is used to indicate that the server is being run in a test
+	TestMode bool
 }
 
 // NewKronosServer returns an instance of Server based on given
@@ -805,7 +834,7 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 		config.GossipSeedHosts, config.CertsDir)
 
 	oracleSM, bootstrapReqCh := oracle.NewRaftStateMachine(ctx,
-		config.RaftConfig, g)
+		config.RaftConfig, g, config.TestMode)
 	if config.Metrics == nil {
 		config.Metrics = kronosstats.NewTestMetrics()
 	}
@@ -826,7 +855,31 @@ func NewKronosServer(ctx context.Context, config Config) (*Server, error) {
 		GossipServer:             g,
 		bootstrapReqCh:           bootstrapReqCh,
 		listenHost:               config.ListenHost,
+		TestMode:                 config.TestMode,
 	}
 
+	oracle.AddProposalFilter(s.proposalFilter)
+
 	return s, nil
+}
+
+func (k *Server) proposalFilter(
+	ctx context.Context, proposalBytes interface{},
+) error {
+	proposal, err := kronosutil.OracleProposalFromBytes(proposalBytes.([]byte))
+	if err != nil {
+		return nil
+	}
+	curOracle := k.OracleSM.State(ctx)
+	if curOracle.Oracle == nil {
+		return nil
+	}
+	if proto.Equal(proposal.ProposedState.Oracle, curOracle.Oracle) {
+		return nil
+	}
+	if !k.shouldOverthrowOracle(ctx) {
+		return errors.Errorf("cannot accept proposal from non-oracle %v since oracle %v is active", proposal.ProposedState.Oracle, k.OracleSM.State(ctx).Oracle)
+	}
+	log.Infof(ctx, "Accepting proposal from non-oracle %v since current oracle %v is down", proposal.ProposedState.Oracle, k.OracleSM.State(ctx).Oracle)
+	return nil
 }

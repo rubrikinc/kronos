@@ -79,6 +79,7 @@ func NewRaftStateMachine(
 	ctx context.Context,
 	rc *RaftConfig,
 	g *gossip.Server,
+	testMode bool,
 ) (StateMachine, chan kronospb.BootstrapRequest) {
 	var raftStateMachine *RaftStateMachine
 	proposeC := make(chan string)
@@ -86,7 +87,7 @@ func NewRaftStateMachine(
 	nodeID := metadata.FetchOrAssignNodeID(ctx, rc.DataDir).String()
 	nodeInfo := newRaftNode(rc,
 		getSnapshot,
-		proposeC, nodeID, g)
+		proposeC, nodeID, g, testMode)
 
 	raftStateMachine = &RaftStateMachine{
 		proposeC:     proposeC,

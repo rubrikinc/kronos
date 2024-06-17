@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"google.golang.org/grpc/connectivity"
 	"net"
 	"time"
 
@@ -32,7 +33,7 @@ var _ Client = &grpcClient{}
 
 // connect connects to the given server if not already connected
 func (c *grpcClient) connect(ctx context.Context, server *kronospb.NodeAddr) error {
-	if c.conn == nil || !proto.Equal(c.server, server) {
+	if c.conn == nil || !proto.Equal(c.server, server) || c.conn.GetState() == connectivity.Shutdown || c.conn.GetState() == connectivity.TransientFailure {
 		if c.conn != nil {
 			if err := c.conn.Close(); err != nil {
 				log.Error(ctx, err)
@@ -87,7 +88,7 @@ func (c *grpcClient) OracleTime(
 		// time.Since uses monotonic time and is immune to clock jumps
 		timeResponse.Rtt = int64(time.Since(startTime))
 	}
-	return timeResponse, err
+	return timeResponse, errors.Wrapf(err, "conn state - %v", c.conn.GetState())
 }
 
 // KronosTime implements the Client interface.
@@ -107,7 +108,7 @@ func (c *grpcClient) KronosTime(
 	if timeResponse != nil {
 		timeResponse.Rtt = int64(time.Since(startTime))
 	}
-	return timeResponse, err
+	return timeResponse, errors.Wrapf(err, "conn state - %v", c.conn.GetState())
 }
 
 // KronosUptime implements the Client interface.
@@ -127,7 +128,7 @@ func (c *grpcClient) KronosUptime(
 	if timeResponse != nil {
 		timeResponse.Rtt = int64(time.Since(startUptime))
 	}
-	return timeResponse, err
+	return timeResponse, errors.Wrapf(err, "conn state - %v", c.conn.GetState())
 }
 
 // Status implements the Client interface.

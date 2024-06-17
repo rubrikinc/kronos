@@ -6,7 +6,7 @@ require (
 	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f
 	github.com/gogo/protobuf v1.3.2
 	github.com/pkg/errors v0.9.1
-	github.com/rubrikinc/failure-test-utils v0.0.0-20240509175610-a4013588db1c
+	github.com/rubrikinc/failure-test-utils v0.0.0-20240617184314-d8206e413175
 	github.com/spf13/afero v1.1.2
 	github.com/spf13/cobra v1.1.1
 	github.com/stretchr/testify v1.8.4

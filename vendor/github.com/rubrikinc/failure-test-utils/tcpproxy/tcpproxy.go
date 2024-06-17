@@ -20,7 +20,9 @@ type TCPProxy interface {
 	Stop()
 	Stats() ProxyStats
 	BlockIncomingConns()
+	BlockAllTraffic()
 	UnblockIncomingConns()
+	UnblockAllTraffic()
 	BackendHostPort() string
 	FrontendHostPort() string
 }
@@ -128,11 +130,29 @@ func (t *testTCPProxy) BlockIncomingConns() {
 	}
 }
 
+// BlockAllTraffic blocks all traffic in both directions
+func (t *testTCPProxy) BlockAllTraffic() {
+	t.acceptFg.SetFailureProbability(1.0)
+	t.recvFg.SetFailureProbability(1.0)
+	if log.V(3) {
+		log.Infof(t.ctx, "Going to drop all traffic")
+	}
+}
+
 // UnblockIncomingConns unblocks all new incoming connections to the TCP proxy
 func (t *testTCPProxy) UnblockIncomingConns() {
 	t.acceptFg.SetFailureProbability(0.0)
 	if log.V(3) {
 		log.Infof(t.ctx, "Unblocking new connections from client")
+	}
+}
+
+// UnblockAllTraffic unblocks all traffic in both directions
+func (t *testTCPProxy) UnblockAllTraffic() {
+	t.acceptFg.SetFailureProbability(0.0)
+	t.recvFg.SetFailureProbability(0.0)
+	if log.V(3) {
+		log.Infof(t.ctx, "Unblocking all traffic")
 	}
 }
 

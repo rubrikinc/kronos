@@ -3,6 +3,11 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"github.com/rubrikinc/kronos/cli"
+	"github.com/stretchr/testify/assert"
+	"testing"
+
 	"fmt"
 	"math"
 	"net"
@@ -105,6 +110,7 @@ func (t *testNode) kronosStartCmd(
 	manageOracleTickInterval time.Duration,
 	certsDir string,
 	raftSnapCount uint64,
+	leaderNotOracle bool,
 ) string {
 	kronosCmd := []string{
 		"KRONOS_NODE_ID=" + t.id,
@@ -124,10 +130,15 @@ func (t *testNode) kronosStartCmd(
 		"--seed-hosts", strings.Join(seedHosts, ","),
 		"--manage-oracle-tick-interval", manageOracleTickInterval.String(),
 		"--raft-snap-count", fmt.Sprint(raftSnapCount),
+		"--test-mode", fmt.Sprint(true),
 	}
 
 	if len(certsDir) > 0 {
 		kronosCmd = append(kronosCmd, "--certs-dir", certsDir)
+	}
+
+	if leaderNotOracle {
+		kronosCmd = append([]string{"LEADER_NOT_ORACLE=true"}, kronosCmd...)
 	}
 
 	return strings.Join(kronosCmd, " ")
@@ -173,6 +184,7 @@ type TestCluster struct {
 	CertsDir                 string
 	RaftSnapCount            uint64
 	ErrCh                    chan error
+	LeaderNotOracle          bool
 	fs                       afero.Fs
 	kronosBinary             string
 	procfile                 string
@@ -637,6 +649,7 @@ func (tc *TestCluster) generateProcfile(ctx context.Context) error {
 					tc.ManageOracleTickInterval,
 					tc.CertsDir,
 					tc.RaftSnapCount,
+					tc.LeaderNotOracle,
 				),
 				filepath.Join(tc.Nodes[i].logDir, "kronos-stderr.log"),
 				filepath.Join(tc.Nodes[i].logDir, "kronos-stdout.log"),
@@ -704,6 +717,7 @@ type ClusterConfig struct {
 	NumNodes                 int
 	ManageOracleTickInterval time.Duration
 	RaftSnapCount            uint64
+	LeaderNotOracle          bool
 }
 
 // NewInsecureCluster returns an instance of a test kronos cluster. It returns
@@ -814,6 +828,7 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 		procfile:                 filepath.Join(testDir, procfile),
 		RaftSnapCount:            cc.RaftSnapCount,
 		testDir:                  testDir,
+		LeaderNotOracle:          cc.LeaderNotOracle,
 	}
 	log.Infof(ctx, "Procfile: %v", tc.procfile)
 
@@ -1004,15 +1019,55 @@ func (tc *TestCluster) ExchangeDataDir(ctx context.Context, id1 int,
 }
 
 func (tc *TestCluster) Disconnect(oracle int, i int) {
-	tc.raftProxy[oracle][i].BlockIncomingConns()
-	tc.grpcProxy[oracle][i].BlockIncomingConns()
-	tc.raftProxy[i][oracle].BlockIncomingConns()
-	tc.grpcProxy[i][oracle].BlockIncomingConns()
+	tc.raftProxy[oracle][i].BlockAllTraffic()
+	tc.grpcProxy[oracle][i].BlockAllTraffic()
+	tc.raftProxy[i][oracle].BlockAllTraffic()
+	tc.grpcProxy[i][oracle].BlockAllTraffic()
 }
 
 func (tc *TestCluster) Connect(oracle int, i int) {
-	tc.raftProxy[oracle][i].UnblockIncomingConns()
-	tc.grpcProxy[oracle][i].UnblockIncomingConns()
-	tc.raftProxy[i][oracle].UnblockIncomingConns()
-	tc.grpcProxy[i][oracle].UnblockIncomingConns()
+	tc.raftProxy[oracle][i].UnblockAllTraffic()
+	tc.grpcProxy[oracle][i].UnblockAllTraffic()
+	tc.raftProxy[i][oracle].UnblockAllTraffic()
+	tc.grpcProxy[i][oracle].UnblockAllTraffic()
+}
+
+func (tc *TestCluster) ProcessNodePairs(filter func(int, int) bool, effect func(int, int)) {
+	for i := 0; i < len(tc.Nodes); i++ {
+		for j := i + 1; j < len(tc.Nodes); j++ {
+			if filter(i, j) {
+				effect(i, j)
+			}
+		}
+	}
+}
+
+func (tc *TestCluster) findNodeWithRaftId(t *testing.T, id string) int {
+	for idx := range tc.Nodes {
+		raftId, err := tc.NodeID(idx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if raftId == id {
+			return idx
+		}
+	}
+	t.Fatalf("node with id %v not found", id)
+	return -1
+}
+
+func (tc *TestCluster) FindLeader(t *testing.T, a *assert.Assertions) int {
+	data, err := tc.Status(0, false /*local*/)
+	a.NoError(err)
+	var nodeInfos []cli.NodeInfo
+	err = json.Unmarshal(data, &nodeInfos)
+	a.NoError(err)
+	leader := -1
+	for _, nodeInfo := range nodeInfos {
+		if nodeInfo.RaftLeader {
+			leader = tc.findNodeWithRaftId(t, nodeInfo.ID)
+		}
+	}
+	a.NotEqual(-1, leader)
+	return leader
 }

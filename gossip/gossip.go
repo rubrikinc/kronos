@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"google.golang.org/grpc/connectivity"
 	"sync"
 	"time"
 
@@ -253,7 +254,11 @@ func (g *Server) gossip(ctx context.Context) {
 			var conn *grpc.ClientConn
 			if _, ok := g.connMap[peer]; ok {
 				conn = g.connMap[peer]
-			} else {
+			}
+			if conn == nil || conn.GetState() == connectivity.Shutdown || conn.GetState() == connectivity.TransientFailure {
+				if conn != nil {
+					conn.Close()
+				}
 				var dialOpts grpc.DialOption
 				if g.certsDir == "" {
 					dialOpts = grpc.WithInsecure()
@@ -440,6 +445,7 @@ func NodeDescriptor(ctx context.Context, g *Server, stopCh chan struct{}) {
 	f := func() {
 		secure := g.certsDir != ""
 		url := kronosutil.AddrToURL(g.raftAddr, secure)
+		g.mu.Lock()
 		desc := &kronospb.NodeDescriptor{
 			NodeId:         g.nodeID,
 			RaftAddr:       url.String(),
@@ -450,6 +456,7 @@ func NodeDescriptor(ctx context.Context, g *Server, stopCh chan struct{}) {
 			ClusterId:      g.clusterID,
 		}
 		g.nodeList[g.nodeID] = desc
+		g.mu.Unlock()
 		descBytes, err := protoutil.Marshal(desc)
 		if err != nil {
 			log.Errorf(ctx,

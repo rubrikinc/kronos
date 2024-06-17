@@ -77,10 +77,24 @@ const (
 	clusterRequestTimeout = 10 * time.Second
 )
 
+type proposalFilter func(ctx context.Context, proposal interface{}) error
+
+var propFilters struct {
+	filters []proposalFilter
+	mu      sync.RWMutex
+}
+
 func init() {
 	// Override the default wal SegmentSizeBytes
 	wal.SegmentSizeBytes = walSegmentSizeBytes
 	capnslog.SetFormatter(&logFormatter{})
+	propFilters.filters = make([]proposalFilter, 0)
+}
+
+func AddProposalFilter(f proposalFilter) {
+	propFilters.mu.Lock()
+	defer propFilters.mu.Unlock()
+	propFilters.filters = append(propFilters.filters, f)
 }
 
 // logFormatter is used to convert capnslog log format to kronos log format.
@@ -223,6 +237,7 @@ type raftNode struct {
 		sync.Mutex
 		isBootstrapped bool
 	}
+	testMode bool
 }
 
 // getNodesIncludingRemoved gets nodes in the cluster metadata from
@@ -396,6 +411,7 @@ type RaftNodeInfo struct {
 func newRaftNode(
 	rc *RaftConfig, getSnapshot func() ([]byte, error),
 	proposeC <-chan string, nodeID string, g *gossip.Server,
+	testMode bool,
 ) *RaftNodeInfo {
 	ctx := context.Background()
 	seedHosts, err := convertToNodeAddrs(rc.SeedHosts)
@@ -428,6 +444,7 @@ func newRaftNode(
 		gossip:            g,
 		bootstrapReqC:     make(chan kronospb.BootstrapRequest),
 		listenHost:        rc.ListenHost,
+		testMode:          testMode,
 		// rest of structure populated after WAL replay
 	}
 	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort)
@@ -1239,9 +1256,20 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 				if !ok {
 					rc.proposeC = nil
 				} else {
-					// blocks until accepted by raft state machine
-					if err := rc.node.Propose(context.TODO(), []byte(prop)); err != nil {
-						log.Error(ctx, err)
+					if kronosutil.IsOracleProposal([]byte(prop)) {
+						if rc.isNodeEligibleForOracle() {
+							err := rc.node.Propose(ctx, []byte(prop))
+							if err != nil {
+								log.Error(ctx, err)
+							}
+						} else {
+							log.Infof(ctx, "Node is not eligible for oracle, skipping proposal")
+						}
+					} else {
+						err := rc.node.Propose(ctx, []byte(prop))
+						if err != nil {
+							log.Error(ctx, err)
+						}
 					}
 				}
 
@@ -1368,9 +1396,39 @@ func (rc *raftNode) serveRaft(
 	close(rc.httpdonec)
 }
 
-// Process processes the given raft message
+func filterProposal(ctx context.Context, data []byte) error {
+	propFilters.mu.RLock()
+	defer propFilters.mu.RUnlock()
+	for _, filter := range propFilters.filters {
+		if err := filter(ctx, data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Process processes the given raft message coming from raft transport
 func (rc *raftNode) Process(ctx context.Context, m raftpb.Message) error {
-	return rc.node.Step(ctx, m)
+	status := rc.node.Status()
+	if status.RaftState == raft.StateLeader && m.Type == raftpb.MsgProp {
+		newEntries := make([]raftpb.Entry, 0, len(m.Entries))
+		for i := range m.Entries {
+			err := filterProposal(ctx, m.Entries[i].Data)
+			if err == nil {
+				newEntries = append(newEntries, m.Entries[i])
+			} else {
+				log.Infof(ctx, "Dropping proposal, error: %v", err)
+			}
+		}
+		m.Entries = newEntries
+		if len(newEntries) > 0 {
+			return rc.node.Step(ctx, m)
+		} else {
+			return nil
+		}
+	} else {
+		return rc.node.Step(ctx, m)
+	}
 }
 
 // IsIDRemoved returns whether the given raft node ID has been removed from this
@@ -1407,4 +1465,15 @@ func (rc *raftNode) sanitizeOutgoingMessages(ms []raftpb.Message) []raftpb.Messa
 		}
 	}
 	return ms
+}
+
+func (rc *raftNode) isNodeEligibleForOracle() bool {
+	if !rc.testMode {
+		return true
+	}
+	if os.Getenv("LEADER_NOT_ORACLE") != "" {
+		return rc.node.Status().RaftState != raft.StateLeader && rc.node.Status().Lead != raft.None
+	} else {
+		return true
+	}
 }

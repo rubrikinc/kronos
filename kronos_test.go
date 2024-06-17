@@ -765,6 +765,7 @@ func TestMultiNodeExceedsTimeCap(t *testing.T) {
 	cluster.Tick(nodes[1])
 
 	for _, node := range nodes {
+		cluster.Tick(node)
 		_, err := node.Server.KronosTimeNow(ctx)
 		a.NoError(err)
 		_, err = node.Server.KronosUptimeNow(ctx)

@@ -6,6 +6,8 @@ package acceptance
 import (
 	"bytes"
 	"context"
+	"github.com/pkg/errors"
+	"math"
 	"math/rand"
 	"path/filepath"
 	"testing"
@@ -795,16 +797,7 @@ func TestCheckQuorum(t *testing.T) {
 	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
 	a.NoError(err)
 
-	// find the raft leader
-	data, err := tc.Status(0, false /*local*/)
-	a.NoError(err)
-	nodeInfos := nodeInfosFromBytes(data, a)
-	leader := -1
-	for _, nodeInfo := range nodeInfos {
-		if nodeInfo.RaftLeader {
-			leader = findNodeWithRaftId(t, tc, nodeInfo.ID)
-		}
-	}
+	leader := tc.FindLeader(t, a)
 	oracle, err := tc.OracleForNode(ctx, leader)
 	a.NoError(err)
 	log.Infof(ctx, "leader: %d, oracle: %d", leader, oracle)
@@ -832,15 +825,21 @@ func TestCheckQuorum(t *testing.T) {
 	// restart skipped node to make sure it is not the leader
 	a.NoError(tc.RunOperation(ctx, cluster.Restart, skippedNode))
 	time.Sleep(defaultOracleTimeCapDelta + manageOracleTickInterval) // wait till timecap expires and one of nodes 3, 4 becomes oracle
+	minTime, maxTime := int64(math.MaxInt64), int64(0)
+	count := 0
 	for i := 0; i < numNodes; i++ {
-		if i != leader {
-			_, err := tc.Time(ctx, i)
-			a.NoError(err)
-		} else {
-			_, err := tc.Time(ctx, i)
-			a.Error(err)
+		t, err := tc.Time(ctx, i)
+		if err == nil {
+			if t < minTime {
+				minTime = t
+			} else if t > maxTime {
+				maxTime = t
+			}
+			count++
 		}
 	}
+	a.True(count > 1 && count < numNodes)
+	a.True(maxTime-minTime < 50*time.Millisecond.Nanoseconds())
 
 	for i := 0; i < numNodes; i++ {
 		if leader != i && i != skippedNode {
@@ -853,13 +852,58 @@ func TestCheckQuorum(t *testing.T) {
 	a.NoError(err)
 }
 
-func findNodeWithRaftId(t *testing.T, tc *cluster.TestCluster, id string) int {
-	for idx, _ := range tc.Nodes {
-		raftId, _ := tc.NodeID(idx)
-		if raftId == id {
-			return idx
-		}
+func TestOracleChanges(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 4
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			RaftSnapCount:            2,
+			LeaderNotOracle:          true,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("node with id %v not found", id)
-	return -1
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+	time.Sleep(bootstrapTime * 2)
+
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
+
+	// find the raft leader
+	leader := tc.FindLeader(t, a)
+	oracle, err := tc.OracleForNode(ctx, leader)
+	a.NoError(err)
+	a.NotEqual(oracle, leader)
+	log.Infof(ctx, "leader: %d, oracle: %d", leader+1, oracle+1)
+	tc.ProcessNodePairs(func(i, j int) bool {
+		return i != leader && j != leader
+	}, tc.Disconnect)
+	time.Sleep(defaultOracleTimeCapDelta)
+	startTime := time.Now()
+	for time.Since(startTime) < time.Minute {
+		for i := 0; i < numNodes; i++ {
+			_, err := tc.Time(ctx, i)
+			if i == leader || i == oracle {
+				a.NoError(err)
+			} else {
+				a.Error(errors.Wrapf(err, "node %v", i))
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	tc.ProcessNodePairs(func(i, j int) bool {
+		return i != leader && j != leader
+	}, tc.Connect)
+	time.Sleep(manageOracleTickInterval)
+
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
 }

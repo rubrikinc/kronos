@@ -35,6 +35,7 @@ const (
 	raftSnapCountFlag            = "raft-snap-count"
 	seedHostsFlag                = "seed-hosts"
 	gossipSeedHostsFlag          = "gossip-seed-hosts"
+	testFlag                     = "test-mode"
 )
 
 var startCtx struct {
@@ -50,6 +51,7 @@ var startCtx struct {
 	seedHosts                string
 	gossipSeedHosts          string
 	raftSnapCount            uint64
+	testMode                 bool
 	driftClock               struct {
 		servicePort     string
 		startConfigFile string
@@ -116,6 +118,13 @@ func init() {
 	if err := startCmd.MarkFlagRequired(gossipSeedHostsFlag); err != nil {
 		log.Fatal(ctx, err)
 	}
+
+	startCmd.Flags().BoolVar(
+		&startCtx.testMode,
+		testFlag,
+		false,
+		"Flag indicating whether the server is run as part of test",
+	)
 
 	startCmd.Flags().Uint64Var(
 		&startCtx.raftSnapCount,
@@ -271,6 +280,7 @@ func runStart() {
 		ManageOracleTickInterval: startCtx.manageOracleTickInterval,
 		OracleTimeCapDelta:       startCtx.oracleTimeCapDelta,
 		OracleUptimeCapDelta:     startCtx.oracleUptimeCapDelta,
+		TestMode:                 startCtx.testMode,
 		RaftConfig: &oracle.RaftConfig{
 			CertsDir: kronosCertsDir(),
 			DataDir:  startCtx.dataDir,
