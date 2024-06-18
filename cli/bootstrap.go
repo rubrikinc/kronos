@@ -36,7 +36,7 @@ func init() {
 	)
 	bootstrapCmd.Flags().Int32Var(
 		&bootstrapCtx.expectedNodeCount,
-		"exepected-node-count",
+		"expected-node-count",
 		1,
 		"Expected number of nodes in the cluster.",
 	)
@@ -72,7 +72,8 @@ func runBootstrap() {
 			"error, bootstrap may have failed, err: %+v", err)
 		return
 	}
-	if res.NodeCount < (bootstrapCtx.expectedNodeCount+1)/2 {
+	quorum := bootstrapCtx.expectedNodeCount/2 + 1
+	if res.NodeCount < quorum {
 		log.Errorf(ctx, "Attempt to bootstrap the cluster failed, "+
 			"expected node count: %d, actual node count: %d",
 			bootstrapCtx.expectedNodeCount, res.NodeCount)
@@ -90,7 +91,7 @@ func runBootstrap() {
 			count++
 		}
 	}
-	if count < (bootstrapCtx.expectedNodeCount+1)/2 {
+	if count < quorum {
 		log.Errorf(ctx, "Attempt to bootstrap the cluster failed, "+
 			"expected node count: %d, actual node count: %d",
 			bootstrapCtx.expectedNodeCount, count)
