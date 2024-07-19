@@ -1227,6 +1227,8 @@ func (rc *raftNode) serveRaft(
 		if err != nil {
 			log.Fatalf(ctx, "Failed to get tls config: %v", err)
 		}
+		tlsConfig.MinVersion, tlsConfig.MaxVersion = kronosutil.GetTLSVersions()
+		tlsConfig.CipherSuites = kronosutil.GetTls12CipherSuites()
 		httpServer.TLSConfig = tlsConfig
 		err = httpServer.ServeTLS(
 			ln,
