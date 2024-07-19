@@ -56,8 +56,8 @@ func SSLCreds(certsDir string) (credentials.TransportCredentials, error) {
 	}
 
 	// Create the TLS credentials
-	minVersion, maxVersion := getTLSVersions()
-	tls12Ciphers := getTls12CipherSuites()
+	minVersion, maxVersion := GetTLSVersions()
+	tls12Ciphers := GetTls12CipherSuites()
 	creds := credentials.NewTLS(&tls.Config{
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		Certificates: []tls.Certificate{certificate},
@@ -132,7 +132,7 @@ func convertTLSVersionStrToInt(tlsVersionStr string) (uint16, error) {
 		tlsVersionStr)
 }
 
-func getTLSVersions() (uint16, uint16) {
+func GetTLSVersions() (uint16, uint16) {
 	minVersion := os.Getenv(defaultMinTLSVersionKey)
 	minVersionInt, err := convertTLSVersionStrToInt(minVersion)
 	if err != nil {
@@ -166,7 +166,7 @@ func getTLSVersions() (uint16, uint16) {
 	return minVersionInt, maxVersionInt
 }
 
-func getTls12CipherSuites() []uint16 {
+func GetTls12CipherSuites() []uint16 {
 	ianaTls12Ciphers := os.Getenv(defaultTLS12CipherSuitesKey)
 	convertedCiphers, err := parseTLS12CipherSuites(ianaTls12Ciphers)
 	if err != nil {

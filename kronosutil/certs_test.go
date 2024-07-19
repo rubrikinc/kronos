@@ -42,7 +42,7 @@ func TestGetTls12CipherSuites(t *testing.T) {
 		assert.Nil(
 			t,
 			os.Setenv("KRONOS_TLS_1_2_CIPHER_SUITES", tc.inputCipherSuites))
-		result := getTls12CipherSuites()
+		result := GetTls12CipherSuites()
 		assert.ElementsMatch(t, result, tc.expectedCipherSuites)
 		assert.Nil(t, os.Unsetenv("KRONOS_TLS_1_2_CIPHER_SUITES"))
 	}
@@ -106,7 +106,7 @@ func TestGetTLSVersions(t *testing.T) {
 		assert.Nil(
 			t,
 			os.Setenv("KRONOS_MAX_TLS_VERSION", tc.inputMaxVersionStr))
-		minVersion, maxVersion := getTLSVersions()
+		minVersion, maxVersion := GetTLSVersions()
 		assert.Equal(t, minVersion, tc.expectedMinVersion)
 		assert.Equal(t, maxVersion, tc.expectedMaxVersion)
 		assert.Nil(t, os.Unsetenv("KRONOS_MIN_TLS_VERSION"))
