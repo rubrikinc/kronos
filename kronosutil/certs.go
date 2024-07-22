@@ -29,6 +29,7 @@ const (
 var tls12CipherSuitesDefaultValue = []uint16{
 	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, // required for http servers
 }
 
 // SSLCreds returns credentials by reading keys and certificates from
@@ -134,6 +135,12 @@ func convertTLSVersionStrToInt(tlsVersionStr string) (uint16, error) {
 
 func GetTLSVersions() (uint16, uint16) {
 	minVersion := os.Getenv(defaultMinTLSVersionKey)
+	if minVersion == "" {
+		log.Infof(
+			context.Background(),
+			"TLS versions not provided. Using default values.")
+		return defaultMinTLSVersionValue, defaultMaxTLSVersionValue
+	}
 	minVersionInt, err := convertTLSVersionStrToInt(minVersion)
 	if err != nil {
 		log.Errorf(
@@ -143,6 +150,12 @@ func GetTLSVersions() (uint16, uint16) {
 		return defaultMinTLSVersionValue, defaultMaxTLSVersionValue
 	}
 	maxVersion := os.Getenv(defaultMaxTLSVersionKey)
+	if maxVersion == "" {
+		log.Infof(
+			context.Background(),
+			"TLS versions not provided. Using default values.")
+		return defaultMinTLSVersionValue, defaultMaxTLSVersionValue
+	}
 	maxVersionInt, err := convertTLSVersionStrToInt(maxVersion)
 	if err != nil {
 		log.Errorf(
@@ -168,6 +181,12 @@ func GetTLSVersions() (uint16, uint16) {
 
 func GetTls12CipherSuites() []uint16 {
 	ianaTls12Ciphers := os.Getenv(defaultTLS12CipherSuitesKey)
+	if ianaTls12Ciphers == "" {
+		log.Infof(
+			context.Background(),
+			"TLS 1.2 cipher suites not provided. Using default values.")
+		return tls12CipherSuitesDefaultValue
+	}
 	convertedCiphers, err := parseTLS12CipherSuites(ianaTls12Ciphers)
 	if err != nil {
 		log.Errorf(
