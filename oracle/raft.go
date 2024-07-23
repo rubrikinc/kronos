@@ -907,6 +907,22 @@ func (rc *raftNode) maybeAddRemote(ctx context.Context,
 	}
 	if rc.transport != nil {
 		rc.transport.AddRemote(typedNodeId, []string{desc.RaftAddr})
+		parsedUrl, _ := url.Parse(desc.RaftAddr)
+		addr, err := kronosutil.NodeAddr(parsedUrl.Host)
+		if err != nil {
+			log.Errorf(ctx, "Failed to convert %s to NodeAddr, err: %v", desc.RaftAddr, err)
+		} else {
+			changed, err := rc.cluster.UpdateNode(desc.NodeId, addr)
+			if err != nil {
+				log.Errorf(ctx, "Failed to update node %v in cluster metadata, error: %v", desc.NodeId, err)
+			}
+			if changed {
+				err := rc.cluster.Persist()
+				if err != nil {
+					log.Errorf(ctx, "Failed to persist cluster metadata after updating node %v, error: %v", desc.NodeId, err)
+				}
+			}
+		}
 		rc.transport.UpdatePeer(typedNodeId, []string{desc.RaftAddr})
 	}
 }
@@ -1108,6 +1124,24 @@ func (rc *raftNode) startRaft(
 
 	if err := rc.transport.Start(); err != nil {
 		log.Fatalf(ctx, "Failed to start raft transport, error: %v", err)
+	}
+
+	// Add remotes in case some of the nodes are in old version, they won't gossip their address
+	// our best guess is to use the address in the cluster metadata.
+	for id, node := range rc.cluster.ActiveNodes() {
+		if id == rc.nodeID {
+			continue
+		}
+		if node.IsRemoved {
+			continue
+		}
+		typedID, err := types.IDFromString(id)
+		if err != nil {
+			log.Errorf(ctx, "Failed to convert node id %v to raft id, error: %v", id, err)
+			continue
+		}
+		addrToURL := kronosutil.AddrToURL(node.RaftAddr, !tlsInfo.Empty())
+		rc.transport.AddPeer(typedID, []string{addrToURL.String()})
 	}
 
 	rc.gossip.RegisterCallback(gossip.NodeDescriptorPrefix, func(
