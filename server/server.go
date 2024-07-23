@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
@@ -291,12 +290,6 @@ func (k *Server) shouldOverthrowOracle(ctx context.Context) bool {
 		}
 		errs = append(errs, syncErr.err.Error())
 	}
-	log.Infof(
-		ctx,
-		"Eligible to overthrow oracle due to %d consecutive errors on the same oracle %s,"+
-			" errs: [%v]",
-		numConsecutiveErrsForOverthrow, oracle, strings.Join(errs, "; "),
-	)
 	return k.canOverthrowOracleNow(ctx, k.OracleSM.State(ctx))
 }
 

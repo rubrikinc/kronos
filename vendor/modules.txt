@@ -92,6 +92,7 @@ github.com/spf13/pflag
 # github.com/stretchr/testify v1.8.4
 ## explicit; go 1.20
 github.com/stretchr/testify/assert
+github.com/stretchr/testify/require
 # github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2
 ## explicit
 github.com/xiang90/probing

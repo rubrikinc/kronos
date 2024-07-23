@@ -23,6 +23,7 @@ require (
 	go.etcd.io/etcd/raft/v3 v3.5.0-alpha.0.0.20210320072418-e51c697ec6e8
 	go.etcd.io/etcd/server/v3 v3.5.0-alpha.0.0.20210320072418-e51c697ec6e8
 	go.etcd.io/gofail v0.1.0
+	go.uber.org/zap v1.17.0
 )
 
 require (
@@ -45,7 +46,6 @@ require (
 	github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.0-alpha.0.0.20210320072418-e51c697ec6e8 // indirect
 	go.uber.org/multierr v1.6.0 // indirect
-	go.uber.org/zap v1.17.0 // indirect
 	golang.org/x/net v0.0.0-20220722155237-a158d28d115b // indirect
 	golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f // indirect
 	golang.org/x/text v0.3.7 // indirect

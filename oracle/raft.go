@@ -311,6 +311,7 @@ func (rc *raftNode) removeNode(id string) {
 // addNode adds the given nodeID to cluster metadata and raft peers with the
 // given raft address.
 func (rc *raftNode) addNode(id string, addr *kronospb.NodeAddr) error {
+	log.Infof(context.Background(), "Adding node %v with address %v", id, addr)
 	if err := rc.cluster.AddNode(id, addr); err != nil {
 		return err
 	}
@@ -907,6 +908,22 @@ func (rc *raftNode) maybeAddRemote(ctx context.Context,
 	}
 	if rc.transport != nil {
 		rc.transport.AddRemote(typedNodeId, []string{desc.RaftAddr})
+		parsedUrl, _ := url.Parse(desc.RaftAddr)
+		addr, err := kronosutil.NodeAddr(parsedUrl.Host + ":" + parsedUrl.Port())
+		if err != nil {
+			log.Errorf(ctx, "Failed to convert %s to NodeAddr, err: %v", desc.RaftAddr, err)
+		} else {
+			changed, err := rc.cluster.UpdateNode(desc.NodeId, addr)
+			if err != nil {
+				log.Errorf(ctx, "Failed to update node %v in cluster metadata, error: %v", desc.NodeId, err)
+			}
+			if changed {
+				err := rc.cluster.Persist()
+				if err != nil {
+					log.Errorf(ctx, "Failed to persist cluster metadata after updating node %v, error: %v", desc.NodeId, err)
+				}
+			}
+		}
 		rc.transport.UpdatePeer(typedNodeId, []string{desc.RaftAddr})
 	}
 }
@@ -1046,6 +1063,8 @@ func (rc *raftNode) startRaft(
 	isNodeInitialized := lastIndex != 0
 
 	tlsInfo := kronosutil.TLSInfo(certsDir)
+	hs, cs, err := c.Storage.InitialState()
+	log.Infof(ctx, "InitialState : %+v %+v %+v", hs, cs, err)
 
 	if isNodeInitialized {
 		rc.bootstrappedStatus.Lock()
@@ -1108,6 +1127,24 @@ func (rc *raftNode) startRaft(
 
 	if err := rc.transport.Start(); err != nil {
 		log.Fatalf(ctx, "Failed to start raft transport, error: %v", err)
+	}
+
+	// Add remotes in case some of the nodes are in old version, they won't gossip their address
+	// our best guess is to use the address in the cluster metadata.
+	for id, node := range rc.cluster.ActiveNodes() {
+		if id == rc.nodeID {
+			continue
+		}
+		if node.IsRemoved {
+			continue
+		}
+		typedID, err := types.IDFromString(id)
+		if err != nil {
+			log.Errorf(ctx, "Failed to convert node id %v to raft id, error: %v", id, err)
+			continue
+		}
+		addrToURL := kronosutil.AddrToURL(node.RaftAddr, !tlsInfo.Empty())
+		rc.transport.AddPeer(typedID, []string{addrToURL.String()})
 	}
 
 	rc.gossip.RegisterCallback(gossip.NodeDescriptorPrefix, func(
@@ -1305,6 +1342,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 
 		// store raft entries to wal, then publish over commit channel
 		case rd := <-rc.node.Ready():
+			log.Infof(ctx, "Ready : %+v", rd.Entries)
 			if !raft.IsEmptySnap(rd.Snapshot) {
 				if err := rc.saveSnap(rd.Snapshot); err != nil {
 					log.Fatal(ctx, err)

@@ -84,26 +84,27 @@ func (op Operation) String() string {
 	}
 }
 
-type testNode struct {
-	id            string
-	dataDir       string
-	logDir        string
-	listenHost    string
-	advertiseHost string
-	raftPort      string
-	grpcPort      string
-	driftPort     string
-	pprofAddr     string
-	isRunning     bool
-	mu            *syncutil.RWMutex
+type TestNode struct {
+	Id            string
+	DataDirectory string
+	LogDir        string
+	ListenHost    string
+	AdvertiseHost string
+	RaftPort      string
+	GrpcPort      string
+	DriftPort     string
+	PprofAddr     string
+	KronosBinary  string
+	IsRunning     bool
+	Mu            *syncutil.RWMutex
 	driftConfig   *kronospb.DriftTimeConfig
 }
 
-func (t *testNode) DataDir() string {
-	return t.dataDir
+func (t *TestNode) DataDir() string {
+	return t.DataDirectory
 }
 
-func (t *testNode) kronosStartCmd(
+func (t *TestNode) kronosStartCmd(
 	kronosBinary string,
 	seedHosts []string,
 	gossipSeeds []string,
@@ -113,20 +114,20 @@ func (t *testNode) kronosStartCmd(
 	leaderNotOracle bool,
 ) string {
 	kronosCmd := []string{
-		"KRONOS_NODE_ID=" + t.id,
+		"KRONOS_NODE_ID=" + t.Id,
 		"GODEBUG=netdns=cgo",
 		fmt.Sprintf("LD_PRELOAD=%v", os.Getenv("PROXY_AWARE_RESOLVER")),
 		kronosBinary,
 		"start",
-		"--advertise-host", t.advertiseHost,
-		"--listen-addr", t.listenHost,
-		"--raft-port", t.raftPort,
-		"--grpc-port", t.grpcPort,
+		"--advertise-host", t.AdvertiseHost,
+		"--listen-addr", t.ListenHost,
+		"--raft-port", t.RaftPort,
+		"--grpc-port", t.GrpcPort,
 		"--gossip-seed-hosts", strings.Join(gossipSeeds, ","),
 		"--use-drift-clock",
-		"--drift-port", t.driftPort,
-		"--data-dir", t.dataDir,
-		"--pprof-addr", t.pprofAddr,
+		"--drift-port", t.DriftPort,
+		"--data-dir", t.DataDirectory,
+		"--pprof-addr", t.PprofAddr,
 		"--seed-hosts", strings.Join(seedHosts, ","),
 		"--manage-oracle-tick-interval", manageOracleTickInterval.String(),
 		"--raft-snap-count", fmt.Sprint(raftSnapCount),
@@ -179,15 +180,15 @@ func (ct ClusterTime) Since(pastTime ClusterTime) map[int]time.Duration {
 // TestCluster is a kronos test cluster, that can be used to test kronos in
 // various scenarios.
 type TestCluster struct {
-	Nodes                    []*testNode
+	Nodes                    []*TestNode
 	ManageOracleTickInterval time.Duration
 	CertsDir                 string
 	RaftSnapCount            uint64
 	ErrCh                    chan error
 	LeaderNotOracle          bool
-	fs                       afero.Fs
+	Fs                       afero.Fs
 	kronosBinary             string
-	procfile                 string
+	Procfile                 string
 	seedHosts                []string
 	gossipSeedHosts          []string
 	goremanCmd               *exec.Cmd
@@ -229,33 +230,33 @@ func (tc *TestCluster) RunOperation(ctx context.Context, op Operation, indices .
 	}
 	for _, index := range indices {
 		log.Infof(ctx, "Running %s on node %d", op, index)
-		tc.Nodes[index].mu.Lock()
+		tc.Nodes[index].Mu.Lock()
 		output, err := tc.runGoremanWithArgs(
 			"run",
 			op.String(),
-			tc.Nodes[index].id,
+			tc.Nodes[index].Id,
 		)
 		if err != nil {
 			return errors.Wrapf(err, "output: %s", output)
 		}
 		switch op {
 		case Start, Restart:
-			tc.Nodes[index].isRunning = true
+			tc.Nodes[index].IsRunning = true
 		case Stop:
-			tc.Nodes[index].isRunning = false
+			tc.Nodes[index].IsRunning = false
 		default:
 			return errors.Errorf("unsupported value of op %v", op)
 		}
-		tc.Nodes[index].mu.Unlock()
+		tc.Nodes[index].Mu.Unlock()
 	}
 	return nil
 }
 
 // IsRunning is used to check if nodeIdx node is running or has been stopped.
 func (tc *TestCluster) IsRunning(nodeIdx int) bool {
-	tc.Nodes[nodeIdx].mu.RLock()
-	defer tc.Nodes[nodeIdx].mu.RUnlock()
-	return tc.Nodes[nodeIdx].isRunning
+	tc.Nodes[nodeIdx].Mu.RLock()
+	defer tc.Nodes[nodeIdx].Mu.RUnlock()
+	return tc.Nodes[nodeIdx].IsRunning
 }
 
 // UpdateClockConfig is used to update the drifting clock config for nodeidx
@@ -265,7 +266,7 @@ func (tc *TestCluster) UpdateClockConfig(
 ) error {
 	dialOpts := grpc.WithInsecure()
 	conn, err := grpc.Dial(
-		net.JoinHostPort(tc.Nodes[nodeIdx].listenHost, tc.Nodes[nodeIdx].driftPort),
+		net.JoinHostPort(tc.Nodes[nodeIdx].ListenHost, tc.Nodes[nodeIdx].DriftPort),
 		dialOpts,
 	)
 	if err != nil {
@@ -290,7 +291,7 @@ func (tc *TestCluster) Time(ctx context.Context, nodeIdx int) (int64, error) {
 	defer timeClient.Close()
 	tr, err := timeClient.KronosTime(
 		ctx,
-		&kronospb.NodeAddr{Host: tc.Nodes[nodeIdx].listenHost, Port: tc.Nodes[nodeIdx].grpcPort},
+		&kronospb.NodeAddr{Host: tc.Nodes[nodeIdx].ListenHost, Port: tc.Nodes[nodeIdx].GrpcPort},
 	)
 	if err != nil {
 		return -1, err
@@ -303,8 +304,8 @@ func (tc *TestCluster) Bootstrap(ctx context.Context, nodeIdx int) error {
 	bootstrapClient := server.NewGRPCClient(tc.CertsDir)
 	defer bootstrapClient.Close()
 	_, err := bootstrapClient.Bootstrap(ctx,
-		&kronospb.NodeAddr{Host: tc.Nodes[nodeIdx].listenHost, Port: tc.Nodes[nodeIdx].
-			grpcPort}, &kronospb.BootstrapRequest{ExpectedNodeCount: int32(len(tc.Nodes))})
+		&kronospb.NodeAddr{Host: tc.Nodes[nodeIdx].ListenHost, Port: tc.Nodes[nodeIdx].
+			GrpcPort}, &kronospb.BootstrapRequest{ExpectedNodeCount: int32(len(tc.Nodes))})
 	return err
 }
 
@@ -321,7 +322,7 @@ func (tc *TestCluster) ValidateTimeInConsensus(
 		}
 		nodesToValidate = append(
 			nodesToValidate,
-			net.JoinHostPort(node.listenHost, node.grpcPort),
+			net.JoinHostPort(node.ListenHost, node.GrpcPort),
 		)
 	}
 	addressToTime, addressToUptime, err := tc.validateTimeInConsensus(
@@ -336,7 +337,7 @@ func (tc *TestCluster) ValidateTimeInConsensus(
 
 func (tc *TestCluster) index(address string) int {
 	for idx, node := range tc.Nodes {
-		nodeAddress := net.JoinHostPort(node.listenHost, node.grpcPort)
+		nodeAddress := net.JoinHostPort(node.ListenHost, node.GrpcPort)
 		if nodeAddress == address {
 			return idx
 		}
@@ -350,7 +351,7 @@ func (tc *TestCluster) OracleForNode(ctx context.Context, nodeIdx int) (int, err
 	defer timeClient.Close()
 	status, err := timeClient.Status(
 		ctx,
-		&kronospb.NodeAddr{Host: tc.Nodes[nodeIdx].listenHost, Port: tc.Nodes[nodeIdx].grpcPort},
+		&kronospb.NodeAddr{Host: tc.Nodes[nodeIdx].ListenHost, Port: tc.Nodes[nodeIdx].GrpcPort},
 	)
 	if err != nil {
 		return -1, err
@@ -361,7 +362,7 @@ func (tc *TestCluster) OracleForNode(ctx context.Context, nodeIdx int) (int, err
 	)
 	idx := -1
 	for i, node := range tc.Nodes {
-		if addr == net.JoinHostPort(node.advertiseHost, node.grpcPort) {
+		if addr == net.JoinHostPort(node.AdvertiseHost, node.GrpcPort) {
 			idx = i
 			break
 		}
@@ -372,10 +373,10 @@ func (tc *TestCluster) OracleForNode(ctx context.Context, nodeIdx int) (int, err
 	return idx, nil
 }
 
-// NodeID returns the raft id of the idx node. It reads cluster
+// NodeID returns the raft Id of the idx node. It reads cluster
 // metadata of idx node to get the same.
 func (tc *TestCluster) NodeID(idx int) (string, error) {
-	id, err := metadata.FetchNodeID(tc.Nodes[idx].dataDir)
+	id, err := metadata.FetchNodeID(tc.Nodes[idx].DataDirectory)
 	if err != nil {
 		return "", err
 	}
@@ -412,7 +413,7 @@ func (tc *TestCluster) RemoveNode(ctx context.Context, idx int, nodeToRunRemoveF
 		"remove",
 		nodeID,
 		"--host",
-		fmt.Sprintf("%s:%s", tc.Nodes[nodeToRunRemoveFrom].listenHost, tc.Nodes[nodeToRunRemoveFrom].raftPort),
+		fmt.Sprintf("%s:%s", tc.Nodes[nodeToRunRemoveFrom].ListenHost, tc.Nodes[nodeToRunRemoveFrom].RaftPort),
 		"--certs-dir", tc.CertsDir,
 	}
 	if output, err := exec.Command(
@@ -426,7 +427,7 @@ func (tc *TestCluster) RemoveNode(ctx context.Context, idx int, nodeToRunRemoveF
 		}
 		// deleting the data directory, as we don't support recommission of node to
 		// kronos cluster yet.
-		return tc.fs.RemoveAll(tc.Nodes[idx].dataDir)
+		return tc.Fs.RemoveAll(tc.Nodes[idx].DataDirectory)
 	} else {
 		return nil
 	}
@@ -435,10 +436,10 @@ func (tc *TestCluster) RemoveNode(ctx context.Context, idx int, nodeToRunRemoveF
 // AddNode adds a new node to testCluster and returns the newly assigned NodeID.
 func (tc *TestCluster) AddNode(ctx context.Context, idx int) (string, error) {
 	log.Infof(ctx, "Adding node %d to the cluster", idx)
-	if _, err := os.Stat(tc.Nodes[idx].dataDir); err == nil || os.IsExist(err) {
+	if _, err := os.Stat(tc.Nodes[idx].DataDirectory); err == nil || os.IsExist(err) {
 		return "", errors.New("data directory for node being added already exists")
 	}
-	if err := tc.fs.Mkdir(tc.Nodes[idx].dataDir, 0755); err != nil {
+	if err := tc.Fs.Mkdir(tc.Nodes[idx].DataDirectory, 0755); err != nil {
 		return "", err
 	}
 	if err := tc.RunOperation(ctx, Start, idx); err != nil {
@@ -446,7 +447,7 @@ func (tc *TestCluster) AddNode(ctx context.Context, idx int) (string, error) {
 	}
 	// Wait for sometime to let the node-info file be created for the node.
 	time.Sleep(time.Second)
-	id, err := metadata.FetchNodeID(tc.Nodes[idx].dataDir)
+	id, err := metadata.FetchNodeID(tc.Nodes[idx].DataDirectory)
 	if err != nil {
 		return "", err
 	}
@@ -455,8 +456,8 @@ func (tc *TestCluster) AddNode(ctx context.Context, idx int) (string, error) {
 
 // IsNodeRemoved checks if node idx is removed according to the metadata of
 // node sourceNode.
-func (t *testNode) IsNodeRemoved(id string) (bool, error) {
-	c, err := metadata.LoadCluster(t.dataDir, true /* readOnly */)
+func (t *TestNode) IsNodeRemoved(id string) (bool, error) {
+	c, err := metadata.LoadCluster(t.DataDirectory, true /* readOnly */)
 	if err != nil {
 		return true, err
 	}
@@ -484,7 +485,7 @@ func (tc *TestCluster) Oracle(
 	var oracles []int
 	multipleOracle := false
 	for i, node := range tc.Nodes {
-		if checkOnlyRunningNodes && !node.isRunning {
+		if checkOnlyRunningNodes && !node.IsRunning {
 			continue
 		}
 		var oracleForI int
@@ -547,8 +548,12 @@ func (tc *TestCluster) destroyProxies() {
 			if i == j {
 				continue
 			}
-			tc.grpcProxy[i][j].Stop()
-			tc.raftProxy[i][j].Stop()
+			if tc.grpcProxy != nil && tc.grpcProxy[i][j] != nil {
+				tc.grpcProxy[i][j].Stop()
+			}
+			if tc.raftProxy != nil && tc.raftProxy[i][j] != nil {
+				tc.raftProxy[i][j].Stop()
+			}
 		}
 	}
 }
@@ -569,8 +574,8 @@ func (tc *TestCluster) ReIP(ctx context.Context) error {
 	for i, node := range tc.Nodes {
 		newPort := fmt.Sprint(freePorts[i])
 		name := "kronos" + strconv.Itoa(i+1)
-		oldToNewAddr[addr(name, node.raftPort)] = addr(name, newPort)
-		node.raftPort = newPort
+		oldToNewAddr[addr(name, node.RaftPort)] = addr(name, newPort)
+		node.RaftPort = newPort
 	}
 	var newSeedHosts []string
 	for _, seed := range tc.seedHosts {
@@ -598,7 +603,7 @@ func (tc *TestCluster) Status(hostIdx int, local bool) ([]byte, error) {
 	statusArgs := []string{
 		"status",
 		"--format", "json",
-		"--raft-addr", fmt.Sprintf("%s:%s", tc.Nodes[hostIdx].advertiseHost, tc.Nodes[hostIdx].raftPort),
+		"--raft-addr", fmt.Sprintf("%s:%s", tc.Nodes[hostIdx].AdvertiseHost, tc.Nodes[hostIdx].RaftPort),
 		fmt.Sprintf("--local=%t", local),
 	}
 	if len(tc.CertsDir) > 0 {
@@ -626,13 +631,7 @@ func (tc *TestCluster) Status(hostIdx int, local bool) ([]byte, error) {
 }
 
 func (tc *TestCluster) generateProcfile(ctx context.Context, addEnvs map[int]string) error {
-	kronosBinary, err := absoluteBinaryPath("kronos")
-	if err != nil {
-		return err
-	}
-	log.Infof(ctx, "Kronos binary path: %v", kronosBinary)
-	tc.kronosBinary = kronosBinary
-	pf, err := tc.fs.OpenFile(tc.procfile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	pf, err := tc.Fs.OpenFile(tc.Procfile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
@@ -647,10 +646,10 @@ func (tc *TestCluster) generateProcfile(ctx context.Context, addEnvs map[int]str
 		_, err = pf.WriteString(
 			fmt.Sprintf(
 				"%s: %s %s 2>>%s 1>>%s\n",
-				tc.Nodes[i].id,
+				tc.Nodes[i].Id,
 				envVars,
 				tc.Nodes[i].kronosStartCmd(
-					tc.kronosBinary,
+					tc.Nodes[i].KronosBinary,
 					tc.seedHosts,
 					tc.gossipSeedHosts,
 					tc.ManageOracleTickInterval,
@@ -658,8 +657,8 @@ func (tc *TestCluster) generateProcfile(ctx context.Context, addEnvs map[int]str
 					tc.RaftSnapCount,
 					tc.LeaderNotOracle,
 				),
-				filepath.Join(tc.Nodes[i].logDir, "kronos-stderr.log"),
-				filepath.Join(tc.Nodes[i].logDir, "kronos-stdout.log"),
+				filepath.Join(tc.Nodes[i].LogDir, "kronos-stderr.log"),
+				filepath.Join(tc.Nodes[i].LogDir, "kronos-stdout.log"),
 			),
 		)
 		if err != nil {
@@ -674,9 +673,10 @@ func (tc *TestCluster) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err = tc.fs.Stat(goremanBinary); err != nil {
+	if _, err = tc.Fs.Stat(goremanBinary); err != nil {
 		if os.IsNotExist(err) {
 			log.Info(ctx, "goreman binary is missing. Make sure $GOPATH/bin is in $PATH")
+			return err
 		} else {
 			return err
 		}
@@ -684,13 +684,20 @@ func (tc *TestCluster) Start(ctx context.Context) error {
 	if tc.goremanCmd != nil {
 		tc.goremanCmd.Wait()
 	}
+	if tc.goremanPort == "" {
+		ports, err := testutil.GetFreePorts(ctx, 1)
+		if err != nil {
+			return err
+		}
+		tc.goremanPort = strconv.Itoa(ports[0])
+	}
 
 	tc.goremanCmd = exec.Command(
 		goremanBinary,
 		"-p",
 		tc.goremanPort,
 		"-f",
-		tc.procfile,
+		tc.Procfile,
 		"-exit-on-stop=false",
 		"start",
 	)
@@ -709,11 +716,11 @@ func (tc *TestCluster) Close() error {
 	if err := tc.Stop(context.Background()); err != nil {
 		return err
 	}
-	for _, node := range tc.Nodes {
-		if err := tc.fs.RemoveAll(node.dataDir); err != nil {
-			return err
-		}
-	}
+	//for _, node := range tc.Nodes {
+	//	//if err := tc.Fs.RemoveAll(node.DataDirectory); err != nil {
+	//	//	return err
+	//	//}
+	//}
 	tc.destroyProxies()
 	return nil
 }
@@ -733,7 +740,7 @@ type ClusterConfig struct {
 // TestCluster should be closed using Close method once test is finished.
 // This returns a cluster which runs in insecure mode.
 func NewInsecureCluster(ctx context.Context, cc ClusterConfig) (*TestCluster, error) {
-	return newCluster(ctx, cc, true /* insecure */)
+	return newCluster(ctx, cc, true)
 }
 
 // NewCluster returns an instance of a test kronos cluster. It returns
@@ -749,8 +756,8 @@ func NewCluster(ctx context.Context, cc ClusterConfig) (*TestCluster, error) {
 func (tc *TestCluster) createProxy(ctx context.Context, i, j int) error {
 	proxy, err := tcpproxy.NewTCPProxy(
 		ctx,
-		fmt.Sprintf("127.0.%d.%d:%s", i+1, j+1, tc.Nodes[j].raftPort),
-		fmt.Sprintf("127.0.0.%d:%s", j+1, tc.Nodes[j].raftPort),
+		fmt.Sprintf("127.0.%d.%d:%s", i+1, j+1, tc.Nodes[j].RaftPort),
+		fmt.Sprintf("127.0.0.%d:%s", j+1, tc.Nodes[j].RaftPort),
 		failuregen.NewFailureGenerator(),
 		failuregen.NewFailureGenerator(),
 	)
@@ -760,8 +767,8 @@ func (tc *TestCluster) createProxy(ctx context.Context, i, j int) error {
 	}
 	proxy, err = tcpproxy.NewTCPProxy(
 		ctx,
-		fmt.Sprintf("127.0.%d.%d:%s", i+1, j+1, tc.Nodes[j].grpcPort),
-		fmt.Sprintf("127.0.0.%d:%s", j+1, tc.Nodes[j].grpcPort),
+		fmt.Sprintf("127.0.%d.%d:%s", i+1, j+1, tc.Nodes[j].GrpcPort),
+		fmt.Sprintf("127.0.0.%d:%s", j+1, tc.Nodes[j].GrpcPort),
 		failuregen.NewFailureGenerator(),
 		failuregen.NewFailureGenerator(),
 	)
@@ -828,21 +835,21 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 
 	tc := &TestCluster{
 		CertsDir:                 certsDir,
-		fs:                       cc.Fs,
+		Fs:                       cc.Fs,
 		ErrCh:                    make(chan error),
 		ManageOracleTickInterval: cc.ManageOracleTickInterval,
-		Nodes:                    make([]*testNode, cc.NumNodes),
-		procfile:                 filepath.Join(testDir, procfile),
+		Nodes:                    make([]*TestNode, cc.NumNodes),
+		Procfile:                 filepath.Join(testDir, procfile),
 		RaftSnapCount:            cc.RaftSnapCount,
 		testDir:                  testDir,
 		LeaderNotOracle:          cc.LeaderNotOracle,
 	}
-	log.Infof(ctx, "Procfile: %v", tc.procfile)
+	log.Infof(ctx, "Procfile: %v", tc.Procfile)
 
 	// 0 -> goreman port
 	// 1 -> raft port,
 	// 2 -> grpc port,
-	// 3 -> driftPort
+	// 3 -> DriftPort
 	// 4 -> pprofPort
 	freePorts, err := testutil.GetFreePorts(ctx, 5)
 	if err != nil {
@@ -861,23 +868,30 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 	}
 
 	for i := 0; i < cc.NumNodes; i++ {
-		tc.Nodes[i] = &testNode{
-			id:            fmt.Sprintf("%d", i+1),
-			dataDir:       filepath.Join(testDir, fmt.Sprintf("data_dir_%d", i)),
-			logDir:        filepath.Join(testDir, fmt.Sprintf("log_dir_%d", i)),
-			advertiseHost: fmt.Sprintf("kronos%d", i+1),
-			listenHost:    fmt.Sprintf("127.0.0.%d", i+1),
-			raftPort:      strconv.Itoa(freePorts[1]),
-			grpcPort:      strconv.Itoa(freePorts[2]),
-			driftPort:     strconv.Itoa(freePorts[3]),
-			pprofAddr:     strconv.Itoa(freePorts[4]),
-			isRunning:     true,
-			mu:            &syncutil.RWMutex{},
-		}
-		if err = cc.Fs.Mkdir(tc.Nodes[i].dataDir, 0755); err != nil {
+		kronosBinary, err := absoluteBinaryPath("kronos")
+		if err != nil {
 			return nil, err
 		}
-		if err = cc.Fs.Mkdir(tc.Nodes[i].logDir, 0755); err != nil {
+		log.Infof(ctx, "Kronos binary path: %v", kronosBinary)
+		tc.kronosBinary = kronosBinary
+		tc.Nodes[i] = &TestNode{
+			Id:            fmt.Sprintf("%d", i+1),
+			DataDirectory: filepath.Join(testDir, fmt.Sprintf("data_dir_%d", i)),
+			LogDir:        filepath.Join(testDir, fmt.Sprintf("log_dir_%d", i)),
+			AdvertiseHost: fmt.Sprintf("kronos%d", i+1),
+			ListenHost:    fmt.Sprintf("127.0.0.%d", i+1),
+			RaftPort:      strconv.Itoa(freePorts[1]),
+			GrpcPort:      strconv.Itoa(freePorts[2]),
+			DriftPort:     strconv.Itoa(freePorts[3]),
+			PprofAddr:     strconv.Itoa(freePorts[4]),
+			IsRunning:     true,
+			Mu:            &syncutil.RWMutex{},
+			KronosBinary:  kronosBinary,
+		}
+		if err = cc.Fs.Mkdir(tc.Nodes[i].DataDirectory, 0755); err != nil {
+			return nil, err
+		}
+		if err = cc.Fs.Mkdir(tc.Nodes[i].LogDir, 0755); err != nil {
 			return nil, err
 		}
 	}
@@ -914,7 +928,7 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 
 // validateTimeInConsensus validates that the kronos time across the given nodes
 // (difference between maxTime and minTime) is within maxDiffAllowed.
-// Returns a map of node id to time, node id to uptime, and error (if any)
+// Returns a map of node Id to time, node Id to uptime, and error (if any)
 func (tc *TestCluster) validateTimeInConsensus(
 	ctx context.Context, maxDiffAllowed time.Duration, nodeAddresses []string, certsDir string,
 ) (ClusterTime, ClusterTime, error) {
@@ -1003,16 +1017,16 @@ func (tc *TestCluster) ExchangeDataDir(ctx context.Context, id1 int,
 	}
 
 	// Exchange data dir
-	tmpDataDir := tc.Nodes[id1].dataDir + "_tmp"
-	err = tc.fs.Rename(tc.Nodes[id1].dataDir, tmpDataDir)
+	tmpDataDir := tc.Nodes[id1].DataDirectory + "_tmp"
+	err = tc.Fs.Rename(tc.Nodes[id1].DataDirectory, tmpDataDir)
 	if err != nil {
 		return err
 	}
-	err = tc.fs.Rename(tc.Nodes[id2].dataDir, tc.Nodes[id1].dataDir)
+	err = tc.Fs.Rename(tc.Nodes[id2].DataDirectory, tc.Nodes[id1].DataDirectory)
 	if err != nil {
 		return err
 	}
-	err = tc.fs.Rename(tmpDataDir, tc.Nodes[id2].dataDir)
+	err = tc.Fs.Rename(tmpDataDir, tc.Nodes[id2].DataDirectory)
 	if err != nil {
 		return err
 	}
@@ -1059,7 +1073,7 @@ func (tc *TestCluster) findNodeWithRaftId(t *testing.T, id string) int {
 			return idx
 		}
 	}
-	t.Fatalf("node with id %v not found", id)
+	t.Fatalf("node with Id %v not found", id)
 	return -1
 }
 
