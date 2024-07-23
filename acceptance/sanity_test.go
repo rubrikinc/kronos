@@ -960,3 +960,73 @@ func RefreshNodeEnv(ctx context.Context, nodeId int, env string, tc *cluster.Tes
 	}
 	return tc.Start(ctx)
 }
+
+func TestDoNotUseSeedsBeyondBootstrap(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 7
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			RaftSnapCount:            1,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+	time.Sleep(bootstrapTime)
+
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
+
+	removeNode := func(idx int) {
+		if err := tc.RemoveNode(ctx, idx, -1, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addNode := func(idx int) string {
+		id, err := tc.AddNode(ctx, idx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	stopNode := func(idx int) {
+		if err := tc.RunOperation(ctx, cluster.Stop, idx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	startNode := func(idx int) {
+		if err := tc.RunOperation(ctx, cluster.Start, idx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	removeNode(3)
+	time.Sleep(kronosStabilizationBufferTime)
+	// stop the seeds.
+	stopNode(0)
+	stopNode(1)
+	// add back again
+	addNode(3)
+	// wait for some time so that the stopped nodes need a snapshot to catch up.
+	time.Sleep(kronosStabilizationBufferTime)
+	startNode(0)
+	startNode(1)
+	time.Sleep(kronosStabilizationBufferTime)
+	c, err := metadata.LoadCluster(tc.Nodes[0].DataDir(), true)
+	a.NoError(err)
+	count := 0
+	for _, node := range c.ActiveNodes() {
+		if !node.IsRemoved {
+			count++
+		}
+	}
+	a.Equal(numNodes, count)
+}
