@@ -22,6 +22,7 @@ import (
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/metadata"
 	"github.com/rubrikinc/kronos/pb"
+	_ "go.etcd.io/gofail/runtime"
 )
 
 const (
@@ -906,4 +907,56 @@ func TestOracleChanges(t *testing.T) {
 
 	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
 	a.NoError(err)
+}
+
+func TestSuddenCrashes(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 5
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			RaftSnapCount:            1,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+	time.Sleep(bootstrapTime)
+
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
+
+	leader := tc.FindLeader(t, a)
+	stopNode := 0
+	if leader == stopNode {
+		stopNode = 1
+	}
+	a.NoError(tc.RunOperation(ctx, cluster.Stop, stopNode))
+	// let it sleep for a while so that leader can send a snapshot
+	// to the follower.
+	time.Sleep(bootstrapTime)
+	a.NoError(RefreshNodeEnv(ctx, stopNode, "GOFAIL_FAILPOINTS='crashBeforeSaveSnapshot=panic(\"Injected crash\")'", tc))
+	time.Sleep(bootstrapTime)
+	// The stopNode will crash before the snapshot is applied and after hardstate is saved.
+	_, err = tc.Time(ctx, stopNode)
+	a.Error(err)
+	a.NoError(RefreshNodeEnv(ctx, stopNode, "", tc))
+	time.Sleep(bootstrapTime)
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
+}
+
+func RefreshNodeEnv(ctx context.Context, nodeId int, env string, tc *cluster.TestCluster) error {
+	tc.AddEnv(ctx, nodeId, env)
+	if err := tc.Stop(ctx); err != nil {
+		return err
+	}
+	return tc.Start(ctx)
 }

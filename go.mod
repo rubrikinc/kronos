@@ -22,6 +22,7 @@ require (
 	go.etcd.io/etcd/pkg/v3 v3.5.0-alpha.0.0.20210320072418-e51c697ec6e8
 	go.etcd.io/etcd/raft/v3 v3.5.0-alpha.0.0.20210320072418-e51c697ec6e8
 	go.etcd.io/etcd/server/v3 v3.5.0-alpha.0.0.20210320072418-e51c697ec6e8
+	go.etcd.io/gofail v0.1.0
 )
 
 require (

@@ -1297,15 +1297,17 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 
 		// store raft entries to wal, then publish over commit channel
 		case rd := <-rc.node.Ready():
+			if !raft.IsEmptySnap(rd.Snapshot) {
+				if err := rc.saveSnap(rd.Snapshot); err != nil {
+					log.Fatal(ctx, err)
+				}
+			}
 			if err := rc.wal.Save(rd.HardState, rd.Entries); err != nil {
 				log.Fatal(ctx, err)
 			}
 			appliedIndexBeforePublishing := rc.appliedIndex
 			if !raft.IsEmptySnap(rd.Snapshot) {
-				if err := rc.saveSnap(rd.Snapshot); err != nil {
-					log.Fatal(ctx, err)
-				}
-
+				// gofail: var crashBeforeSaveSnapshot struct{}
 				if err := rc.raftStorage.ApplySnapshot(rd.Snapshot); err != nil {
 					log.Fatal(ctx, err)
 				}

@@ -211,8 +211,8 @@ func (tc *TestCluster) runGoremanWithArgs(args ...string) (string, error) {
 	return string(output), err
 }
 
-// stop stops the testCluster by terminating the goreman command.
-func (tc *TestCluster) stop(ctx context.Context) error {
+// Stop stops the testCluster by terminating the goreman command.
+func (tc *TestCluster) Stop(ctx context.Context) error {
 	if err := tc.goremanCmd.Process.Signal(syscall.SIGTERM); err != nil {
 		log.Errorf(ctx, "Error while terminating goreman: %v", err)
 		if err = tc.goremanCmd.Process.Kill(); err != nil {
@@ -556,7 +556,7 @@ func (tc *TestCluster) destroyProxies() {
 // ReIP simulates re-ip in testcluster by changing raft ports of all the nodes
 // in the cluster.
 func (tc *TestCluster) ReIP(ctx context.Context) error {
-	if err := tc.stop(ctx); err != nil {
+	if err := tc.Stop(ctx); err != nil {
 		return err
 	}
 	tc.destroyProxies()
@@ -578,7 +578,7 @@ func (tc *TestCluster) ReIP(ctx context.Context) error {
 	}
 	tc.seedHosts = newSeedHosts
 
-	if err = tc.generateProcfile(ctx); err != nil {
+	if err = tc.generateProcfile(ctx, nil); err != nil {
 		return err
 	}
 
@@ -586,7 +586,7 @@ func (tc *TestCluster) ReIP(ctx context.Context) error {
 		return err
 	}
 
-	if err = tc.start(ctx); err != nil {
+	if err = tc.Start(ctx); err != nil {
 		return err
 	}
 	log.Info(ctx, "Cluster ReIP successful.")
@@ -625,7 +625,7 @@ func (tc *TestCluster) Status(hostIdx int, local bool) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
-func (tc *TestCluster) generateProcfile(ctx context.Context) error {
+func (tc *TestCluster) generateProcfile(ctx context.Context, addEnvs map[int]string) error {
 	kronosBinary, err := absoluteBinaryPath("kronos")
 	if err != nil {
 		return err
@@ -638,10 +638,17 @@ func (tc *TestCluster) generateProcfile(ctx context.Context) error {
 	}
 	defer pf.Close()
 	for i := 0; i < len(tc.Nodes); i++ {
+		envVars := ""
+		if addEnvs != nil {
+			if env, ok := addEnvs[i]; ok {
+				envVars = env
+			}
+		}
 		_, err = pf.WriteString(
 			fmt.Sprintf(
-				"%s: %s 2>>%s 1>>%s\n",
+				"%s: %s %s 2>>%s 1>>%s\n",
 				tc.Nodes[i].id,
+				envVars,
 				tc.Nodes[i].kronosStartCmd(
 					tc.kronosBinary,
 					tc.seedHosts,
@@ -662,7 +669,7 @@ func (tc *TestCluster) generateProcfile(ctx context.Context) error {
 	return nil
 }
 
-func (tc *TestCluster) start(ctx context.Context) error {
+func (tc *TestCluster) Start(ctx context.Context) error {
 	goremanBinary, err := absoluteBinaryPath("goreman")
 	if err != nil {
 		return err
@@ -699,7 +706,7 @@ func (tc *TestCluster) start(ctx context.Context) error {
 
 // Close closes the testcluster.
 func (tc *TestCluster) Close() error {
-	if err := tc.stop(context.Background()); err != nil {
+	if err := tc.Stop(context.Background()); err != nil {
 		return err
 	}
 	for _, node := range tc.Nodes {
@@ -889,11 +896,11 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 		return nil, err
 	}
 
-	if err = tc.generateProcfile(ctx); err != nil {
+	if err = tc.generateProcfile(ctx, nil); err != nil {
 		return nil, err
 	}
 
-	if err = tc.start(ctx); err != nil {
+	if err = tc.Start(ctx); err != nil {
 		return nil, err
 	}
 
@@ -1070,4 +1077,10 @@ func (tc *TestCluster) FindLeader(t *testing.T, a *assert.Assertions) int {
 	}
 	a.NotEqual(-1, leader)
 	return leader
+}
+
+func (tc *TestCluster) AddEnv(ctx context.Context, node int, s string) {
+	mp := make(map[int]string)
+	mp[node] = s
+	tc.generateProcfile(ctx, mp)
 }
