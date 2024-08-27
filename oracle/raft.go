@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"go.uber.org/zap"
 	"io"
 	"net"
 	"net/http"
@@ -238,6 +239,7 @@ type raftNode struct {
 		isBootstrapped bool
 	}
 	testMode bool
+	lg       *zap.Logger
 }
 
 // getNodesIncludingRemoved gets nodes in the cluster metadata from
@@ -424,6 +426,10 @@ func newRaftNode(
 	if rc.SnapCount <= 0 {
 		rc.SnapCount = numEntriesPerSnap
 	}
+	lg, err := zap.NewProduction()
+	if err != nil {
+		log.Fatalf(ctx, "Failed to create logger, error: %v", err)
+	}
 	rn := &raftNode{
 		proposeC:          proposeC,
 		confChangeC:       confChangeC,
@@ -445,6 +451,7 @@ func newRaftNode(
 		bootstrapReqC:     make(chan kronospb.BootstrapRequest),
 		listenHost:        rc.ListenHost,
 		testMode:          testMode,
+		lg:                lg,
 		// rest of structure populated after WAL replay
 	}
 	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort)
@@ -452,9 +459,9 @@ func newRaftNode(
 }
 
 func (rc *raftNode) purgeFiles(ctx context.Context) {
-	snaperrc := fileutil.PurgeFile(nil, rc.snapdir, snapFileSuffix,
+	snaperrc := fileutil.PurgeFile(rc.lg, rc.snapdir, snapFileSuffix,
 		maxSnapFiles, fileGCInterval, rc.stopc)
-	walerrc := fileutil.PurgeFile(nil, rc.waldir, walFileSuffix, maxWALFiles,
+	walerrc := fileutil.PurgeFile(rc.lg, rc.waldir, walFileSuffix, maxWALFiles,
 		fileGCInterval, rc.stopc)
 	select {
 	case e := <-snaperrc:
@@ -644,7 +651,7 @@ func (rc *raftNode) readWAL(
 		if err = os.Mkdir(rc.waldir, 0750); err != nil {
 			log.Fatalf(ctx, "Cannot create dir for wal, err: %v", err)
 		}
-		w, err = wal.Create(nil, rc.waldir, nil)
+		w, err = wal.Create(rc.lg, rc.waldir, nil)
 		if err != nil {
 			log.Fatalf(ctx, "Create wal err: %v", err)
 		}
@@ -667,7 +674,7 @@ func (rc *raftNode) readWAL(
 
 	repaired := false
 	for {
-		if w, err = wal.Open(nil, rc.waldir, walsnap); err != nil {
+		if w, err = wal.Open(rc.lg, rc.waldir, walsnap); err != nil {
 			log.Fatalf(ctx, "Failed to open wal, err: %v", err)
 		}
 		if _, st, ents, err = w.ReadAll(); err != nil {
@@ -683,7 +690,7 @@ func (rc *raftNode) readWAL(
 			if err := w.Close(); err != nil {
 				log.Errorf(ctx, "Ignoring close wal err: %v", err)
 			}
-			if !wal.Repair(nil, rc.waldir) {
+			if !wal.Repair(rc.lg, rc.waldir) {
 				log.Fatalf(ctx, "Failed to repair WAL")
 			} else {
 				log.Infof(ctx, "Successfully repaired WAL")
@@ -1013,7 +1020,7 @@ func (rc *raftNode) startRaft(
 			log.Fatalf(ctx, "Cannot create dir for snapshot (%v)", err)
 		}
 	}
-	rc.snapshotter = snap.New(nil, rc.snapdir)
+	rc.snapshotter = snap.New(rc.lg, rc.snapdir)
 	rc.snapshotterReady <- rc.snapshotter
 
 	rc.wal = rc.replayWAL(ctx)
@@ -1088,11 +1095,12 @@ func (rc *raftNode) startRaft(
 	}
 
 	rc.transport = &rafthttp.Transport{
+		Logger:      rc.lg,
 		ID:          selfID,
 		ClusterID:   types.ID(rc.clusterID),
 		Raft:        rc,
 		ServerStats: stats.NewServerStats("", ""),
-		LeaderStats: stats.NewLeaderStats(nil, fmt.Sprintf("%v", rc.nodeID)),
+		LeaderStats: stats.NewLeaderStats(rc.lg, fmt.Sprintf("%v", rc.nodeID)),
 		ErrorC:      make(chan error),
 		DialTimeout: 5 * time.Second,
 		TLSInfo:     tlsInfo,
