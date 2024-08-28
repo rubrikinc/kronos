@@ -20,7 +20,7 @@ var (
 	nodeDescriptorPeriod = 1 * time.Second
 	livenessPeriod       = 1 * time.Second
 	gossipPeriod         = time.Second
-	printGossipPeriod    = time.Second
+	printGossipPeriod    = 1 * time.Minute
 	delimiter            = "-"
 )
 

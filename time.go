@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	kronospb "github.com/rubrikinc/kronos/pb"
 	"time"
 
 	"github.com/rubrikinc/kronos/kronoshttp"
@@ -179,4 +180,14 @@ func GetTime(timeout time.Duration) (int64, error) {
 	}
 	return 0, errors.New(fmt.Sprintf(
 		"Couldn't get kronos time within timeout - %v", timeout))
+}
+
+func Bootstrap(ctx context.Context, expectedNodeCount int32) error {
+	if kronosServer == nil {
+		return errors.New("kronos server is not initialized")
+	}
+	_, err := kronosServer.Bootstrap(ctx, &kronospb.BootstrapRequest{
+		ExpectedNodeCount: expectedNodeCount,
+	})
+	return err
 }

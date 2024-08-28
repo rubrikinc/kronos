@@ -6,11 +6,11 @@ require (
 	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f
 	github.com/gogo/protobuf v1.3.2
 	github.com/pkg/errors v0.9.1
-	github.com/rubrikinc/failure-test-utils v0.0.0-20240617184314-d8206e413175
+	github.com/rubrikinc/failure-test-utils v0.0.0-20240828214825-4ce431dbf2dd
 	github.com/spf13/afero v1.1.2
 	github.com/spf13/cobra v1.1.1
 	github.com/stretchr/testify v1.8.4
-	go.uber.org/atomic v1.10.0
+	go.uber.org/atomic v1.9.0
 	golang.org/x/sync v0.0.0-20220513210516-0976fa681c29
 	google.golang.org/grpc v1.32.0
 )

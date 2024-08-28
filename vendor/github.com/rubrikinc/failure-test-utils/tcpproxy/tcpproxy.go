@@ -12,7 +12,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rubrikinc/failure-test-utils/failuregen"
 	"github.com/rubrikinc/failure-test-utils/log"
-	"go.uber.org/atomic"
 )
 
 // TCPProxy is the interface for test L4 proxy
@@ -32,13 +31,18 @@ type ProxyStats struct {
 	// connections accepted by proxy from client, includes only the ones that
 	// are currently getting served by proxy. It should not account for dropped
 	// connections
-	activeConnCtr atomic.Int64
+	activeConnCtr int64
 	// Connections dropped due to failure policies (not accounted in
 	// activeConnCtr
-	FrontendDropCtr atomic.Int64
+	FrontendDropCtr int64
 	// Connection those were getting served but got dropped due to failure
 	// policy set on the response receiving side.
-	backendDropCtr atomic.Int64
+	backendDropCtr int64
+}
+
+type proxyStatsWrapper struct {
+	sync.Mutex
+	value ProxyStats
 }
 
 type testTCPProxy struct {
@@ -50,7 +54,7 @@ type testTCPProxy struct {
 	wg               sync.WaitGroup
 	recvFg           failuregen.FailureGenerator
 	acceptFg         failuregen.FailureGenerator
-	stats            ProxyStats
+	stats            proxyStatsWrapper
 }
 
 func (t *testTCPProxy) BackendHostPort() string {
@@ -77,7 +81,8 @@ func NewTCPProxy(
 		backendHostPort:  backendHostPort,
 		recvFg:           recvFg,
 		acceptFg:         acceptFg,
-		stats:            ProxyStats{}}
+		stats:            proxyStatsWrapper{value: ProxyStats{}},
+	}
 	l, err := net.Listen("tcp", frontendHostPort)
 	if err != nil {
 		return nil, errors.Wrap(err, "listen")
@@ -101,23 +106,35 @@ func (t *testTCPProxy) Stop() {
 		log.Error(t.ctx, err)
 	}
 	t.wg.Wait()
-	activeConn := t.stats.activeConnCtr.Load()
+
+	activeConn := t.stats.getActiveConnCtr()
+
 	if activeConn != int64(0) {
 		panic(fmt.Sprintf("found %d active conn should be 0", activeConn))
 	}
 }
 
+func (stats *proxyStatsWrapper) getActiveConnCtr() int64 {
+	stats.Lock()
+	defer stats.Unlock()
+
+	return stats.value.activeConnCtr
+}
+
 // Stats provides the tcp proxy stats
 func (t *testTCPProxy) Stats() ProxyStats {
-	return t.stats
+	t.stats.Lock()
+	defer t.stats.Unlock()
+
+	return t.stats.value
 }
 
 func (st ProxyStats) String() string {
 	return fmt.Sprintf(
 		"stats{activeConn: %d, frontendDrop: %d, backendDrop: %d}\n",
-		st.activeConnCtr.Load(),
-		st.FrontendDropCtr.Load(),
-		st.backendDropCtr.Load())
+		st.activeConnCtr,
+		st.FrontendDropCtr,
+		st.backendDropCtr)
 }
 
 // BlockIncomingConns blocks all new incoming connections to the TCP proxy by
@@ -166,10 +183,11 @@ func (t *testTCPProxy) closeFrontendConn(
 			conn.RemoteAddr(), reason)
 	}
 	_ = conn.Close()
+
 	if reason == "drop" {
-		t.stats.FrontendDropCtr.Inc()
+		t.stats.incrementFrontendDropCtr()
 	}
-	t.stats.activeConnCtr.Dec()
+	t.stats.decrementActiveConnCtr()
 }
 
 func (t *testTCPProxy) serve() {
@@ -187,7 +205,9 @@ func (t *testTCPProxy) serve() {
 			}
 		} else {
 			log.Infof(t.ctx, "Accepted connection from %v", conn.RemoteAddr())
-			t.stats.activeConnCtr.Inc()
+
+			t.stats.incrementActiveConnCtr()
+
 			if err := t.acceptFg.FailMaybe(); err != nil {
 				log.Warningf(
 					t.ctx,
@@ -208,6 +228,30 @@ func (t *testTCPProxy) serve() {
 			}()
 		}
 	}
+}
+
+func (stats *proxyStatsWrapper) incrementActiveConnCtr() {
+	stats.Lock()
+	defer stats.Unlock()
+	stats.value.activeConnCtr++
+}
+
+func (stats *proxyStatsWrapper) decrementActiveConnCtr() {
+	stats.Lock()
+	defer stats.Unlock()
+	stats.value.activeConnCtr--
+}
+
+func (stats *proxyStatsWrapper) incrementBackendDropCtr() {
+	stats.Lock()
+	defer stats.Unlock()
+	stats.value.backendDropCtr++
+}
+
+func (stats *proxyStatsWrapper) incrementFrontendDropCtr() {
+	stats.Lock()
+	defer stats.Unlock()
+	stats.value.FrontendDropCtr++
 }
 
 func (t *testTCPProxy) copy(
@@ -251,15 +295,17 @@ func (t *testTCPProxy) copy(
 			condFailGen, ok := (t.recvFg).(failuregen.ConditionalFailureGenerator)
 			if ok {
 				if err := condFailGen.FailOnCondition(buf); err != nil {
-					t.stats.backendDropCtr.Inc()
+					t.stats.incrementBackendDropCtr()
 					return errors.Wrap(err, "injected recv failure on satisfying condition")
 				}
 			} else {
 				if err := t.recvFg.FailMaybe(); err != nil {
-					t.stats.backendDropCtr.Inc()
+					t.stats.incrementBackendDropCtr()
 					return errors.Wrap(err, "injected recv failure")
 				}
 			}
+			return nil
+
 		}
 		_, err := dest.Write(buf[:nr])
 
