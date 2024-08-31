@@ -192,6 +192,21 @@ func (c *Cluster) AddNode(id string, addr *kronospb.NodeAddr) error {
 	return nil
 }
 
+func (c *Cluster) UpdateNode(id string, addr *kronospb.NodeAddr) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if node, ok := c.mu.cluster.AllNodes[id]; !ok || node.IsRemoved {
+		return false, nil
+	}
+	prevAddr := kronosutil.AddrToURL(c.mu.cluster.AllNodes[id].RaftAddr, false)
+	newAddr := kronosutil.AddrToURL(addr, false)
+	if prevAddr == newAddr {
+		return false, nil
+	}
+	c.mu.cluster.AllNodes[id].RaftAddr = protoutil.Clone(addr).(*kronospb.NodeAddr)
+	return true, nil
+}
+
 // RemoveNode sets nodeID as removed. It creates the node and marks it as
 // removed if it doesn't already exist in metadata. This function is idempotent
 // and it is OK to remove an already removed node.

@@ -1,4 +1,5 @@
 GO      ?= go
+GIT		?= git
 PATH	?= PATH
 PWD    ?= $(shell pwd)
 GO_BUILD := $(GO) build
@@ -27,6 +28,7 @@ gofail:
 acceptance: install_with_failpoints goreman getaddrinfo
 	PATH=$(shell $(GO) env GOPATH)/bin:$(PATH) PROXY_AWARE_RESOLVER=$(PWD)/getaddrinfo.so $(GO) test -p 1 -v ./acceptance/... --tags=acceptance --timeout 30m
 	$(shell $(GO) env GOPATH)/bin/gofail disable ./oracle
+	./acceptance/run_upgrade_test.sh b9.1 $(shell $(GIT) rev-parse --abbrev-ref HEAD)
 
 test:
 	$(GO) test -v ./...
