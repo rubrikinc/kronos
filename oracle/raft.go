@@ -244,12 +244,10 @@ type raftNode struct {
 
 // getNodesIncludingRemoved gets nodes in the cluster metadata from
 // the remote node. It retries internally for 1 minute.
-func (rc *raftNode) getNodesIncludingRemoved(
-	ctx context.Context, remote *kronospb.NodeAddr,
-) (nodes []kronoshttp.Node, err error) {
+func (rc *raftNode) getNodesIncludingRemoved(ctx context.Context, remote *kronospb.NodeAddr, timeout time.Duration) (nodes []kronoshttp.Node, err error) {
 	log.Infof(ctx, "Getting nodes from %v", remote)
 	err = kronoshttp.ForDuration(
-		time.Minute,
+		timeout,
 		func() error {
 			c, err := kronoshttp.NewClusterClient(remote, rc.transport.TLSInfo)
 			if err != nil {
@@ -260,6 +258,32 @@ func (rc *raftNode) getNodesIncludingRemoved(
 			ctxWithTimeout, cancelFunc := context.WithTimeout(ctx, clusterRequestTimeout)
 			defer cancelFunc()
 			nodes, err = c.Nodes(ctxWithTimeout)
+			if err != nil {
+				log.Errorf(ctxWithTimeout, "Failed to get nodes, error: %v", err)
+				return err
+			}
+			return nil
+		},
+	)
+	return
+}
+
+// getRaftStatus gets nodes in the cluster metadata from
+// the remote node. It retries internally for 1 minute.
+func (rc *raftNode) getRaftStatus(ctx context.Context, remote *kronospb.NodeAddr, timeout time.Duration) (statusResp *kronoshttp.RaftStatusResp, err error) {
+	log.Infof(ctx, "Getting raft status from %v", remote)
+	err = kronoshttp.ForDuration(
+		timeout,
+		func() error {
+			c, err := kronoshttp.NewClusterClient(remote, rc.transport.TLSInfo)
+			if err != nil {
+				log.Errorf(ctx, "Failed to create cluster client, error: %v", err)
+				return err
+			}
+			defer c.Close()
+			ctxWithTimeout, cancelFunc := context.WithTimeout(ctx, clusterRequestTimeout)
+			defer cancelFunc()
+			statusResp, err = c.RaftStatus(ctxWithTimeout)
 			if err != nil {
 				log.Errorf(ctxWithTimeout, "Failed to get nodes, error: %v", err)
 				return err
@@ -321,10 +345,9 @@ func (rc *raftNode) addNode(id string, addr *kronospb.NodeAddr) error {
 
 // updateClusterFromConfState updates the cluster metadata and raft peers with
 // the nodes present in the confstate. It fetches the current cluster metadata
-// from seedHosts to get the addresses for the ID not present in the it's
-// cluster metadata. It also removes the nodeIDs present in the cluster metadata
-// but not in the confState.
-func (rc *raftNode) updateClusterFromConfState(ctx context.Context) {
+// from raft leader and other nodes to get the metadata for the nodes which could've
+// been added and then removed since the last snapshot.
+func (rc *raftNode) updateClusterFromConfState(ctx context.Context, snapshotIndex uint64) {
 	log.Infof(ctx, "Raft confstate: %v", rc.confState.Voters)
 	// remove nodes extra in activeNodes and add nodes extra in confstate.
 	nodesToRemove, nodesToAdd := extraNodes(rc.cluster.ActiveNodes(),
@@ -341,44 +364,116 @@ func (rc *raftNode) updateClusterFromConfState(ctx context.Context) {
 		rc.removeNode(nodeID)
 	}
 
-	// NB(kaavee): need to think if we need to change it to use addresses from
-	// all the nodes in confstate, or just the seed hosts. What to
-	// do if we get error? Should we retry later sometime?
-	for _, seed := range rc.seedHosts {
-		// nodes from nodesToAdd are deleted in this function later when we add a
-		// node to cluster metadata. Check if all the required nodes have been added
-		// initially to avoid asking nodes from the subsequent seedhosts if we get
-		// all the required data from the previous seed hosts.
-		if len(nodesToAdd) == 0 {
-			break
-		}
-		if proto.Equal(rc.localAddr, seed) {
-			continue
-		}
-		nodesIncludingRemoved, err := rc.getNodesIncludingRemoved(ctx, seed)
+	getNodeAddr := func(addr string) (*kronospb.NodeAddr, error) {
+		parsedUrl, err := url.Parse(addr)
 		if err != nil {
-			log.Errorf(ctx, "Failed to get nodes from %v, error: %v", seed, err)
+			log.Errorf(ctx, "Failed to parse url %s, err: %v", addr, err)
+			return nil, err
+		}
+		nodeAddr, err := kronosutil.NodeAddr(parsedUrl.Host)
+		if err != nil {
+			log.Errorf(ctx, "Failed to convert %s to NodeAddr, err: %v", parsedUrl.Host, err)
+			return nil, err
+		}
+		return nodeAddr, nil
+	}
+
+	rc.gossip.WaitForNRoundsofGossip(time.Minute, 2)
+	added := 0
+	for nodeID := range nodesToAdd {
+		nodeDesc := rc.gossip.GetNodeDesc(nodeID)
+		addr, err := getNodeAddr(nodeDesc.RaftAddr)
+		if err != nil {
+			log.Errorf(ctx, "Failed to get node addr for node %s, err: %v", nodeID, err)
 			continue
 		}
-		// Add the nodes not present in the local node's metadata with address
-		// according to the metadata fetched from the seed host.
-		for _, node := range nodesIncludingRemoved {
-			if node.IsRemoved {
-				rc.removeNode(node.NodeID)
-			} else {
-				if _, ok := nodesToAdd[node.NodeID]; !ok {
-					continue
-				}
-				if err := rc.addNode(node.NodeID, node.RaftAddr); err != nil {
-					log.Fatalf(ctx, "Failed to add node to cluster, error: %v", err)
-				}
-				// delete as the metadata has been added for this node.
-				delete(nodesToAdd, node.NodeID)
-			}
+		if err := rc.addNode(nodeID, addr); err != nil {
+			log.Errorf(ctx, "Failed to add node id: %s, addr: %s to cluster metadata, err: %v",
+				nodeID, addr, err)
+		} else {
+			added++
 		}
 	}
 
-	if len(nodesToAdd) > 0 {
+	// The below code is to handle the cases where a node was added and then removed before the snapshot was taken.
+	// In such cases, the node will not be present in the confState but we still need to add it to the cluster metadata.
+	// To handle this, we get the metadata of all the nodes from raft leader and other nodes and remove the nodes which
+	// are marked as removed.
+	raftLeader := rc.node.Status().Lead
+	err := func() error {
+		if raftLeader == raft.None {
+			return errors.New("raft leader not found")
+		}
+		nodeID := types.ID(raftLeader).String()
+		if nodeID == rc.nodeID {
+			// This should never happen as we are not the leader.
+			return errors.New("leader is this node")
+		}
+		nodeDesc := rc.gossip.GetNodeDesc(nodeID)
+		if nodeDesc == nil {
+			log.Errorf(ctx, "Node %s not found in gossip list", nodeID)
+			return errors.New("node not found in gossip list")
+		}
+		addr, err := getNodeAddr(nodeDesc.RaftAddr)
+		if err != nil {
+			log.Errorf(ctx, "Failed to get node addr for node %s, err: %v", nodeID, err)
+			return err
+		}
+		nodes, err := rc.getNodesIncludingRemoved(ctx, addr, 10*time.Second)
+		if err != nil {
+			log.Errorf(ctx, "Failed to get nodes from %s, err: %v", addr, err)
+			return err
+		}
+		for _, node := range nodes {
+			if node.IsRemoved {
+				rc.removeNode(node.NodeID)
+			}
+		}
+		return nil
+	}()
+
+	if err != nil {
+		func() {
+			for {
+				for _, nodeDesc := range rc.gossip.GetNodeList() {
+					if nodeDesc.IsRemoved || !nodeDesc.IsBootstrapped || nodeDesc.NodeId == rc.nodeID {
+						continue
+					}
+					parsedUrl, err := url.Parse(nodeDesc.RaftAddr)
+					if err != nil {
+						log.Errorf(ctx, "Failed to parse url %s, err: %v", nodeDesc.RaftAddr, err)
+						continue
+					}
+					addr, err := kronosutil.NodeAddr(parsedUrl.Host)
+					if err != nil {
+						log.Errorf(ctx, "Failed to convert %s to NodeAddr, err: %v", parsedUrl.Host, err)
+						continue
+					}
+					nodes, err := rc.getNodesIncludingRemoved(ctx, addr, 10*time.Second)
+					if err != nil {
+						log.Errorf(ctx, "Failed to get nodes from %s, err: %v", addr, err)
+						continue
+					}
+					for _, node := range nodes {
+						if node.IsRemoved {
+							rc.removeNode(node.NodeID)
+						}
+					}
+					raftStatus, err := rc.getRaftStatus(ctx, addr, 10*time.Second)
+					if err != nil {
+						log.Errorf(ctx, "Failed to get raftstatus from %s, err: %v", addr, err)
+						continue
+					}
+					if raftStatus.AppliedIndex >= snapshotIndex {
+						return
+					}
+				}
+				time.Sleep(5 * time.Second)
+			}
+		}()
+	}
+
+	if len(nodesToAdd) > added {
 		// Don't fatal over here as it's possible that this is an older snapshot
 		// and later a remove node comes in publishEntries because of which we don't
 		// find this node in the metadata of the seed hosts. Log as error here as
@@ -788,50 +883,6 @@ func raftID(nodeID string) types.ID {
 		panic(errors.Wrapf(err, "failed to convert nodeID %s to raftID", nodeID))
 	}
 	return raftID
-}
-
-func (rc *raftNode) seedRpc(ctx context.Context,
-	tlsInfo transport.TLSInfo, timeout time.Duration,
-	rpc func(ctx context.Context,
-		client *kronoshttp.
-			ClusterClient) error) error {
-	// try on both the seedHosts to maintain one seedHost failure tolerance
-	var lastTryError error
-	for _, seed := range rc.seedHosts {
-		if proto.Equal(seed, rc.localAddr) {
-			continue
-		}
-		log.Infof(ctx, "Executing rpc on %v", seed)
-		lastTryError = kronoshttp.ForDuration(
-			timeout,
-			func() error {
-				c, err := kronoshttp.NewClusterClient(seed,
-					tlsInfo)
-				if err != nil {
-					log.Errorf(ctx, "Failed to create cluster client, error: %v", err)
-					return err
-				}
-				defer c.Close()
-				ctxWithTimeout, cancelFunc := context.WithTimeout(ctx, clusterRequestTimeout)
-				defer cancelFunc()
-				err = rpc(ctxWithTimeout, c)
-				if err != nil {
-					log.Errorf(ctx, "Seed RPC to %v failed with error: %v",
-						seed, err)
-					return errors.Wrapf(err,
-						"Seed RPC to %v failed", seed)
-				}
-				return nil
-			},
-		)
-		if lastTryError != nil {
-			log.Errorf(ctx, "Failed to execute rpc on %v, error: %v", seed,
-				lastTryError)
-			continue
-		}
-		break
-	}
-	return lastTryError
 }
 
 func (rc *raftNode) tryIdempotentRpc(
@@ -1366,7 +1417,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 				}
 				rc.publishSnapshot(ctx, rd.Snapshot)
 				log.Infof(ctx, "Updating cluster metadata")
-				rc.updateClusterFromConfState(ctx)
+				rc.updateClusterFromConfState(ctx, rd.Snapshot.Metadata.Index)
 			}
 
 			if err := rc.raftStorage.Append(rd.Entries); err != nil {

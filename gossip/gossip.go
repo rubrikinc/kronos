@@ -490,6 +490,16 @@ func (g *Server) RemovePeer(id string) {
 	}
 }
 
+func (g *Server) GetNodeDesc(id string) *kronospb.NodeDescriptor {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	desc, ok := g.nodeList[id]
+	if !ok {
+		return nil
+	}
+	return protoutil.Clone(desc).(*kronospb.NodeDescriptor)
+}
+
 func IsNodeLive(desc *kronospb.NodeDescriptor) bool {
 	return desc != nil && desc.IsRemoved == false && desc.
 		LastHeartbeat > time.Now().Add(-10*nodeDescriptorPeriod).UnixNano()
