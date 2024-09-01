@@ -1,8 +1,31 @@
 package log
 
-import "context"
+import (
+	"context"
+	"go.uber.org/zap/zapcore"
+)
 
 type noOpLogger struct {
+}
+
+func (n noOpLogger) Enabled(level zapcore.Level) bool {
+	return false
+}
+
+func (n noOpLogger) With(fields []zapcore.Field) zapcore.Core {
+	return n
+}
+
+func (n noOpLogger) Check(entry zapcore.Entry, entry2 *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	return entry2.AddCore(entry, n)
+}
+
+func (n noOpLogger) Write(entry zapcore.Entry, fields []zapcore.Field) error {
+	return nil
+}
+
+func (n noOpLogger) Sync() error {
+	return nil
 }
 
 func (n noOpLogger) Info(ctx context.Context, args ...interface{}) {

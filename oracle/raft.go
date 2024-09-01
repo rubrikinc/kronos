@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"io"
 	"net"
 	"net/http"
@@ -521,10 +522,9 @@ func newRaftNode(
 	if rc.SnapCount <= 0 {
 		rc.SnapCount = numEntriesPerSnap
 	}
-	lg, err := zap.NewProduction()
-	if err != nil {
-		log.Fatalf(ctx, "Failed to create logger, error: %v", err)
-	}
+	var core zapcore.Core = log.Getlogger()
+	lg := zap.New(core).WithOptions()
+	lg = lg.WithOptions(zap.AddCaller())
 	rn := &raftNode{
 		proposeC:          proposeC,
 		confChangeC:       confChangeC,

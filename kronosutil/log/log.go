@@ -2,6 +2,7 @@ package log
 
 import (
 	"context"
+	"go.uber.org/zap/zapcore"
 	"sync"
 )
 
@@ -44,6 +45,11 @@ type Logger interface {
 	WithLogTag(ctx context.Context, name string, value interface{}) context.Context
 	// Flush the logger
 	Flush()
+	Enabled(level zapcore.Level) bool
+	With(fields []zapcore.Field) zapcore.Core
+	Check(entry zapcore.Entry, entry2 *zapcore.CheckedEntry) *zapcore.CheckedEntry
+	Write(entry zapcore.Entry, fields []zapcore.Field) error
+	Sync() error
 }
 
 // SetLogger is used to override the kronos logger. It should be called
@@ -54,58 +60,64 @@ func SetLogger(l Logger) {
 	logger.l = l
 }
 
+func Getlogger() Logger {
+	logger.Lock()
+	defer logger.Unlock()
+	return logger.l
+}
+
 // Info log
 func Info(ctx context.Context, args ...interface{}) {
-	logger.l.InfofDepth(ctx, 2, "", args...)
+	logger.l.InfofDepth(ctx, 1, "", args...)
 }
 
 // Infof log
 func Infof(ctx context.Context, format string, args ...interface{}) {
-	logger.l.InfofDepth(ctx, 2, format, args...)
+	logger.l.InfofDepth(ctx, 1, format, args...)
 }
 
 // InfofDepth log
 func InfofDepth(ctx context.Context, depth int, format string, args ...interface{}) {
-	logger.l.InfofDepth(ctx, depth+2, format, args...)
+	logger.l.InfofDepth(ctx, depth+1, format, args...)
 }
 
 // Warning log
 func Warning(ctx context.Context, args ...interface{}) {
-	logger.l.WarningfDepth(ctx, 2, "", args...)
+	logger.l.WarningfDepth(ctx, 1, "", args...)
 }
 
 // Warningf log
 func Warningf(ctx context.Context, format string, args ...interface{}) {
-	logger.l.WarningfDepth(ctx, 2, format, args...)
+	logger.l.WarningfDepth(ctx, 1, format, args...)
 }
 
 // WarningfDepth log
 func WarningfDepth(ctx context.Context, depth int, format string, args ...interface{}) {
-	logger.l.WarningfDepth(ctx, depth+2, format, args...)
+	logger.l.WarningfDepth(ctx, depth+1, format, args...)
 }
 
 // Error log
 func Error(ctx context.Context, args ...interface{}) {
-	logger.l.ErrorfDepth(ctx, 2, "", args...)
+	logger.l.ErrorfDepth(ctx, 1, "", args...)
 }
 
 // Errorf log
 func Errorf(ctx context.Context, format string, args ...interface{}) {
-	logger.l.ErrorfDepth(ctx, 2, format, args...)
+	logger.l.ErrorfDepth(ctx, 1, format, args...)
 }
 
 // ErrorfDepth log
 func ErrorfDepth(ctx context.Context, depth int, format string, args ...interface{}) {
-	logger.l.ErrorfDepth(ctx, depth+2, format, args...)
+	logger.l.ErrorfDepth(ctx, depth+1, format, args...)
 }
 
 // Fatal log
 func Fatal(ctx context.Context, args ...interface{}) {
-	logger.l.FatalfDepth(ctx, 2, "", args...)
+	logger.l.FatalfDepth(ctx, 1, "", args...)
 }
 
 func Fatalf(ctx context.Context, format string, args ...interface{}) {
-	logger.l.FatalfDepth(ctx, 2, format, args...)
+	logger.l.FatalfDepth(ctx, 1, format, args...)
 }
 
 // FatalfDepth log
