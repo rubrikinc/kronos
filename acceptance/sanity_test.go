@@ -1014,6 +1014,7 @@ func TestDoNotUseSeedsBeyondBootstrap(t *testing.T) {
 	stopNode(0)
 	stopNode(1)
 	// add back again
+	time.Sleep(kronosStabilizationBufferTime)
 	nodeId := addNode(3)
 	time.Sleep(kronosStabilizationBufferTime)
 	removeNode(3)

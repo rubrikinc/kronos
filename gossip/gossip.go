@@ -20,7 +20,7 @@ var (
 	nodeDescriptorPeriod = 1 * time.Second
 	livenessPeriod       = 1 * time.Second
 	gossipPeriod         = time.Second
-	printGossipPeriod    = time.Second
+	printGossipPeriod    = 1 * time.Minute
 	delimiter            = "-"
 )
 
@@ -31,6 +31,22 @@ const (
 
 type PrefixKey string
 type GossipKey string
+
+func SetGossipPeriod(period time.Duration) {
+	gossipPeriod = period
+}
+
+func SetNodeDescriptorPeriod(period time.Duration) {
+	nodeDescriptorPeriod = period
+}
+
+func SetLivenessPeriod(period time.Duration) {
+	livenessPeriod = period
+}
+
+func SetPrintGossipPeriod(period time.Duration) {
+	printGossipPeriod = period
+}
 
 func (p PrefixKey) String() string {
 	return string(p)
@@ -502,5 +518,5 @@ func (g *Server) GetNodeDesc(id string) *kronospb.NodeDescriptor {
 
 func IsNodeLive(desc *kronospb.NodeDescriptor) bool {
 	return desc != nil && desc.IsRemoved == false && desc.
-		LastHeartbeat > time.Now().Add(-10*nodeDescriptorPeriod).UnixNano()
+		LastHeartbeat > time.Now().Add(-5*nodeDescriptorPeriod).UnixNano()
 }
