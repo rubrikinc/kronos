@@ -2,11 +2,49 @@ package log
 
 import (
 	"context"
+	"go.uber.org/zap/zapcore"
 
 	log "github.com/sirupsen/logrus"
 )
 
 type simpleLogger struct {
+}
+
+func (s *simpleLogger) Enabled(level zapcore.Level) bool {
+	return true
+}
+
+func (s *simpleLogger) With(fields []zapcore.Field) zapcore.Core {
+	return s
+}
+
+func (s *simpleLogger) Check(entry zapcore.Entry, entry2 *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	return entry2.AddCore(entry, s)
+}
+
+func (s *simpleLogger) Write(entry zapcore.Entry, fields []zapcore.Field) error {
+	ctx := context.Background()
+	for _, f := range fields {
+		ctx = s.WithLogTag(ctx, f.Key, f.Interface)
+	}
+	switch entry.Level {
+	case zapcore.DebugLevel, zapcore.InfoLevel:
+		s.Infof(ctx, "%s - %s", entry.Caller.TrimmedPath(), entry.Message)
+	case zapcore.WarnLevel:
+		s.Warningf(ctx, "%s - %s", entry.Caller.TrimmedPath(), entry.Message)
+	case zapcore.ErrorLevel:
+		s.Errorf(ctx, "%s - %s", entry.Caller.TrimmedPath(), entry.Message)
+	case zapcore.DPanicLevel, zapcore.PanicLevel, zapcore.FatalLevel:
+		s.Fatalf(ctx, "%s - %s", entry.Caller.TrimmedPath(), entry.Message)
+	default:
+		s.Infof(ctx, "%s - %s", entry.Caller.TrimmedPath(), entry.Message)
+	}
+	return nil
+}
+
+func (s *simpleLogger) Sync() error {
+	s.Flush()
+	return nil
 }
 
 func (s *simpleLogger) Info(ctx context.Context, args ...interface{}) {
