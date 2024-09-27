@@ -5,17 +5,27 @@ import (
 	"errors"
 	"time"
 
+	"github.com/gogo/status"
 	"github.com/rubrikinc/kronos/kronoshttp"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	"github.com/rubrikinc/kronos/metadata"
 	kronospb "github.com/rubrikinc/kronos/pb"
 	"go.etcd.io/etcd/pkg/v3/types"
+	"google.golang.org/grpc/codes"
 )
 
 func (k *Server) Bootstrap(ctx context.Context, req *kronospb.BootstrapRequest) (*kronospb.BootstrapResponse, error) {
-	if _, err := metadata.FetchClusterUUID(k.dataDir); err == nil {
-		log.Infof(ctx, "Cluster already bootstrapped")
-		return &kronospb.BootstrapResponse{}, nil
+	if clusterID, err := metadata.FetchClusterUUID(k.dataDir); err == nil {
+		cluster, err := metadata.LoadCluster(k.dataDir, true)
+		if err != nil {
+			return nil, err
+		}
+		stat := status.New(codes.AlreadyExists, "Cluster already bootstrapped")
+		statWithDetails, err := stat.WithDetails(&kronospb.BootstrapResponse{ClusterId: clusterID.String(), NodeCount: int32(len(cluster.ActiveNodes()))})
+		if err != nil {
+			return nil, err
+		}
+		return nil, statWithDetails.Err()
 	}
 	k.bootstrapReqCh <- *req
 	var clusterID types.ID

@@ -16,6 +16,7 @@ require (
 )
 
 require (
+	github.com/gogo/status v1.1.1
 	github.com/petermattis/goid v0.0.0-20180202154549-b0b1615b78e5
 	github.com/sasha-s/go-deadlock v0.2.0
 	github.com/sirupsen/logrus v1.8.1
@@ -33,6 +34,7 @@ require (
 	github.com/coreos/go-systemd v0.0.0-20190321100706-95778dfbb74e // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.0 // indirect
+	github.com/gogo/googleapis v0.0.0-20180223154316-0cd9801be74a // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/inconshreveable/mousetrap v1.0.0 // indirect

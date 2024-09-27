@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/gogo/status"
+	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+
 	"github.com/rubrikinc/kronos/kronosutil"
 	"github.com/rubrikinc/kronos/kronosutil/log"
 	kronospb "github.com/rubrikinc/kronos/pb"
 	"github.com/rubrikinc/kronos/server"
-	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
 )
 
 var bootstrapCtx struct {
@@ -52,8 +55,7 @@ func runBootstrap() {
 	} else {
 		creds, err := kronosutil.SSLCreds(certsDir)
 		if err != nil {
-			log.Infof(ctx, "Error creating SSL creds: %v", err)
-			return
+			log.Fatalf(ctx, "Error creating SSL creds: %v", err)
 		}
 		dialOpts = grpc.WithTransportCredentials(creds)
 	}
@@ -68,34 +70,24 @@ func runBootstrap() {
 	res, err := client.Bootstrap(ctx,
 		&kronospb.BootstrapRequest{ExpectedNodeCount: bootstrapCtx.expectedNodeCount})
 	if err != nil {
-		log.Errorf(ctx, "Attempt to bootstrap the cluster encountered "+
-			"error, bootstrap may have failed, err: %+v", err)
-		return
+		st, ok := status.FromError(err)
+		if ok && status.Code(err) == codes.AlreadyExists {
+			res := st.Details()[0].(*kronospb.BootstrapResponse)
+			if res == nil || res.NodeCount < bootstrapCtx.expectedNodeCount/2+1 {
+				log.Fatalf(ctx, "Cluster already bootstrapped, but actual node count: %d is less than expected node count: %d",
+					res.NodeCount, bootstrapCtx.expectedNodeCount)
+			}
+			log.Infof(ctx, "Cluster already bootstrapped with cluster-id: %s and %d nodes", res.ClusterId, res.NodeCount)
+			return
+		}
+		log.Fatalf(ctx, "Attempt to bootstrap kronos cluster encountered "+
+			"error, bootstrap failed with err: %+v", err)
 	}
 	quorum := bootstrapCtx.expectedNodeCount/2 + 1
 	if res.NodeCount < quorum {
-		log.Errorf(ctx, "Attempt to bootstrap the cluster failed, "+
+		log.Fatalf(ctx, "Attempt to bootstrap kronos cluster failed, "+
 			"expected node count: %d, actual node count: %d",
 			bootstrapCtx.expectedNodeCount, res.NodeCount)
-		return
-	}
-	gossipClient := kronospb.NewGossipClient(conn)
-	resp, err := gossipClient.NodeLs(ctx, &kronospb.NodeLsRequest{})
-	if err != nil {
-		log.Errorf(ctx, "Error fetching gossiped information: %v", err)
-		return
-	}
-	count := int32(0)
-	for _, node := range resp.Nodes {
-		if node.IsBootstrapped && !node.IsRemoved && node.ClusterId == res.ClusterId {
-			count++
-		}
-	}
-	if count < quorum {
-		log.Errorf(ctx, "Attempt to bootstrap the cluster failed, "+
-			"expected node count: %d, actual node count: %d",
-			bootstrapCtx.expectedNodeCount, count)
-		return
 	} else {
 		log.Infof(ctx, "Cluster bootstrapped successfully with cluster-id: %s", res.ClusterId)
 	}
