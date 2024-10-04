@@ -262,7 +262,9 @@ func (g *Server) SetRemoved(ctx context.Context, isRemoved bool) {
 func (g *Server) gossip(ctx context.Context) {
 	peerList := g.GetPeers()
 	if len(peerList) == 0 {
-		log.Infof(ctx, "No peers to gossip with")
+		if log.V(1) {
+			log.Infof(ctx, "No peers to gossip with")
+		}
 		return
 	}
 	for _, peer := range peerList {

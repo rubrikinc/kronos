@@ -76,84 +76,84 @@ func Getlogger() Logger {
 // Info log
 func Info(ctx context.Context, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.Info(ctx, args...)
+		l.InfofDepth(ctx, 3, "", args...)
 	})
 }
 
 // Infof log
 func Infof(ctx context.Context, format string, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.Infof(ctx, format, args...)
+		l.InfofDepth(ctx, 3, format, args...)
 	})
 }
 
 // InfofDepth log
 func InfofDepth(ctx context.Context, depth int, format string, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.InfofDepth(ctx, depth+1, format, args...)
+		l.InfofDepth(ctx, depth+3, format, args...)
 	})
 }
 
 // Warning log
 func Warning(ctx context.Context, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.Warning(ctx, args...)
+		l.WarningfDepth(ctx, 3, "", args...)
 	})
 }
 
 // Warningf log
 func Warningf(ctx context.Context, format string, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.Warningf(ctx, format, args...)
+		l.WarningfDepth(ctx, 3, format, args...)
 	})
 }
 
 // WarningfDepth log
 func WarningfDepth(ctx context.Context, depth int, format string, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.WarningfDepth(ctx, depth+1, format, args...)
+		l.WarningfDepth(ctx, depth+3, format, args...)
 	})
 }
 
 // Error log
 func Error(ctx context.Context, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.Error(ctx, args...)
+		l.ErrorfDepth(ctx, 3, "", args...)
 	})
 }
 
 // Errorf log
 func Errorf(ctx context.Context, format string, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.Errorf(ctx, format, args...)
+		l.ErrorfDepth(ctx, 3, format, args...)
 	})
 }
 
 // ErrorfDepth log
 func ErrorfDepth(ctx context.Context, depth int, format string, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.ErrorfDepth(ctx, depth+1, format, args...)
+		l.ErrorfDepth(ctx, depth+3, format, args...)
 	})
 }
 
 // Fatal log
 func Fatal(ctx context.Context, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.Fatal(ctx, args...)
+		l.FatalfDepth(ctx, 3, "", args...)
 	})
 }
 
 // Fatalf log
 func Fatalf(ctx context.Context, format string, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.Fatalf(ctx, format, args...)
+		l.FatalfDepth(ctx, 3, format, args...)
 	})
 }
 
 // FatalfDepth log
 func FatalfDepth(ctx context.Context, depth int, format string, args ...interface{}) {
 	extractLoggerAndRun(func(l Logger) {
-		l.FatalfDepth(ctx, depth+1, format, args...)
+		l.FatalfDepth(ctx, depth+3, format, args...)
 	})
 }
 
