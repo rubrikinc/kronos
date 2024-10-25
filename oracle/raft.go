@@ -943,6 +943,29 @@ func (rc *raftNode) checkDuplicate(ctx context.Context,
 	}
 }
 
+func (rc *raftNode) updateClusterFile(desc *kronospb.NodeDescriptor) error {
+	parsedUrl, err := url.Parse(desc.RaftAddr)
+	if err != nil {
+		return errors.Wrapf(err, "failed to parse url %s", desc.RaftAddr)
+	}
+	addr, err := kronosutil.NodeAddr(parsedUrl.Host)
+	if err != nil {
+		return errors.Wrapf(err, "failed to convert %s to NodeAddr", desc.RaftAddr)
+	}
+
+	changed, err := rc.cluster.UpdateNode(desc.NodeId, addr)
+	if err != nil {
+		return errors.Wrapf(err, "failed to update node %s in cluster metadata", desc.NodeId)
+	}
+	if changed {
+		err := rc.cluster.Persist()
+		if err != nil {
+			return errors.Wrapf(err, "failed to persist cluster metadata after updating node %s", desc.NodeId)
+		}
+	}
+	return nil
+}
+
 func (rc *raftNode) maybeAddRemote(ctx context.Context,
 	desc *kronospb.NodeDescriptor) {
 	if desc == nil {
@@ -950,7 +973,9 @@ func (rc *raftNode) maybeAddRemote(ctx context.Context,
 	}
 	if desc.IsRemoved {
 		rc.removeNode(desc.NodeId)
-		log.Infof(ctx, "Node %v is removed, skipping", desc.NodeId)
+		if log.V(1) {
+			log.Infof(ctx, "Node %v is removed, skipping", desc.NodeId)
+		}
 		return
 	}
 	if !kronosutil.IsValidRaftAddr(desc.RaftAddr) {
@@ -965,25 +990,6 @@ func (rc *raftNode) maybeAddRemote(ctx context.Context,
 	}
 	if rc.transport != nil {
 		rc.transport.AddRemote(typedNodeId, []string{desc.RaftAddr})
-		parsedUrl, err := url.Parse(desc.RaftAddr)
-		if err != nil {
-			log.Errorf(ctx, "Failed to parse raft address %v, error: %v", desc.RaftAddr, err)
-		}
-		addr, err := kronosutil.NodeAddr(parsedUrl.Host)
-		if err != nil {
-			log.Errorf(ctx, "Failed to convert %s to NodeAddr, err: %v", desc.RaftAddr, err)
-		} else {
-			changed, err := rc.cluster.UpdateNode(desc.NodeId, addr)
-			if err != nil {
-				log.Errorf(ctx, "Failed to update node %v in cluster metadata, error: %v", desc.NodeId, err)
-			}
-			if changed {
-				err := rc.cluster.Persist()
-				if err != nil {
-					log.Errorf(ctx, "Failed to persist cluster metadata after updating node %v, error: %v", desc.NodeId, err)
-				}
-			}
-		}
 		rc.transport.UpdatePeer(typedNodeId, []string{desc.RaftAddr})
 	}
 }
@@ -1211,6 +1217,10 @@ func (rc *raftNode) startRaft(
 		if err := proto.Unmarshal(info.Data, &desc); err != nil {
 			log.Errorf(ctx, "Failed to unmarshal node descriptor, error: %v", err)
 			return
+		}
+		err := rc.updateClusterFile(&desc)
+		if err != nil {
+			log.Errorf(ctx, "Failed to update cluster metadata, error: %v", err)
 		}
 		if desc.NodeId == rc.nodeID {
 			return

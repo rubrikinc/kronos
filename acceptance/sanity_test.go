@@ -6,6 +6,7 @@ package acceptance
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"github.com/pkg/errors"
 	"math"
 	"math/rand"
@@ -267,6 +268,17 @@ func TestKronosSanityReIP(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	md5sums := make(map[[16]byte]int)
+	for i := 0; i < numNodes; i++ {
+		contents, err := checksumfile.Read(filepath.Join(tc.Nodes[i].DataDir(), "cluster_info"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		md5sums[md5.Sum(contents)] = i
+	}
+	if len(md5sums) != 1 {
+		t.Fatalf("md5sums of cluster_info files don't match %+v", md5sums)
+	}
 }
 
 func TestKronosSanityBackupRestore(t *testing.T) {

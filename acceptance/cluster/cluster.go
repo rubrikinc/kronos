@@ -716,11 +716,6 @@ func (tc *TestCluster) Close() error {
 	if err := tc.Stop(context.Background()); err != nil {
 		return err
 	}
-	for _, node := range tc.Nodes {
-		if err := tc.Fs.RemoveAll(node.DataDirectory); err != nil {
-			return err
-		}
-	}
 	tc.destroyProxies()
 	return nil
 }
