@@ -945,24 +945,31 @@ func TestSuddenCrashes(t *testing.T) {
 	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
 	a.NoError(err)
 
-	leader := tc.FindLeader(t, a)
-	stopNode := 0
-	if leader == stopNode {
-		stopNode = 1
+	envs := []string{
+		"GOFAIL_FAILPOINTS='crashBeforeSaveSnapshot=panic(\"Injected crash\")'",
+		"GOFAIL_FAILPOINTS='crashBeforeSaveHardState=panic(\"Injected crash\")'",
 	}
-	a.NoError(tc.RunOperation(ctx, cluster.Stop, stopNode))
-	// let it sleep for a while so that leader can send a snapshot
-	// to the follower.
-	time.Sleep(bootstrapTime)
-	a.NoError(RefreshNodeEnv(ctx, stopNode, "GOFAIL_FAILPOINTS='crashBeforeSaveSnapshot=panic(\"Injected crash\")'", tc))
-	time.Sleep(bootstrapTime)
-	// The stopNode will crash before the snapshot is applied and after hardstate is saved.
-	_, err = tc.Time(ctx, stopNode)
-	a.Error(err)
-	a.NoError(RefreshNodeEnv(ctx, stopNode, "", tc))
-	time.Sleep(bootstrapTime)
-	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
-	a.NoError(err)
+	for _, env := range envs {
+		leader := tc.FindLeader(t, a)
+		stopNode := 0
+		if leader == stopNode {
+			stopNode = 1
+		}
+		a.NoError(tc.RunOperation(ctx, cluster.Stop, stopNode))
+		// let it sleep for a while so that leader can send a snapshot
+		// to the follower.
+		time.Sleep(bootstrapTime)
+		a.NoError(RefreshNodeEnv(ctx, stopNode, env, tc))
+		time.Sleep(bootstrapTime)
+		// The stopNode will crash before the snapshot is applied and after hardstate is saved.
+		_, err = tc.Time(ctx, stopNode)
+		a.Error(err)
+		a.NoError(RefreshNodeEnv(ctx, stopNode, "", tc))
+		time.Sleep(bootstrapTime)
+		_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+		a.NoError(err)
+	}
+
 }
 
 func RefreshNodeEnv(ctx context.Context, nodeId int, env string, tc *cluster.TestCluster) error {

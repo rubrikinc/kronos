@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -567,6 +568,40 @@ func (rc *raftNode) purgeFiles(ctx context.Context) {
 	}
 }
 
+func (rc *raftNode) gcInvalidSnapshots(ctx context.Context) {
+	if wal.Exist(rc.waldir) {
+		walSnaps, err := wal.ValidSnapshotEntries(rc.lg, rc.waldir)
+		if err == nil {
+			fnames, err := fileutil.ReadDir(rc.snapdir)
+			if err != nil {
+				log.Errorf(ctx, "Failed to read snap dir, err: %v", err)
+			} else {
+				for _, fname := range fnames {
+					log.Infof(ctx, "Checking snap file %s", fname)
+					if strings.HasSuffix(fname, snapFileSuffix) {
+						found := false
+						for _, snap := range walSnaps {
+							// This should match the file naming scheme in
+							// vendor/go.etcd.io/etcd/server/v3/etcdserver/api/snap/snapshotter.go
+							snapFname := fmt.Sprintf("%016x-%016x.%s", snap.Term, snap.Index, snapFileSuffix)
+							if snapFname == fname {
+								found = true
+								break
+							}
+						}
+						if !found {
+							log.Infof(ctx, "Removing snap file %s since its not a valid snapshot entry", fname)
+							if err := os.Remove(filepath.Join(rc.snapdir, fname)); err != nil {
+								log.Errorf(ctx, "Failed to remove snap file %s, err: %v", fname, err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 // saveSnap saves the given snapshot
 func (rc *raftNode) saveSnap(snap raftpb.Snapshot) error {
 	// must save the snapshot index to the WAL before saving the
@@ -730,6 +765,19 @@ func (rc *raftNode) loadSnapshot(ctx context.Context) *raftpb.Snapshot {
 	snapshot, err := rc.snapshotter.Load()
 	if err != nil && err != snap.ErrNoSnapshot {
 		log.Fatalf(ctx, "Error loading snapshot (%v)", err)
+	}
+	if wal.Exist(rc.waldir) && err != snap.ErrNoSnapshot {
+		// ValidSnapshotEntries returns the snapshots that are valid (which have index <= last committed index in hard state)
+		walSnaps, err := wal.ValidSnapshotEntries(rc.lg, rc.waldir)
+		if err != nil {
+			log.Errorf(ctx, "Failed to read wal snapshots, err: %v", err)
+			return snapshot
+		}
+		snapshot, err = rc.snapshotter.LoadNewestAvailable(walSnaps)
+		if err != nil {
+			log.Errorf(ctx, "Failed to load newest available snapshot, err: %v", err)
+			return snapshot
+		}
 	}
 	return snapshot
 }
@@ -1106,6 +1154,7 @@ func (rc *raftNode) startRaft(
 	rc.snapshotter = snap.New(rc.lg, rc.snapdir)
 	rc.snapshotterReady <- rc.snapshotter
 
+	rc.gcInvalidSnapshots(ctx)
 	rc.wal = rc.replayWAL(ctx)
 
 	selfID := raftID(rc.nodeID)
@@ -1414,6 +1463,7 @@ func (rc *raftNode) serveChannels(ctx context.Context) {
 				if err := rc.saveSnap(rd.Snapshot); err != nil {
 					log.Fatal(ctx, err)
 				}
+				// gofail: var crashBeforeSaveHardState struct{}
 			}
 			if err := rc.wal.Save(rd.HardState, rd.Entries); err != nil {
 				log.Fatal(ctx, err)
