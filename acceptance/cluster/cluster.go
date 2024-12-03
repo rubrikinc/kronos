@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"github.com/rubrikinc/kronos/cli"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
+	"math/rand"
 	"testing"
 
 	"fmt"
@@ -69,6 +72,10 @@ const (
 	Stop
 	// Restart a node
 	Restart
+	// Suspend a node (make it idle)
+	Suspend
+	// Resume a suspended node
+	Resume
 )
 
 func (op Operation) String() string {
@@ -79,6 +86,10 @@ func (op Operation) String() string {
 		return "stop"
 	case Restart:
 		return "restart"
+	case Suspend:
+		return "suspend"
+	case Resume:
+		return "resume"
 	default:
 		panic(errors.Errorf("unknown operation %d", op))
 	}
@@ -198,6 +209,255 @@ type TestCluster struct {
 	testDir                  string
 }
 
+type NodeState int32
+
+const (
+	Running NodeState = iota
+	Stopped
+	Suspended
+)
+
+type NetworkState int32
+
+const (
+	Connected NetworkState = iota
+	Disconnected
+	Isolated
+)
+
+type FailureInjectionOptions struct {
+	ReplicaCrashProbability            float32
+	ReplicaRecoverfromCrashProbability float32
+	ReplicaRestartProbability          float32
+	ReplicaSuspendProbability          float32
+	ReplicaResumeProbability           float32
+	NetworkPartitionProbability        float32
+	NetworkPartitionHealProbability    float32
+	IsolateNodeProbability             float32
+	RecoverFromIsolationProbability    float32
+	DefaultNetworkDelayMicro           int32
+	DefaultDelayProbability            float32
+	DefaultNetworkFailureProbability   float32
+}
+
+var DefaultFailureInjectionConfig = FailureInjectionOptions{
+	ReplicaCrashProbability:            0.01, // expected number of healthy nodes should be quorum
+	ReplicaRecoverfromCrashProbability: 0.01,
+	ReplicaRestartProbability:          0.01,
+	ReplicaSuspendProbability:          0.01,
+	ReplicaResumeProbability:           0.01,
+	NetworkPartitionProbability:        0.01,
+	NetworkPartitionHealProbability:    0.01,
+	IsolateNodeProbability:             0.01,
+	RecoverFromIsolationProbability:    0.01,
+	DefaultNetworkDelayMicro:           10000, // 10ms
+	DefaultNetworkFailureProbability:   0.01,
+}
+
+type TestClusterWithFailureInjection struct {
+	*TestCluster
+	state              []NodeState
+	networkState       [][]NetworkState
+	isolatedNodes      map[int]struct{}
+	doNotInjectFailure []bool
+	r                  *rand.Rand
+	FailureInjectionOptions
+}
+
+func (tc *TestClusterWithFailureInjection) Tick() error {
+	// Inject/Recover Replica level failures
+	ctx := context.Background()
+	for i := 0; i < len(tc.Nodes); i++ {
+		if tc.doNotInjectFailure[i] {
+			continue
+		}
+		r := tc.r.Float32()
+		switch tc.state[i] {
+		case Running:
+			if r < tc.ReplicaCrashProbability {
+				tc.state[i] = Stopped
+				log.Infof(ctx, "Injecting crash on node %d", i)
+				err := tc.RunOperation(context.Background(), Stop, i)
+				if err != nil {
+					return err
+				}
+			} else if r < tc.ReplicaCrashProbability+tc.ReplicaRestartProbability {
+				log.Infof(ctx, "Injecting restart on node %d", i)
+				err := tc.RunOperation(context.Background(), Restart, i)
+				if err != nil {
+					return err
+				}
+			} else if r < tc.ReplicaCrashProbability+tc.ReplicaRestartProbability+tc.ReplicaSuspendProbability {
+				log.Infof(ctx, "Injecting suspend on node %d", i)
+				tc.state[i] = Suspended
+				err := tc.RunOperation(context.Background(), Suspend, i)
+				if err != nil {
+					return err
+				}
+			}
+		case Stopped:
+			if r < tc.ReplicaRecoverfromCrashProbability {
+				log.Infof(ctx, "Recovering from crash on node %d", i)
+				tc.state[i] = Running
+				err := tc.RunOperation(context.Background(), Start, i)
+				if err != nil {
+					return err
+				}
+			}
+		case Suspended:
+			if r < tc.ReplicaResumeProbability {
+				log.Infof(ctx, "Resuming node %d", i)
+				tc.state[i] = Running
+				err := tc.RunOperation(context.Background(), Resume, i)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Inject/Recover Network level failures
+	for i := 0; i < len(tc.Nodes); i++ {
+		for j := i + 1; j < len(tc.Nodes); j++ {
+			if tc.doNotInjectFailure[i] || tc.doNotInjectFailure[j] {
+				continue
+			}
+			r := tc.r.Float32()
+			switch tc.networkState[i][j] {
+			case Connected:
+				if r < tc.NetworkPartitionProbability {
+					log.Infof(ctx, "Partitioning nodes %d and %d", i, j)
+					tc.networkState[i][j] = Disconnected
+					tc.TestCluster.raftProxy[i][j].SetFailureProbability(1)
+					tc.TestCluster.grpcProxy[i][j].SetFailureProbability(1)
+				}
+			case Disconnected:
+				if r < tc.NetworkPartitionHealProbability {
+					log.Infof(ctx, "Healing partition between nodes %d and %d", i, j)
+					tc.networkState[i][j] = Connected
+					tc.TestCluster.raftProxy[i][j].SetFailureProbability(tc.DefaultNetworkFailureProbability)
+					tc.TestCluster.grpcProxy[i][j].SetFailureProbability(tc.DefaultNetworkFailureProbability)
+				}
+			}
+		}
+	}
+
+	// With some probability, isolate a node from the network
+	for i := 0; i < len(tc.Nodes); i++ {
+		if tc.doNotInjectFailure[i] {
+			continue
+		}
+		r := tc.r.Float32()
+		if _, ok := tc.isolatedNodes[i]; ok {
+			if r < tc.RecoverFromIsolationProbability {
+				log.Infof(ctx, "Recovering from network isolation on node %d", i)
+				delete(tc.isolatedNodes, i)
+				for j := 0; j < len(tc.Nodes); j++ {
+					if i == j {
+						continue
+					}
+					tc.networkState[i][j] = Connected
+					tc.TestCluster.raftProxy[i][j].SetFailureProbability(tc.DefaultNetworkFailureProbability)
+					tc.TestCluster.grpcProxy[i][j].SetFailureProbability(tc.DefaultNetworkFailureProbability)
+					tc.TestCluster.raftProxy[j][i].SetFailureProbability(tc.DefaultNetworkFailureProbability)
+					tc.TestCluster.grpcProxy[j][i].SetFailureProbability(tc.DefaultNetworkFailureProbability)
+				}
+			}
+		} else {
+			if r < tc.IsolateNodeProbability {
+				log.Infof(ctx, "Isolating node %d", i)
+				tc.isolatedNodes[i] = struct{}{}
+				for j := 0; j < len(tc.Nodes); j++ {
+					if i == j {
+						continue
+					}
+					tc.networkState[i][j] = Isolated
+					tc.networkState[j][i] = Isolated
+					tc.TestCluster.raftProxy[i][j].SetFailureProbability(1)
+					tc.TestCluster.raftProxy[j][i].SetFailureProbability(1)
+					tc.TestCluster.grpcProxy[i][j].SetFailureProbability(1)
+					tc.TestCluster.grpcProxy[j][i].SetFailureProbability(1)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (tc *TestClusterWithFailureInjection) Close() error {
+	for i := 0; i < len(tc.Nodes); i++ {
+		if tc.state[i] == Suspended {
+			tc.RunOperation(context.Background(), Resume, i)
+		}
+	}
+	return tc.TestCluster.Close()
+}
+
+func (tc *TestClusterWithFailureInjection) RemoveAllFaults(nodes []int) {
+	log.Infof(context.Background(), "Removing all faults from nodes %v", nodes)
+	for _, i := range nodes {
+		tc.doNotInjectFailure[i] = true
+	}
+	for i := 0; i < len(nodes); i++ {
+		for j := 0; j < len(nodes); j++ {
+			if i == j {
+				continue
+			}
+			tc.networkState[nodes[i]][nodes[j]] = Connected
+			tc.TestCluster.raftProxy[nodes[i]][nodes[j]].SetFailureProbability(tc.DefaultNetworkFailureProbability)
+			tc.TestCluster.grpcProxy[nodes[i]][nodes[j]].SetFailureProbability(tc.DefaultNetworkFailureProbability)
+		}
+	}
+	for _, i := range nodes {
+		switch tc.state[i] {
+		case Stopped:
+			tc.RunOperation(context.Background(), Start, i)
+		case Suspended:
+			tc.RunOperation(context.Background(), Resume, i)
+		default:
+		}
+	}
+}
+
+func (tc *TestClusterWithFailureInjection) AssertTimeInvariants(ctx context.Context, a *require.Assertions, threshold time.Duration, shouldServeTime map[int]struct{}) {
+	var nodesServingTime atomic.Int32
+	times := make([]int64, len(tc.Nodes))
+	var wg sync.WaitGroup
+	for i := 0; i < len(tc.Nodes); i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			t, err := tc.Time(ctx, i)
+			if _, ok := shouldServeTime[i]; ok {
+				a.NoError(err, "Node %d should serve time", i)
+			}
+			if err != nil {
+				return
+			}
+			nodesServingTime.Inc()
+			times[i] = t
+		}(i)
+	}
+	wg.Wait()
+	timesMax := int64(0)
+	timesMin := int64(0)
+	for _, t := range times {
+		if t == 0 {
+			continue
+		}
+		if t > timesMax {
+			timesMax = t
+		}
+		if t < timesMin || timesMin == 0 {
+			timesMin = t
+		}
+	}
+	a.Less(timesMax-timesMin, int64(threshold), fmt.Sprintf("Time difference between nodes serving time is too high - %v", time.Duration(timesMax-timesMin)))
+	if nodesServingTime.Load() > 0 {
+		log.Infof(ctx, "Time difference between nodes serving time is %v", time.Duration(timesMax-timesMin))
+	}
+}
+
 func (tc *TestCluster) runGoremanWithArgs(args ...string) (string, error) {
 	goremanBinary, err := absoluteBinaryPath("goreman")
 	if err != nil {
@@ -245,6 +505,8 @@ func (tc *TestCluster) RunOperation(ctx context.Context, op Operation, indices .
 			tc.Nodes[index].IsRunning = true
 		case Stop:
 			tc.Nodes[index].IsRunning = false
+		case Suspend, Resume:
+			// Do nothing
 		default:
 			return errors.Errorf("unsupported value of op %v", op)
 		}
@@ -748,6 +1010,48 @@ func NewCluster(ctx context.Context, cc ClusterConfig) (*TestCluster, error) {
 	return newCluster(ctx, cc, true /* insecure */)
 }
 
+func NewClusterWithFailureInjection(ctx context.Context, cc ClusterConfig, opts FailureInjectionOptions) (*TestClusterWithFailureInjection, error) {
+	seed := time.Now().UnixNano()
+	log.Infof(ctx, "Seed: %v", seed)
+	rand.Seed(seed)
+	tc, err := newCluster(ctx, cc, true)
+	if err != nil {
+		return nil, err
+	}
+	tcWithFailureInjection := &TestClusterWithFailureInjection{
+		TestCluster:             tc,
+		state:                   make([]NodeState, len(tc.Nodes)),
+		networkState:            make([][]NetworkState, len(tc.Nodes)),
+		isolatedNodes:           make(map[int]struct{}),
+		doNotInjectFailure:      make([]bool, len(tc.Nodes)),
+		FailureInjectionOptions: opts,
+		r:                       rand.New(rand.NewSource(seed)),
+	}
+
+	for i := 0; i < len(tc.Nodes); i++ {
+		tcWithFailureInjection.doNotInjectFailure[i] = false
+		tcWithFailureInjection.state[i] = Running
+		tcWithFailureInjection.networkState[i] = make([]NetworkState, len(tc.Nodes))
+		for j := 0; j < len(tc.Nodes); j++ {
+			tcWithFailureInjection.networkState[i][j] = Connected
+			if i == j {
+				continue
+			}
+			tcWithFailureInjection.TestCluster.raftProxy[i][j].SetDelayConfig(failuregen.DelayConfig{
+				MaxDelayMicros:   opts.DefaultNetworkDelayMicro,
+				DelayProbability: opts.DefaultDelayProbability,
+			})
+			tcWithFailureInjection.TestCluster.grpcProxy[i][j].SetDelayConfig(failuregen.DelayConfig{
+				MaxDelayMicros:   opts.DefaultNetworkDelayMicro,
+				DelayProbability: opts.DefaultDelayProbability,
+			})
+			tcWithFailureInjection.TestCluster.raftProxy[i][j].SetFailureProbability(opts.DefaultNetworkFailureProbability)
+			tcWithFailureInjection.TestCluster.grpcProxy[i][j].SetFailureProbability(opts.DefaultNetworkFailureProbability)
+		}
+	}
+	return tcWithFailureInjection, nil
+}
+
 func (tc *TestCluster) createProxy(ctx context.Context, i, j int) error {
 	proxy, err := tcpproxy.NewTCPProxy(
 		ctx,
@@ -1092,4 +1396,11 @@ func (tc *TestCluster) AddEnv(ctx context.Context, node int, s string) {
 	mp := make(map[int]string)
 	mp[node] = s
 	tc.generateProcfile(ctx, mp)
+}
+
+func (tc *TestCluster) InjectNetworkPartition(i int, j int, prob float32) {
+	tc.raftProxy[i][j].SetFailureProbability(prob)
+	tc.grpcProxy[i][j].SetFailureProbability(prob)
+	tc.raftProxy[j][i].SetFailureProbability(prob)
+	tc.grpcProxy[j][i].SetFailureProbability(prob)
 }

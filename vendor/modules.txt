@@ -74,7 +74,7 @@ github.com/prometheus/common/model
 github.com/prometheus/procfs
 github.com/prometheus/procfs/internal/fs
 github.com/prometheus/procfs/internal/util
-# github.com/rubrikinc/failure-test-utils v0.0.0-20240831074746-82dbc141e899
+# github.com/rubrikinc/failure-test-utils v0.0.0-20241004235910-5d36eadcf83c
 ## explicit; go 1.19
 github.com/rubrikinc/failure-test-utils/failuregen
 github.com/rubrikinc/failure-test-utils/log

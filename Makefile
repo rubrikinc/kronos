@@ -16,7 +16,7 @@ install:
 	@$(GO_INSTALL) -v ./cmd/...
 
 goreman:
-	@$(GO_INSTALL) github.com/mattn/goreman@v0.3.15
+	@$(GO_INSTALL) github.com/mohanr-rubrik/goreman@latest
 
 getaddrinfo:
 	gcc -D_GNU_SOURCE -shared -fPIC -o $(PWD)/getaddrinfo.so acceptance/cutils/getaddrinfo.c -ldl
