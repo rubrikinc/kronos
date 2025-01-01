@@ -1,0 +1,3 @@
+[submodule "cdeps/sysfail"]
+	path = cdeps/sysfail
+	url = git@github.com:rubrikinc/sysfail.git

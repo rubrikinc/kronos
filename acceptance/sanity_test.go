@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"fmt"
 	"github.com/pkg/errors"
 	"math"
 	"math/rand"
@@ -1056,5 +1057,91 @@ func TestDoNotUseSeedsBeyondBootstrap(t *testing.T) {
 	nodes := c.NodesIncludingRemoved()
 	if node, ok := nodes[nodeId]; !ok || !node.IsRemoved {
 		t.Fatalf("node %s should be present in the cluster", nodeId)
+	}
+}
+
+func TestSysfail(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), 2*testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 7
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			RaftSnapCount:            1,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+	time.Sleep(bootstrapTime)
+
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
+	mp := make(map[int]string)
+	for i := 0; i < numNodes; i++ {
+		mp[i] = "SYSFAIL_PROB=0.3"
+	}
+	a.NoError(tc.GenerateProcFile(ctx, mp))
+
+	if err := tc.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tc.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		time.Sleep(bootstrapTime)
+		a.NoError(tc.Stop(ctx))
+		a.NoError(tc.Start(ctx))
+	}
+	for i := 0; i < numNodes; i++ {
+		mp[i] = "SYSFAIL_PROB=0.0"
+	}
+	a.NoError(tc.GenerateProcFile(ctx, mp))
+	a.NoError(tc.Stop(ctx))
+	a.NoError(tc.Start(ctx))
+	time.Sleep(bootstrapTime)
+	_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
+	a.NoError(err)
+	// raft's persistent state is validated using the time
+	// check rest of the pieces of persistent state are consistent
+	// i.e cluster_info, node_info and node-uuid
+	nodes := make(map[string]kronospb.NodeAddr)
+	for i := 0; i < numNodes; i++ {
+		id, err := metadata.FetchNodeID(tc.Nodes[i].DataDir())
+		a.NoError(err)
+		nodes[id.String()] = kronospb.NodeAddr{
+			Host: fmt.Sprintf("kronos%d", i+1),
+			Port: tc.Nodes[i].RaftPort,
+		}
+	}
+
+	clusterUuid, err := metadata.FetchClusterUUID(tc.Nodes[0].DataDir())
+	a.NoError(err)
+	for i := 0; i < numNodes; i++ {
+		c, err := metadata.FetchClusterUUID(tc.Nodes[i].DataDir())
+		a.NoError(err)
+		a.Equal(clusterUuid, c)
+	}
+
+	for i := 0; i < numNodes; i++ {
+		c, err := metadata.LoadCluster(tc.Nodes[i].DataDir(), true)
+		a.NoError(err)
+		mp := c.ActiveNodes()
+		for id, node := range mp {
+			if node.IsRemoved {
+				continue
+			}
+			addr, ok := nodes[id]
+			a.True(ok)
+			a.Equal(addr.Host, node.RaftAddr.Host)
+			a.Equal(addr.Port, node.RaftAddr.Port)
+		}
 	}
 }

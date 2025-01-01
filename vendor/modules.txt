@@ -80,6 +80,9 @@ github.com/rubrikinc/failure-test-utils/failuregen
 github.com/rubrikinc/failure-test-utils/log
 github.com/rubrikinc/failure-test-utils/randutil
 github.com/rubrikinc/failure-test-utils/tcpproxy
+# github.com/rubrikinc/sysfail v0.0.0-20241220191730-c9d931868a13 => github.com/rubrikinc/sysfail/src/go v0.0.0-20241220191730-c9d931868a13
+## explicit; go 1.22.5
+github.com/rubrikinc/sysfail
 # github.com/sasha-s/go-deadlock v0.2.0
 ## explicit
 github.com/sasha-s/go-deadlock
@@ -96,9 +99,10 @@ github.com/spf13/cobra
 # github.com/spf13/pflag v1.0.5
 ## explicit; go 1.12
 github.com/spf13/pflag
-# github.com/stretchr/testify v1.8.4
-## explicit; go 1.20
+# github.com/stretchr/testify v1.10.0
+## explicit; go 1.17
 github.com/stretchr/testify/assert
+github.com/stretchr/testify/assert/yaml
 github.com/stretchr/testify/require
 # github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2
 ## explicit
@@ -257,3 +261,4 @@ gopkg.in/yaml.v3
 # go.etcd.io/etcd/server/v3 => github.com/cockroachdb/etcd/server/v3 v3.0.0-20230718104326-dbe02a550754
 # go.etcd.io/etcd/pkg/v3 => github.com/cockroachdb/etcd/pkg/v3 v3.0.0-20230718104326-dbe02a550754
 # go.etcd.io/etcd/raft/v3 => github.com/cockroachdb/etcd/raft/v3 v3.0.0-20230718104326-dbe02a550754
+# github.com/rubrikinc/sysfail => github.com/rubrikinc/sysfail/src/go v0.0.0-20241220191730-c9d931868a13

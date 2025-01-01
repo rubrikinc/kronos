@@ -94,6 +94,7 @@ int getaddrinfo(const char *node, const char *service,
         ai->ai_socktype = SOCK_STREAM;
         ai->ai_protocol = IPPROTO_TCP;
         ai->ai_addrlen = sizeof(struct sockaddr_in);
+        ai->ai_canonname = NULL;
 
         struct sockaddr_in *sa = (struct sockaddr_in *)malloc(sizeof(struct sockaddr_in));
         if (sa == NULL)
@@ -123,6 +124,7 @@ int getaddrinfo(const char *node, const char *service,
 
         // Set the ai_addr field
         ai->ai_addr = (struct sockaddr *)sa;
+        ai->ai_next = NULL;
 
         // Set the res field
         *res = ai;
@@ -149,7 +151,10 @@ void freeaddrinfo(struct addrinfo *res)
     while (res != NULL)
     {
         struct addrinfo *next = res->ai_next;
-        free(res->ai_addr);
+        if (res->ai_addr != NULL)
+        {
+            free(res->ai_addr);
+        }
         if (res->ai_canonname != NULL)
         {
             free(res->ai_canonname);

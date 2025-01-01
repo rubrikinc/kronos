@@ -845,7 +845,7 @@ func (tc *TestCluster) ReIP(ctx context.Context) error {
 	}
 	tc.seedHosts = newSeedHosts
 
-	if err = tc.generateProcfile(ctx, nil); err != nil {
+	if err = tc.GenerateProcFile(ctx, nil); err != nil {
 		return err
 	}
 
@@ -892,7 +892,7 @@ func (tc *TestCluster) Status(hostIdx int, local bool) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
-func (tc *TestCluster) generateProcfile(ctx context.Context, addEnvs map[int]string) error {
+func (tc *TestCluster) GenerateProcFile(ctx context.Context, addEnvs map[int]string) error {
 	pf, err := tc.Fs.OpenFile(tc.Procfile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -1209,7 +1209,7 @@ func newCluster(ctx context.Context, cc ClusterConfig, insecure bool) (*TestClus
 		return nil, err
 	}
 
-	if err = tc.generateProcfile(ctx, nil); err != nil {
+	if err = tc.GenerateProcFile(ctx, nil); err != nil {
 		return nil, err
 	}
 
@@ -1395,7 +1395,7 @@ func (tc *TestCluster) FindLeader(t *testing.T, a *assert.Assertions) int {
 func (tc *TestCluster) AddEnv(ctx context.Context, node int, s string) {
 	mp := make(map[int]string)
 	mp[node] = s
-	tc.generateProcfile(ctx, mp)
+	tc.GenerateProcFile(ctx, mp)
 }
 
 func (tc *TestCluster) InjectNetworkPartition(i int, j int, prob float32) {

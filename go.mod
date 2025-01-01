@@ -1,6 +1,6 @@
 module github.com/rubrikinc/kronos
 
-go 1.19
+go 1.22.5
 
 require (
 	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f
@@ -9,7 +9,7 @@ require (
 	github.com/rubrikinc/failure-test-utils v0.0.0-20241004235910-5d36eadcf83c
 	github.com/spf13/afero v1.1.2
 	github.com/spf13/cobra v1.1.1
-	github.com/stretchr/testify v1.8.4
+	github.com/stretchr/testify v1.10.0
 	go.uber.org/atomic v1.9.0 // CrDB 22.2 doesn't play well with v1.10.0 due to lack of generics in go 1.19
 	golang.org/x/sync v0.0.0-20220513210516-0976fa681c29
 	google.golang.org/grpc v1.32.0
@@ -18,6 +18,7 @@ require (
 require (
 	github.com/gogo/status v1.1.1
 	github.com/petermattis/goid v0.0.0-20180202154549-b0b1615b78e5
+	github.com/rubrikinc/sysfail v0.0.0-20241220191730-c9d931868a13
 	github.com/sasha-s/go-deadlock v0.2.0
 	github.com/sirupsen/logrus v1.8.1
 	go.etcd.io/etcd/pkg/v3 v3.5.0-alpha.0.0.20210320072418-e51c697ec6e8
@@ -66,3 +67,5 @@ replace go.etcd.io/etcd/server/v3 => github.com/cockroachdb/etcd/server/v3 v3.0.
 replace go.etcd.io/etcd/pkg/v3 => github.com/cockroachdb/etcd/pkg/v3 v3.0.0-20230718104326-dbe02a550754
 
 replace go.etcd.io/etcd/raft/v3 => github.com/cockroachdb/etcd/raft/v3 v3.0.0-20230718104326-dbe02a550754
+
+replace github.com/rubrikinc/sysfail => github.com/rubrikinc/sysfail/src/go v0.0.0-20241220191730-c9d931868a13

@@ -2,9 +2,13 @@ package cli
 
 import (
 	"context"
+	"github.com/rubrikinc/sysfail"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
+	"syscall"
 
 	"github.com/rubrikinc/kronos/protoutil"
 
@@ -303,7 +307,134 @@ func runStart() {
 		log.Fatal(ctx, err)
 	}
 	defer server.Stop()
+	if startCtx.testMode {
+		setupSysFailFailureInjection(ctx)
+	}
+
 	if err := server.RunServer(ctx); err != nil {
+		log.Fatal(ctx, err)
+	}
+}
+
+func setupSysFailFailureInjection(ctx context.Context) {
+	log.Infof(ctx, "Setting up sysfail failure injection")
+	p := 0.0
+	if os.Getenv("SYSFAIL_PROB") != "" {
+		var err error
+		p, err = strconv.ParseFloat(os.Getenv("SYSFAIL_PROB"), 32)
+		if err != nil {
+			log.Fatalf(ctx, "Failed to parse SYSFAIL_PROB: %s", err)
+		}
+	}
+	plan, err := sysfail.NewPlan(
+		sysfail.ThreadDiscoveryPoll,
+		1000,
+		[]*sysfail.SyscallOutcome{
+			{
+				Syscall: syscall.SYS_WRITE,
+				Outcome: sysfail.Outcome{
+					Fail:         sysfail.Probability{P: p},
+					Delay:        sysfail.Probability{P: p},
+					MaxDelayUsec: 1000,
+					Ctx:          nil,
+					Eligible:     sysfail.Eligibility{Eligible: nil, Type: sysfail.EligibleIfFDNotStdInOutErr},
+					NumErrors:    1,
+					ErrorWeights: []sysfail.ErrorWeight{{Nerror: int(syscall.EIO), Weight: 1.0}},
+				},
+			},
+			{
+				Syscall: syscall.SYS_FSYNC,
+				Outcome: sysfail.Outcome{
+					Fail:         sysfail.Probability{P: p},
+					Delay:        sysfail.Probability{P: p},
+					MaxDelayUsec: 1000,
+					Ctx:          nil,
+					Eligible:     sysfail.Eligibility{Eligible: nil, Type: sysfail.EligibleIfFDNotStdInOutErr},
+					NumErrors:    1,
+					ErrorWeights: []sysfail.ErrorWeight{{Nerror: int(syscall.EIO), Weight: 1.0}},
+				},
+			},
+			{
+				Syscall: syscall.SYS_FDATASYNC,
+				Outcome: sysfail.Outcome{
+					Fail:         sysfail.Probability{P: p},
+					Delay:        sysfail.Probability{P: p},
+					MaxDelayUsec: 1000,
+					Ctx:          nil,
+					Eligible:     sysfail.Eligibility{Eligible: nil, Type: sysfail.EligibleIfFDNotStdInOutErr},
+					NumErrors:    1,
+					ErrorWeights: []sysfail.ErrorWeight{{Nerror: int(syscall.EIO), Weight: 1.0}},
+				},
+			},
+			{
+				Syscall: syscall.SYS_PWRITEV,
+				Outcome: sysfail.Outcome{
+					Fail:         sysfail.Probability{P: p},
+					Delay:        sysfail.Probability{P: p},
+					MaxDelayUsec: 1000,
+					Ctx:          nil,
+					Eligible:     sysfail.Eligibility{Eligible: nil, Type: sysfail.EligibleIfFDNotStdInOutErr},
+					NumErrors:    1,
+					ErrorWeights: []sysfail.ErrorWeight{{Nerror: int(syscall.EIO), Weight: 1.0}},
+				},
+			},
+			{
+				Syscall: syscall.SYS_PWRITE64,
+				Outcome: sysfail.Outcome{
+					Fail:         sysfail.Probability{P: p},
+					Delay:        sysfail.Probability{P: p},
+					MaxDelayUsec: 1000,
+					Ctx:          nil,
+					Eligible:     sysfail.Eligibility{Eligible: nil, Type: sysfail.EligibleIfFDNotStdInOutErr},
+					NumErrors:    1,
+					ErrorWeights: []sysfail.ErrorWeight{{Nerror: int(syscall.EIO), Weight: 1.0}},
+				},
+			},
+			{
+				Syscall: syscall.SYS_WRITEV,
+				Outcome: sysfail.Outcome{
+					Fail:         sysfail.Probability{P: p},
+					Delay:        sysfail.Probability{P: p},
+					MaxDelayUsec: 1000,
+					Ctx:          nil,
+					Eligible:     sysfail.Eligibility{Eligible: nil, Type: sysfail.EligibleIfFDNotStdInOutErr},
+					NumErrors:    1,
+					ErrorWeights: []sysfail.ErrorWeight{{Nerror: int(syscall.EIO), Weight: 1.0}},
+				},
+			},
+			{
+				Syscall: syscall.SYS_CLOSE,
+				Outcome: sysfail.Outcome{
+					Fail:         sysfail.Probability{P: p},
+					Delay:        sysfail.Probability{P: p},
+					MaxDelayUsec: 1000,
+					Ctx:          nil,
+					Eligible:     sysfail.Eligibility{Eligible: nil, Type: sysfail.EligibleIfFDNotStdInOutErr},
+					NumErrors:    1,
+					ErrorWeights: []sysfail.ErrorWeight{{Nerror: int(syscall.EIO), Weight: 1.0}},
+				},
+			},
+			{
+				Syscall: syscall.SYS_RENAMEAT,
+				Outcome: sysfail.Outcome{
+					Fail:         sysfail.Probability{P: p},
+					Delay:        sysfail.Probability{P: p},
+					MaxDelayUsec: 1000,
+					Ctx:          nil,
+					Eligible:     sysfail.Eligibility{Eligible: nil, Type: sysfail.EligibleIfFDNotStdInOutErr},
+					NumErrors:    1,
+					ErrorWeights: []sysfail.ErrorWeight{{Nerror: int(syscall.EINVAL), Weight: 1.0}},
+				},
+			},
+		},
+		nil,
+		nil,
+	)
+	if err != nil {
+		log.Fatal(ctx, err)
+	}
+	_, err = sysfail.StartSession(plan)
+	if err != nil {
 		log.Fatal(ctx, err)
 	}
 }
