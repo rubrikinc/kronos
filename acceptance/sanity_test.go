@@ -764,7 +764,7 @@ func TestFirstSeedDoesntFormNewCluster(t *testing.T) {
 		_, _, err = tc.ValidateTimeInConsensus(ctx, 50*time.Millisecond, false)
 		a.NoError(err)
 
-		data, err := tc.Status(idx, false /*local*/)
+		data, err := tc.Status(idx, false, false)
 		a.NoError(err)
 		nodeInfos := nodeInfosFromBytes(data, a)
 		a.Equal(len(tc.Nodes), len(nodeInfos))

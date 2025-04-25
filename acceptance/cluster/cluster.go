@@ -4,15 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"github.com/rubrikinc/kronos/cli"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"go.uber.org/atomic"
-	"math/rand"
-	"testing"
-
 	"fmt"
 	"math"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -21,11 +15,19 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
+
+	"github.com/rubrikinc/kronos/cli"
 
 	"github.com/rubrikinc/failure-test-utils/failuregen"
 	tcpLog "github.com/rubrikinc/failure-test-utils/log"
 	"github.com/rubrikinc/failure-test-utils/tcpproxy"
+
 	"github.com/rubrikinc/kronos/checksumfile"
 
 	"github.com/pkg/errors"
@@ -861,12 +863,36 @@ func (tc *TestCluster) ReIP(ctx context.Context) error {
 }
 
 // Status returns kronos status fetched via hostIdx
-func (tc *TestCluster) Status(hostIdx int, local bool) ([]byte, error) {
-	statusArgs := []string{
-		"status",
-		"--format", "json",
-		"--raft-addr", fmt.Sprintf("%s:%s", tc.Nodes[hostIdx].AdvertiseHost, tc.Nodes[hostIdx].RaftPort),
-		fmt.Sprintf("--local=%t", local),
+func (tc *TestCluster) Status(
+	hostIdx int,
+	local bool,
+	prettyPrint bool,
+) ([]byte, error) {
+	var statusArgs []string
+	if !prettyPrint {
+		statusArgs = []string{
+			"status",
+			"--format",
+			"json",
+			"--raft-addr",
+			fmt.Sprintf(
+				"%s:%s",
+				tc.Nodes[hostIdx].AdvertiseHost,
+				tc.Nodes[hostIdx].RaftPort,
+			),
+			fmt.Sprintf("--local=%t", local),
+		}
+	} else {
+		statusArgs = []string{
+			"status",
+			"--raft-addr",
+			fmt.Sprintf(
+				"%s:%s",
+				tc.Nodes[hostIdx].AdvertiseHost,
+				tc.Nodes[hostIdx].RaftPort,
+			),
+			fmt.Sprintf("--local=%t", local),
+		}
 	}
 	if len(tc.CertsDir) > 0 {
 		statusArgs = append(statusArgs, "--certs-dir", tc.CertsDir)
@@ -885,7 +911,7 @@ func (tc *TestCluster) Status(hostIdx int, local bool) ([]byte, error) {
 		if _, ok := err.(*exec.ExitError); !ok {
 			return nil, err
 		}
-		if stderr.Len() != 0 {
+		if !prettyPrint && stderr.Len() != 0 {
 			return nil, err
 		}
 	}
@@ -1377,7 +1403,7 @@ func (tc *TestCluster) findNodeWithRaftId(t *testing.T, id string) int {
 }
 
 func (tc *TestCluster) FindLeader(t *testing.T, a *assert.Assertions) int {
-	data, err := tc.Status(0, false /*local*/)
+	data, err := tc.Status(0, false, false)
 	a.NoError(err)
 	var nodeInfos []cli.NodeInfo
 	err = json.Unmarshal(data, &nodeInfos)

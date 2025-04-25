@@ -22,6 +22,7 @@ func (e errMap) Error() string {
 }
 
 const (
+	raftErrTag     = "raft"
 	grpcAddrErrTag = "grpc-addr"
 	statusErrTag   = "status"
 	timeErrTag     = "time"
@@ -92,23 +93,6 @@ func (n nodeInfoFetcher) fetch(
 		go func(ndInfo *NodeInfo) {
 			defer wg.Done()
 
-			client, err := kronoshttp.NewClusterClient(ndInfo.RaftAddr, tlsInfo)
-			if err != nil {
-				ndInfo.addError(err, grpcAddrErrTag)
-				return
-			}
-			defer client.Close()
-			raftStatus, err := client.RaftStatus(ctx)
-			if err != nil {
-				ndInfo.addError(err, statusErrTag)
-				return
-			}
-
-			ndInfo.RaftLeader = raftStatus.RaftLeader
-			ndInfo.RaftTerm = raftStatus.RaftTerm
-			ndInfo.AppliedIndex = raftStatus.AppliedIndex
-			ndInfo.CommittedIndex = raftStatus.CommittedIndex
-
 			grpcAddr, err := fetchGRPCAddr(ctx, ndInfo.RaftAddr, certsDir)
 			if err != nil {
 				ndInfo.addError(err, grpcAddrErrTag)
@@ -141,6 +125,24 @@ func (n nodeInfoFetcher) fetch(
 					ndInfo.Delta = st.Delta
 				}
 			}
+
+			client, err := kronoshttp.NewClusterClient(ndInfo.RaftAddr, tlsInfo)
+			if err != nil {
+				ndInfo.addError(err, raftErrTag)
+				return
+			}
+			defer client.Close()
+			raftStatus, err := client.RaftStatus(ctx)
+			if err != nil {
+				ndInfo.addError(err, raftErrTag)
+				return
+			}
+
+			ndInfo.RaftLeader = raftStatus.RaftLeader
+			ndInfo.RaftTerm = raftStatus.RaftTerm
+			ndInfo.AppliedIndex = raftStatus.AppliedIndex
+			ndInfo.CommittedIndex = raftStatus.CommittedIndex
+
 		}(infoStores[i])
 	}
 	wg.Wait()

@@ -63,7 +63,7 @@ func TestKronosStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.NoError(tc.RemoveNode(ctx, len(tc.Nodes)-1, -1, ""))
-	data, err := tc.Status(rand.Intn(len(tc.Nodes)-1), false /*local*/)
+	data, err := tc.Status(rand.Intn(len(tc.Nodes)-1), false, false)
 	a.NoError(err)
 	nodeInfos := nodeInfosFromBytes(data, a)
 	// removed node should not be shown in status
@@ -95,7 +95,7 @@ func TestKronosStatus(t *testing.T) {
 	a.NotEqual(0, numNonZeroDeltas)
 
 	// verify that --local flag is respected
-	data, err = tc.Status(rand.Intn(len(tc.Nodes)-1), true /*local*/)
+	data, err = tc.Status(rand.Intn(len(tc.Nodes)-1), true, false)
 	a.NoError(err)
 	nodeInfos = nodeInfosFromBytes(data, a)
 
@@ -115,7 +115,7 @@ func TestKronosStatus(t *testing.T) {
 
 	// verify that errors are reported
 	a.NoError(tc.RunOperation(ctx, cluster.Stop, 2))
-	data, err = tc.Status(1, false /*local*/)
+	data, err = tc.Status(1, false, false)
 	a.NoError(err)
 	var partials []map[string]interface{}
 	a.NoError(json.Unmarshal(data, &partials))
@@ -129,4 +129,31 @@ func TestKronosStatus(t *testing.T) {
 	}
 	// There should be exactly one error as only one node was stopped.
 	a.Equal(1, numErrs)
+}
+
+func TestPrettyStatus(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	numNodes := 4
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			NumNodes:                 numNodes,
+			RaftSnapCount:            2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+	time.Sleep(kronosStabilizationBufferTime)
+	a := assert.New(t)
+	_, err = tc.Status(0, false, true)
+	a.NoError(err)
+	a.NoError(tc.RunOperation(ctx, cluster.Stop, 2))
+	_, err = tc.Status(0, false, true)
+	a.NoError(err)
 }
