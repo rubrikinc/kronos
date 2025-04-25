@@ -9,12 +9,6 @@ import (
 	"github.com/rubrikinc/kronos/kronosutil/log"
 )
 
-// init sets the raft logger for kronos/etcd/raft. This is different from
-// pkg/storage/raft.go as this updates the logger of the raft used by Kronos
-func init() {
-	raft.SetLogger(&raftLogger{ctx: context.Background()})
-}
-
 // raftLogger is used as a logger for etcd/raft so that its logs are a part of
 // kronos logs
 type raftLogger struct {
@@ -70,4 +64,8 @@ func (r *raftLogger) Panic(v ...interface{}) {
 func (r *raftLogger) Panicf(format string, v ...interface{}) {
 	log.ErrorfDepth(r.ctx, 1, format, v...)
 	panic(fmt.Sprintf(format, v...))
+}
+
+func NewRaftLogger() raft.Logger {
+	return &raftLogger{ctx: context.Background()}
 }

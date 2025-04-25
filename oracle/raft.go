@@ -246,7 +246,11 @@ type raftNode struct {
 
 // getNodesIncludingRemoved gets nodes in the cluster metadata from
 // the remote node. It retries internally for 1 minute.
-func (rc *raftNode) getNodesIncludingRemoved(ctx context.Context, remote *kronospb.NodeAddr, timeout time.Duration) (nodes []kronoshttp.Node, err error) {
+func (rc *raftNode) getNodesIncludingRemoved(
+	ctx context.Context,
+	remote *kronospb.NodeAddr,
+	timeout time.Duration,
+) (nodes []kronoshttp.Node, err error) {
 	log.Infof(ctx, "Getting nodes from %v", remote)
 	err = kronoshttp.ForDuration(
 		timeout,
@@ -1167,6 +1171,7 @@ func (rc *raftNode) startRaft(
 		Storage:         rc.raftStorage,
 		MaxSizePerMsg:   16 * 1024,
 		MaxInflightMsgs: 64,
+		Logger:          NewRaftLogger(),
 	}
 
 	lastIndex, err := c.Storage.LastIndex()
