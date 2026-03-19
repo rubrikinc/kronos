@@ -349,6 +349,21 @@ func (rc *raftNode) addNode(id string, addr *kronospb.NodeAddr) error {
 	return nil
 }
 
+// getNodeDescForConfState looks up gossip info for a node that's in the raft
+// conf state. Returns an error if no gossip info is found, which typically
+// indicates a stale or duplicate entry in the Kronos cluster metadata.
+func getNodeDescForConfState(g *gossip.Server, nodeID string) (*kronospb.NodeDescriptor, error) {
+	nodeDesc := g.GetNodeDesc(nodeID)
+	if nodeDesc == nil {
+		return nil, fmt.Errorf(
+			"no gossip info found for node %s present in raft conf state. "+
+				"This likely indicates a stale/duplicate entry in the Kronos cluster. "+
+				"Run 'cockroach kronos cluster remove %s' from a healthy node to fix this",
+			nodeID, nodeID)
+	}
+	return nodeDesc, nil
+}
+
 // updateClusterFromConfState updates the cluster metadata and raft peers with
 // the nodes present in the confstate. It fetches the current cluster metadata
 // from raft leader and other nodes to get the metadata for the nodes which could've
@@ -387,7 +402,10 @@ func (rc *raftNode) updateClusterFromConfState(ctx context.Context, snapshotInde
 	rc.gossip.WaitForNRoundsofGossip(time.Minute, 2)
 	added := 0
 	for nodeID := range nodesToAdd {
-		nodeDesc := rc.gossip.GetNodeDesc(nodeID)
+		nodeDesc, err := getNodeDescForConfState(rc.gossip, nodeID)
+		if err != nil {
+			log.Fatalf(ctx, "%v", err)
+		}
 		addr, err := getNodeAddr(nodeDesc.RaftAddr)
 		if err != nil {
 			log.Errorf(ctx, "Failed to get node addr for node %s, err: %v", nodeID, err)

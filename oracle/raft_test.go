@@ -11,8 +11,10 @@ import (
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 
+	"github.com/rubrikinc/kronos/gossip"
 	"github.com/rubrikinc/kronos/metadata"
 	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/protoutil"
 )
 
 func TestWithProtocol(t *testing.T) {
@@ -406,4 +408,46 @@ func TestSanitizeOutgoingMessages(t *testing.T) {
 			assert.Equal(t, tc.ExpectedMessages, outputMessages)
 		})
 	}
+}
+
+func addNodeDescToGossip(t *testing.T, g *gossip.Server, nodeID, grpcAddr, raftAddr string) {
+	t.Helper()
+	desc := &kronospb.NodeDescriptor{
+		NodeId:   nodeID,
+		GrpcAddr: grpcAddr,
+		RaftAddr: raftAddr,
+	}
+	data, err := protoutil.Marshal(desc)
+	assert.NoError(t, err)
+	g.SetInfo(gossip.NodeDescriptorPrefix.Encode(nodeID), data)
+}
+
+func TestGetNodeDescForConfState(t *testing.T) {
+	a := assert.New(t)
+
+	// Create a gossip server with a different node ID so that SetInfo
+	// callbacks don't skip our test nodes (addPeerLocked skips self).
+	g := gossip.NewServer("", nil, nil, "")
+	g.SetNodeID(context.Background(), "self-node")
+
+	// Populate gossip with valid node descriptors, simulating a real cluster.
+	addNodeDescToGossip(t, g, "ab72bb2588db743e", "10.100.205.10:5766", "https://10.100.205.10:5767")
+	addNodeDescToGossip(t, g, "d5da1f8fecbf0671", "10.100.205.11:5766", "https://10.100.205.11:5767")
+
+	// Valid node: should return descriptor without error.
+	desc, err := getNodeDescForConfState(g, "ab72bb2588db743e")
+	a.NoError(err)
+	a.NotNil(desc)
+	a.Equal("ab72bb2588db743e", desc.NodeId)
+	a.Equal("https://10.100.205.10:5767", desc.RaftAddr)
+
+	// Stale/duplicate raft ID with no gossip info: should return error
+	// with the raft ID and remediation instructions.
+	staleID := "1a97b5675026a901"
+	desc, err = getNodeDescForConfState(g, staleID)
+	a.Nil(desc)
+	a.Error(err)
+	a.Contains(err.Error(), staleID)
+	a.Contains(err.Error(), "cockroach kronos cluster remove "+staleID)
+	a.Contains(err.Error(), "stale/duplicate")
 }
