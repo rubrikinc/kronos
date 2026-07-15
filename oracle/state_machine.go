@@ -8,7 +8,9 @@ import (
 
 // StateMachine is used for managing current oracle and time cap
 type StateMachine interface {
-	// State returns a snapshot of the current state of the state machine.
+	// State returns an immutable snapshot of the current state of the state
+	// machine. Implementations may share the returned pointer across calls,
+	// so callers must not mutate the returned proto.
 	State(ctx context.Context) *kronospb.OracleState
 	// SubmitProposal submits a proposal to update the StateMachine.
 	// This function does not return anything as the proposal is async, it may get
