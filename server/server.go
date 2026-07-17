@@ -152,19 +152,19 @@ func (k *Server) OracleTime(
 		)
 	}
 
-	kt, err := k.KronosTimeNow(ctx)
+	t, _, err := k.KronosTimeNowRaw(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	ut, err := k.KronosUptimeNow(ctx)
+	u, _, err := k.KronosUptimeNowRaw(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	return &kronospb.OracleTimeResponse{
-		Time:   kt.Time,
-		Uptime: ut.Uptime,
+		Time:   t,
+		Uptime: u,
 	}, nil
 }
 
@@ -183,9 +183,24 @@ func (k *Server) KronosUptimeNow(
 	return k.KronosUptime(ctx, &kronospb.KronosUptimeRequest{})
 }
 
+// KronosUptime implements the gRPC KronosUptime method. Local callers should
+// prefer KronosUptimeNowRaw to avoid allocating the response proto.
 func (k *Server) KronosUptime(
 	ctx context.Context, request *kronospb.KronosUptimeRequest,
 ) (*kronospb.KronosUptimeResponse, error) {
+	u, uCap, err := k.KronosUptimeNowRaw(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &kronospb.KronosUptimeResponse{Uptime: u, UptimeCap: uCap}, nil
+}
+
+// KronosUptimeNowRaw returns the current KronosUptime and the current
+// uptime cap as scalar values. It is the allocation-free variant used by
+// the CockroachDB HLC hot path (and by any local caller that does not
+// need the KronosUptimeResponse proto). KronosUptime is a thin wrapper
+// that builds the response for the gRPC entry point.
+func (k *Server) KronosUptimeNowRaw(ctx context.Context) (uptime int64, uptimeCap int64, err error) {
 	oracleData := k.OracleSM.State(ctx)
 
 	k.mu.Lock()
@@ -208,7 +223,7 @@ func (k *Server) KronosUptime(
 		errorMsg = "kronos up time is beyond current time cap, time cap is too stale"
 	}
 	if errorMsg != "" {
-		return nil, errors.Errorf(
+		return 0, 0, errors.Errorf(
 			"%s: kronos uptime: %v, status: %v, uptime time cap: %v",
 			errorMsg, t, currentStatus, oracleData.KronosUptimeCap,
 		)
@@ -220,13 +235,26 @@ func (k *Server) KronosUptime(
 	}
 
 	k.mu.lastKronosUptime = t
-	return &kronospb.KronosUptimeResponse{Uptime: t, UptimeCap: oracleData.KronosUptimeCap}, nil
+	return t, oracleData.KronosUptimeCap, nil
 }
 
 // KronosTimeNow returns the current KronosTime according to the server.
 // If an error is returned, then server might be unitialized or it might have
-// stale data.
+// stale data. Local callers should prefer KronosTimeNowRaw to avoid
+// allocating the response proto.
 func (k *Server) KronosTimeNow(ctx context.Context) (*kronospb.KronosTimeResponse, error) {
+	t, tCap, err := k.KronosTimeNowRaw(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &kronospb.KronosTimeResponse{Time: t, TimeCap: tCap}, nil
+}
+
+// KronosTimeNowRaw returns the current KronosTime and the current time cap
+// as scalar values. It is the allocation-free variant used by the
+// CockroachDB HLC hot path (CDM-552295). KronosTimeNow is a thin wrapper
+// that builds the response proto for the gRPC entry point.
+func (k *Server) KronosTimeNowRaw(ctx context.Context) (time int64, timeCap int64, err error) {
 	oracleData := k.OracleSM.State(ctx)
 
 	k.mu.Lock()
@@ -253,7 +281,7 @@ func (k *Server) KronosTimeNow(ctx context.Context) (*kronospb.KronosTimeRespons
 		errorMsg = "kronos time is beyond current time cap, time cap is too stale"
 	}
 	if errorMsg != "" {
-		return nil, errors.Errorf(
+		return 0, 0, errors.Errorf(
 			"%s: kronos time: %v, status: %v, time cap: %v",
 			errorMsg, t, currentStatus, oracleData.TimeCap,
 		)
@@ -265,7 +293,7 @@ func (k *Server) KronosTimeNow(ctx context.Context) (*kronospb.KronosTimeRespons
 	}
 
 	k.mu.lastKronosTime = t
-	return &kronospb.KronosTimeResponse{Time: t, TimeCap: oracleData.TimeCap}, nil
+	return t, oracleData.TimeCap, nil
 }
 
 func (k *Server) shouldOverthrowOracle(ctx context.Context) bool {

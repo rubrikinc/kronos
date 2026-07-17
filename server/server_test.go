@@ -686,6 +686,80 @@ func TestNodeAddrEqual(t *testing.T) {
 	}
 }
 
+// newBenchServer builds a Server wired up for the KronosTimeNow /
+// KronosUptime happy path: initialized status, valid time cap, valid uptime
+// cap, self as oracle. Used by BenchmarkKronosTimeNow* to measure the hot
+// path CockroachDB HLC reads travel through.
+func newBenchServer(b *testing.B) *Server {
+	b.Helper()
+	clock := tm.NewManualClock()
+	clock.SetTime(100)
+	clock.SetUptime(100)
+	local := &kronospb.NodeAddr{Host: "127.0.0.1", Port: "5766"}
+	sm := oracle.NewMemStateMachine()
+	sm.SubmitProposal(context.Background(), &kronospb.OracleProposal{
+		ProposedState: &kronospb.OracleState{
+			Id:              1,
+			TimeCap:         int64(time.Hour),
+			KronosUptimeCap: int64(time.Hour),
+			Oracle:          local,
+		},
+	})
+	s := &Server{
+		Clock:    clock,
+		OracleSM: sm,
+		GRPCAddr: local,
+	}
+	s.status.Store(kronospb.ServerStatus_INITIALIZED)
+	return s
+}
+
+// BenchmarkKronosTimeNow documents the CDM-552295 hot path: every
+// CockroachDB HLC clock read reaches this function via kronos.GetTime.
+// The proto variant allocates one KronosTimeResponse per call; the raw
+// variant returns primitives and reports 0 allocs/op.
+func BenchmarkKronosTimeNow(b *testing.B) {
+	ctx := context.Background()
+	s := newBenchServer(b)
+	b.Run("proto", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _ = s.KronosTimeNow(ctx)
+			}
+		})
+	})
+	b.Run("raw", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _, _ = s.KronosTimeNowRaw(ctx)
+			}
+		})
+	})
+}
+
+func BenchmarkKronosUptime(b *testing.B) {
+	ctx := context.Background()
+	s := newBenchServer(b)
+	b.Run("proto", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _ = s.KronosUptimeNow(ctx)
+			}
+		})
+	})
+	b.Run("raw", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _, _ = s.KronosUptimeNowRaw(ctx)
+			}
+		})
+	})
+}
+
 // BenchmarkNodeAddrEqual documents the alloc/CPU savings for CDM-552295: the
 // hand-written comparison runs at reflection-free speed and reports 0
 // allocs/op, whereas gogo/proto.Equal — used by every isOracle call on the
