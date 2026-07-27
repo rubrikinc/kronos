@@ -451,3 +451,151 @@ func TestGetNodeDescForConfState(t *testing.T) {
 	a.Contains(err.Error(), "cockroach kronos cluster remove "+staleID)
 	a.Contains(err.Error(), "stale/duplicate")
 }
+
+// --- Tests for liveNodesFromSnapshot ---
+
+// makeTestNode builds a NodeDescriptor for use in liveNodesFromSnapshot tests.
+func makeTestNode(id string, heartbeat int64, bootstrapped, removed bool) *kronospb.NodeDescriptor {
+	return &kronospb.NodeDescriptor{
+		NodeId:         id,
+		LastHeartbeat:  heartbeat,
+		IsBootstrapped: bootstrapped,
+		IsRemoved:      removed,
+	}
+}
+
+func TestLiveNodesFromSnapshot_AllAdvancing(t *testing.T) {
+	// All peers have fresh heartbeats — all should be returned as live.
+	// This also covers the clock-skew scenario: even if the new node's clock
+	// is 27s ahead, peer heartbeat VALUES still advance every second,
+	// so all peers are correctly identified as live.
+	snapshot := map[string]int64{
+		"node-A": 1000,
+		"node-B": 2000,
+		"node-C": 3000,
+	}
+	nodes := []*kronospb.NodeDescriptor{
+		makeTestNode("node-A", 1001, true, false),
+		makeTestNode("node-B", 2003, true, false),
+		makeTestNode("node-C", 3002, true, false),
+	}
+	live := liveNodesFromSnapshot(snapshot, nodes, "self")
+	assert.Len(t, live, 3)
+}
+
+func TestLiveNodesFromSnapshot_NoneAdvancing(t *testing.T) {
+	// No peer heartbeat advanced — simulates dead peers whose gossip is stale.
+	snapshot := map[string]int64{
+		"node-A": 1000,
+		"node-B": 2000,
+	}
+	nodes := []*kronospb.NodeDescriptor{
+		makeTestNode("node-A", 1000, true, false),
+		makeTestNode("node-B", 2000, true, false),
+	}
+	live := liveNodesFromSnapshot(snapshot, nodes, "self")
+	assert.Len(t, live, 0)
+}
+
+func TestLiveNodesFromSnapshot_MixedAdvancing(t *testing.T) {
+	// Some peers are alive (heartbeat advanced), some are dead (heartbeat stuck).
+	snapshot := map[string]int64{
+		"node-A": 1000,
+		"node-B": 2000,
+		"node-C": 3000,
+	}
+	nodes := []*kronospb.NodeDescriptor{
+		makeTestNode("node-A", 1005, true, false),
+		makeTestNode("node-B", 2000, true, false), // stuck
+		makeTestNode("node-C", 3001, true, false),
+	}
+	live := liveNodesFromSnapshot(snapshot, nodes, "self")
+	assert.Len(t, live, 2)
+	for _, n := range live {
+		assert.NotEqual(t, "node-B", n.NodeId, "dead node-B must not be in live list")
+	}
+}
+
+func TestLiveNodesFromSnapshot_SelfExcluded(t *testing.T) {
+	// The new node must not try to join itself.
+	snapshot := map[string]int64{
+		"self":   500,
+		"node-A": 1000,
+	}
+	nodes := []*kronospb.NodeDescriptor{
+		makeTestNode("self", 510, true, false),
+		makeTestNode("node-A", 1005, true, false),
+	}
+	live := liveNodesFromSnapshot(snapshot, nodes, "self")
+	assert.Len(t, live, 1)
+	assert.Equal(t, "node-A", live[0].NodeId)
+}
+
+func TestLiveNodesFromSnapshot_NotBootstrappedExcluded(t *testing.T) {
+	// Peers that have not bootstrapped cannot sponsor a join.
+	snapshot := map[string]int64{
+		"node-A": 1000,
+		"node-B": 2000,
+	}
+	nodes := []*kronospb.NodeDescriptor{
+		makeTestNode("node-A", 1005, false, false), // not bootstrapped
+		makeTestNode("node-B", 2003, true, false),
+	}
+	live := liveNodesFromSnapshot(snapshot, nodes, "self")
+	assert.Len(t, live, 1)
+	assert.Equal(t, "node-B", live[0].NodeId)
+}
+
+func TestLiveNodesFromSnapshot_RemovedExcluded(t *testing.T) {
+	// Removed nodes must be excluded even if bootstrapped and heartbeat advances.
+	snapshot := map[string]int64{
+		"node-A": 1000,
+		"node-B": 2000,
+	}
+	nodes := []*kronospb.NodeDescriptor{
+		makeTestNode("node-A", 1005, true, true), // removed
+		makeTestNode("node-B", 2003, true, false),
+	}
+	live := liveNodesFromSnapshot(snapshot, nodes, "self")
+	assert.Len(t, live, 1)
+	assert.Equal(t, "node-B", live[0].NodeId)
+}
+
+func TestLiveNodesFromSnapshot_NodeNotInSnapshot(t *testing.T) {
+	// A node that appeared after the snapshot was taken is excluded.
+	snapshot := map[string]int64{
+		"node-A": 1000,
+	}
+	nodes := []*kronospb.NodeDescriptor{
+		makeTestNode("node-A", 1005, true, false),
+		makeTestNode("node-B", 5000, true, false), // not in snapshot
+	}
+	live := liveNodesFromSnapshot(snapshot, nodes, "self")
+	assert.Len(t, live, 1)
+	assert.Equal(t, "node-A", live[0].NodeId)
+}
+
+func TestLiveNodesFromSnapshot_EmptyNodes(t *testing.T) {
+	snapshot := map[string]int64{"node-A": 1000}
+	live := liveNodesFromSnapshot(snapshot, nil, "self")
+	assert.Len(t, live, 0)
+}
+
+func TestLiveNodesFromSnapshot_EmptySnapshot(t *testing.T) {
+	// If snapshot is empty, all nodes are unseen and excluded.
+	nodes := []*kronospb.NodeDescriptor{
+		makeTestNode("node-A", 1005, true, false),
+	}
+	live := liveNodesFromSnapshot(map[string]int64{}, nodes, "self")
+	assert.Len(t, live, 0)
+}
+
+func TestLiveNodesFromSnapshot_HeartbeatDecreased(t *testing.T) {
+	// A node whose heartbeat decreased is not treated as live.
+	snapshot := map[string]int64{"node-A": 1000}
+	nodes := []*kronospb.NodeDescriptor{
+		makeTestNode("node-A", 900, true, false),
+	}
+	live := liveNodesFromSnapshot(snapshot, nodes, "self")
+	assert.Len(t, live, 0)
+}
