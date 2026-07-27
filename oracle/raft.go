@@ -1064,6 +1064,11 @@ func (rc *raftNode) maybeAddRemote(ctx context.Context,
 	}
 }
 
+// tryJoinObservationWindow is the duration tryJoin waits between taking the
+// two gossip snapshots. Gossip fires every ~1s, so 3 seconds gives 3 fresh
+// heartbeat values per peer. Overridable in tests to keep test runs fast.
+var tryJoinObservationWindow = 3 * time.Second
+
 // liveNodesFromSnapshot returns nodes whose LastHeartbeat advanced between
 // snapshot (recorded at t=0) and the current node list (read at t=now).
 //
@@ -1102,13 +1107,14 @@ func (rc *raftNode) tryJoin(ctx context.Context, joinCh chan struct{}, tlsInfo t
 			snapshot[node.NodeId] = node.LastHeartbeat
 		}
 
-		// Wait 3 seconds. Gossip fires every ~1s so three fresh heartbeats
-		// arrive per peer. This single sleep also rate-limits the outer loop,
-		// replacing the per-peer ticker from the previous implementation.
+		// Wait one observation window. Gossip fires every ~1s so three fresh
+		// heartbeats arrive per peer. This single sleep also rate-limits the
+		// outer loop, replacing the per-peer ticker from the previous
+		// implementation.
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(3 * time.Second):
+		case <-time.After(tryJoinObservationWindow):
 		}
 
 		// Snapshot 2: find peers whose heartbeat advanced — they are live
