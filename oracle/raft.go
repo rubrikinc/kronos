@@ -1064,29 +1064,69 @@ func (rc *raftNode) maybeAddRemote(ctx context.Context,
 	}
 }
 
-func (rc *raftNode) tryJoin(ctx context.Context, joinCh chan struct{}, tlsInfo transport.TLSInfo) {
-	ticker := time.NewTicker(time.Second)
-	for {
-		nodes := rc.gossip.GetNodeList()
-		for _, node := range nodes {
-			select {
-			case <-ctx.Done():
-				return
-			case _ = <-ticker.C:
-				// try joining the cluster
-			}
-			if node.NodeId == rc.nodeID {
-				continue
-			}
-			if !node.IsBootstrapped || !gossip.IsNodeLive(node) {
-				continue
-			}
+// tryJoinObservationWindow is the duration tryJoin waits between taking the
+// two gossip snapshots. Gossip fires every ~1s, so 3 seconds gives 3 fresh
+// heartbeat values per peer. Overridable in tests to keep test runs fast.
+var tryJoinObservationWindow = 3 * time.Second
 
+// liveNodesFromSnapshot returns nodes whose LastHeartbeat advanced between
+// snapshot (recorded at t=0) and the current node list (read at t=now).
+//
+// This is clock-skew immune: it compares a peer's heartbeat value against its
+// own earlier value rather than against the local wall clock. A peer with a
+// 27-second clock lead still has advancing heartbeats — the old IsNodeLive
+// check incorrectly marked such peers as dead by comparing their timestamps
+// against a skewed local clock.
+//
+// Nodes are excluded if they are self, not bootstrapped, removed, or were not
+// present in the snapshot (appeared after t=0 — too new to trust).
+func liveNodesFromSnapshot(
+	snapshot map[string]int64,
+	nodes []*kronospb.NodeDescriptor,
+	selfID string,
+) []*kronospb.NodeDescriptor {
+	var live []*kronospb.NodeDescriptor
+	for _, node := range nodes {
+		if node.NodeId == selfID || !node.IsBootstrapped || node.IsRemoved {
+			continue
+		}
+		initial, seen := snapshot[node.NodeId]
+		if !seen || node.LastHeartbeat <= initial {
+			continue
+		}
+		live = append(live, node)
+	}
+	return live
+}
+
+func (rc *raftNode) tryJoin(ctx context.Context, joinCh chan struct{}, tlsInfo transport.TLSInfo) {
+	for {
+		// Snapshot 1: record LastHeartbeat for every peer at t=0.
+		snapshot := make(map[string]int64)
+		for _, node := range rc.gossip.GetNodeList() {
+			snapshot[node.NodeId] = node.LastHeartbeat
+		}
+
+		// Wait one observation window. Gossip fires every ~1s so three fresh
+		// heartbeats arrive per peer. This single sleep also rate-limits the
+		// outer loop, replacing the per-peer ticker from the previous
+		// implementation.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(tryJoinObservationWindow):
+		}
+
+		// Snapshot 2: find peers whose heartbeat advanced — they are live
+		// regardless of any clock skew between this node and the peer.
+		for _, node := range liveNodesFromSnapshot(snapshot, rc.gossip.GetNodeList(), rc.nodeID) {
 			log.Infof(ctx, "Trying to join node %v", node)
 
 			parsedUrl, _ := url.Parse(node.RaftAddr)
-			nodeAddr := &kronospb.NodeAddr{Host: parsedUrl.
-				Hostname(), Port: parsedUrl.Port()}
+			nodeAddr := &kronospb.NodeAddr{
+				Host: parsedUrl.Hostname(),
+				Port: parsedUrl.Port(),
+			}
 
 			err := rc.tryIdempotentRpc(ctx, tlsInfo, time.Minute, nodeAddr,
 				func(ctx context.Context, client *kronoshttp.ClusterClient) error {
@@ -1126,9 +1166,8 @@ func (rc *raftNode) tryJoin(ctx context.Context, joinCh chan struct{}, tlsInfo t
 				log.Infof(ctx, "Successfully joined node %v", node)
 				close(joinCh)
 				return
-			} else {
-				log.Errorf(ctx, "Failed to join cluster, error: %v", err)
 			}
+			log.Errorf(ctx, "Failed to join cluster, error: %v", err)
 		}
 	}
 }
