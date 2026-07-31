@@ -211,7 +211,7 @@ func TestSubmitProposal(t *testing.T) {
 			stateMachine := NewMemStateMachine().(*inMemStateMachine)
 			defer stateMachine.Close()
 			if tc.state != nil {
-				stateMachine.state = tc.state
+				stateMachine.state.Store(tc.state)
 			}
 			initialState := protoutil.Clone(stateMachine.State(ctx))
 			stateMachine.SubmitProposal(ctx, tc.proposal)
@@ -300,7 +300,7 @@ func TestProposeState(t *testing.T) {
 			stateMachine := NewMemStateMachine().(*inMemStateMachine)
 			defer stateMachine.Close()
 			if tc.state != nil {
-				stateMachine.state = tc.state
+				stateMachine.state.Store(tc.state)
 			}
 			initialState := protoutil.Clone(stateMachine.State(ctx))
 			stateMachine.restoreState(*tc.proposedState)
@@ -311,4 +311,26 @@ func TestProposeState(t *testing.T) {
 			}
 		})
 	}
+}
+
+// BenchmarkStateReadParallel exercises the hot read path from
+// Server.KronosTimeNow (CDM-552295): every CockroachDB HLC clock read calls
+// OracleSM.State(ctx). The benchmark should report 0 allocs/op — a regression
+// to non-zero means someone reintroduced a deep copy on the read path.
+func BenchmarkStateReadParallel(b *testing.B) {
+	ctx := context.Background()
+	sm := NewMemStateMachine().(*inMemStateMachine)
+	sm.state.Store(&kronospb.OracleState{
+		Id:              1,
+		TimeCap:         1_000_000,
+		KronosUptimeCap: 500_000,
+		Oracle:          &kronospb.NodeAddr{Host: "127.0.0.1", Port: "5766"},
+	})
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = sm.State(ctx)
+		}
+	})
 }
