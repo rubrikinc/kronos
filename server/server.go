@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/rubrikinc/kronos/gossip"
 	"github.com/rubrikinc/kronos/syncutil"
@@ -146,7 +145,7 @@ func (k *Server) OracleTime(
 	ctx context.Context, request *kronospb.OracleTimeRequest,
 ) (*kronospb.OracleTimeResponse, error) {
 	oracleData := k.OracleSM.State(ctx)
-	if oracleData == nil || !proto.Equal(oracleData.Oracle, k.GRPCAddr) {
+	if oracleData == nil || !k.isOracle(oracleData) {
 		return nil, errors.Errorf(
 			"server (%s) is not oracle, current oracle state: %s",
 			k.GRPCAddr, oracleData,
@@ -286,7 +285,7 @@ func (k *Server) shouldOverthrowOracle(ctx context.Context) bool {
 		}
 		if oracle == nil {
 			oracle = syncErr.oracle
-		} else if !proto.Equal(syncErr.oracle, oracle) {
+		} else if !nodeAddrEqual(syncErr.oracle, oracle) {
 			return false
 		}
 		errs = append(errs, syncErr.err.Error())
@@ -464,7 +463,7 @@ func (k *Server) initialize(ctx context.Context, tickCh <-chan time.Time, tickCa
 				// ever oracle. If we wait, another server might try to overthrow us.
 				tickNum = becomeOracleTickThreshold
 
-			case proto.Equal(oracleState.Oracle, k.GRPCAddr):
+			case k.isOracle(oracleState):
 				k.Metrics.IsOracle.Update(1)
 				// Local IP is oracle
 				// It is possible that this server restarted while it was the last
@@ -595,7 +594,7 @@ func (k *Server) ManageOracle(tickCh <-chan time.Time, tickCallback func()) {
 				log.Infof(ctx, "Oracle state: %s", oracleState)
 			}
 			switch {
-			case proto.Equal(oracleState.Oracle, k.GRPCAddr):
+			case k.isOracle(oracleState):
 				k.Metrics.IsOracle.Update(1)
 				// Local IP is oracle
 				if log.V(1) {
@@ -787,8 +786,20 @@ func (k *Server) ID() (string, error) {
 	return id.String(), nil
 }
 
+// nodeAddrEqual reports whether two NodeAddrs are equal. It is a hand-written
+// replacement for proto.Equal on NodeAddr values so that hot paths
+// (KronosTimeNow, KronosUptime, isOracle, proposalFilter) avoid reflection
+// and its per-call allocations. If NodeAddr grows fields in kronos.proto,
+// update this function to compare them.
+func nodeAddrEqual(a, b *kronospb.NodeAddr) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Host == b.Host && a.Port == b.Port
+}
+
 func (k *Server) isOracle(oracleState *kronospb.OracleState) bool {
-	return proto.Equal(oracleState.Oracle, k.GRPCAddr)
+	return nodeAddrEqual(oracleState.Oracle, k.GRPCAddr)
 }
 
 func (k *Server) canOverthrowOracleNow(
@@ -874,7 +885,7 @@ func (k *Server) proposalFilter(
 	if curOracle.Oracle == nil {
 		return nil
 	}
-	if proto.Equal(proposal.ProposedState.Oracle, curOracle.Oracle) {
+	if nodeAddrEqual(proposal.ProposedState.Oracle, curOracle.Oracle) {
 		return nil
 	}
 	if !k.shouldOverthrowOracle(ctx) {

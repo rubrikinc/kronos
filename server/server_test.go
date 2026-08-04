@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/rubrikinc/kronos/kronosstats"
 	"github.com/rubrikinc/kronos/oracle"
 	"github.com/rubrikinc/kronos/pb"
@@ -658,4 +659,50 @@ func TestOverthrowPolicy(t *testing.T) {
 		a.Equal(int64(time.Second), s.adjustedTime())
 		a.Equal(nodes[2].Host, (sm.State(ctx)).Oracle.Host)
 	}
+}
+
+func TestNodeAddrEqual(t *testing.T) {
+	addr := func(h, p string) *kronospb.NodeAddr { return &kronospb.NodeAddr{Host: h, Port: p} }
+	cases := []struct {
+		name string
+		a, b *kronospb.NodeAddr
+		want bool
+	}{
+		{"both nil", nil, nil, true},
+		{"a nil", nil, addr("h", "1"), false},
+		{"b nil", addr("h", "1"), nil, false},
+		{"equal", addr("h", "1"), addr("h", "1"), true},
+		{"host differs", addr("h1", "1"), addr("h2", "1"), false},
+		{"port differs", addr("h", "1"), addr("h", "2"), false},
+		{"both empty", addr("", ""), addr("", ""), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, nodeAddrEqual(tc.a, tc.b))
+			// Sanity: our helper must agree with proto.Equal for the shapes
+			// NodeAddr can take.
+			assert.Equal(t, proto.Equal(tc.a, tc.b), nodeAddrEqual(tc.a, tc.b))
+		})
+	}
+}
+
+// BenchmarkNodeAddrEqual documents the alloc/CPU savings for CDM-552295: the
+// hand-written comparison runs at reflection-free speed and reports 0
+// allocs/op, whereas gogo/proto.Equal — used by every isOracle call on the
+// KronosTimeNow hot path — allocates on each invocation.
+func BenchmarkNodeAddrEqual(b *testing.B) {
+	a := &kronospb.NodeAddr{Host: "127.0.0.1", Port: "5766"}
+	c := &kronospb.NodeAddr{Host: "127.0.0.1", Port: "5766"}
+	b.Run("nodeAddrEqual", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = nodeAddrEqual(a, c)
+		}
+	})
+	b.Run("proto.Equal", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = proto.Equal(a, c)
+		}
+	})
 }
