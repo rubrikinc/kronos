@@ -67,7 +67,7 @@ func Now() int64 {
 	var count = 0
 
 	for {
-		kt, err := kronosServer.KronosTimeNow(ctx)
+		t, _, err := kronosServer.KronosTimeNowRaw(ctx)
 		if err != nil {
 			// We print the first 10 retries, then every 10th retry until 200 retries, and then every 100th retry
 			if count < 10 || (count < 200 && count%10 == 0) || count%100 == 0 {
@@ -81,7 +81,7 @@ func Now() int64 {
 			count += 1
 			continue
 		}
-		return kt.Time
+		return t
 	}
 }
 
@@ -98,12 +98,12 @@ func Uptime() int64 {
 	ctx := context.TODO()
 
 	for {
-		ut, err := kronosServer.KronosUptimeNow(ctx)
+		u, _, err := kronosServer.KronosUptimeNowRaw(ctx)
 		if err != nil {
 			time.Sleep(timePollInterval)
 			continue
 		}
-		return ut.Uptime
+		return u
 	}
 }
 
@@ -162,7 +162,7 @@ func GetTime(timeout time.Duration) (int64, error) {
 	var count = 0
 	start := time.Now()
 	for timeout == 0 || time.Since(start) < timeout {
-		kt, err := kronosServer.KronosTimeNow(ctx)
+		t, _, err := kronosServer.KronosTimeNowRaw(ctx)
 		if err != nil {
 			// We print the first 10 retries, then every 10th retry until 200 retries, and then every 100th retry
 			if count < 10 || (count < 200 && count%10 == 0) || count%100 == 0 {
@@ -176,7 +176,7 @@ func GetTime(timeout time.Duration) (int64, error) {
 			count += 1
 			continue
 		}
-		return kt.Time, nil
+		return t, nil
 	}
 	return 0, errors.New(fmt.Sprintf(
 		"Couldn't get kronos time within timeout - %v", timeout))
