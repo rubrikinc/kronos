@@ -485,7 +485,7 @@ func (tc *TestCluster) Stop(ctx context.Context) error {
 	return nil
 }
 
-// RunOperation can be used to start, stop, restart nodes of test cluster tc.
+// RunOperation can be used to start, stop, restart, suspend, or resume nodes of test cluster tc.
 func (tc *TestCluster) RunOperation(ctx context.Context, op Operation, indices ...int) error {
 	if indices == nil {
 		return nil
@@ -494,26 +494,69 @@ func (tc *TestCluster) RunOperation(ctx context.Context, op Operation, indices .
 		log.Infof(ctx, "Running %s on node %d", op, index)
 		tc.Nodes[index].Mu.Lock()
 		defer tc.Nodes[index].Mu.Unlock()
-		output, err := tc.runGoremanWithArgs(
-			"run",
-			op.String(),
-			tc.Nodes[index].Id,
-		)
-		if err != nil {
-			return errors.Wrapf(err, "output: %s", output)
-		}
 		switch op {
-		case Start, Restart:
-			tc.Nodes[index].IsRunning = true
-		case Stop:
-			tc.Nodes[index].IsRunning = false
-		case Suspend, Resume:
-			// Do nothing
+		case Suspend:
+			// mattn/goreman does not support suspend/resume; send SIGSTOP directly.
+			pid, err := tc.nodeProcessPID(index)
+			if err != nil {
+				return errors.Wrapf(err, "finding PID for node %d", index)
+			}
+			if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+				return errors.Wrapf(err, "SIGSTOP node %d (pid %d)", index, pid)
+			}
+		case Resume:
+			pid, err := tc.nodeProcessPID(index)
+			if err != nil {
+				return errors.Wrapf(err, "finding PID for node %d", index)
+			}
+			if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+				return errors.Wrapf(err, "SIGCONT node %d (pid %d)", index, pid)
+			}
 		default:
-			return errors.Errorf("unsupported value of op %v", op)
+			output, err := tc.runGoremanWithArgs("run", op.String(), tc.Nodes[index].Id)
+			if err != nil {
+				return errors.Wrapf(err, "output: %s", output)
+			}
+			switch op {
+			case Start, Restart:
+				tc.Nodes[index].IsRunning = true
+			case Stop:
+				tc.Nodes[index].IsRunning = false
+			default:
+				return errors.Errorf("unsupported value of op %v", op)
+			}
 		}
 	}
 	return nil
+}
+
+// nodeProcessPID finds the PID of the kronos process for the given node.
+// All cluster nodes share the same port numbers but have unique ListenHosts
+// (127.0.0.X). Goreman runs each node via "sh -c ...", leaving a shell wrapper
+// alive alongside the kronos binary. We scan ps output and match only the line
+// where the binary itself is kronos, which excludes the sh wrapper.
+func (tc *TestCluster) nodeProcessPID(nodeIdx int) (int, error) {
+	listenAddr := tc.Nodes[nodeIdx].ListenHost
+	out, err := exec.Command("ps", "-eo", "pid,cmd", "--no-headers").Output()
+	if err != nil {
+		return 0, errors.Wrapf(err, "ps for node %d", nodeIdx)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if !strings.Contains(line, "--listen-addr "+listenAddr) {
+			continue
+		}
+		fields := strings.Fields(line)
+		// fields[0]=PID, fields[1]=binary. Skip shell wrappers (sh, bash).
+		if len(fields) < 2 || !strings.HasSuffix(fields[1], "/kronos") {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		return pid, nil
+	}
+	return 0, fmt.Errorf("no kronos process found with --listen-addr %s", listenAddr)
 }
 
 // IsRunning is used to check if nodeIdx node is running or has been stopped.
