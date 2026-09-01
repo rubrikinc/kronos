@@ -190,6 +190,32 @@ func (c *snapTriggerConfig) shouldTrigger(appliedIndex, snapshotIndex uint64) bo
 // periodically instead of on every failed raft message send.
 const unreachableLogInterval = 30 * time.Second
 
+// unreachablePeerTracker rate-limits "peer unreachable" log lines per peer ID.
+type unreachablePeerTracker struct {
+	sync.Mutex
+	lastLogged map[uint64]time.Time
+}
+
+// shouldLog returns true if a log line should be emitted for id at now, and
+// records now as the last-logged time when it does.
+func (t *unreachablePeerTracker) shouldLog(id uint64, now time.Time) bool {
+	t.Lock()
+	defer t.Unlock()
+	last, logged := t.lastLogged[id]
+	if logged && now.Sub(last) < unreachableLogInterval {
+		return false
+	}
+	t.lastLogged[id] = now
+	return true
+}
+
+// reset clears the rate-limit entry for id (e.g. after a successful snapshot).
+func (t *unreachablePeerTracker) reset(id uint64) {
+	t.Lock()
+	delete(t.lastLogged, id)
+	t.Unlock()
+}
+
 // raftNode is a node in the raft cluster which manages the oracle state
 // machine
 // This implements rafthttp.Raft
@@ -248,12 +274,8 @@ type raftNode struct {
 	testMode bool
 	lg       *zap.Logger
 
-	// unreachablePeers tracks, per peer, the last time a "peer unreachable"
-	// log line was emitted, to rate-limit the resulting log lines.
-	unreachablePeers struct {
-		sync.Mutex
-		lastLogged map[uint64]time.Time
-	}
+	// unreachablePeers rate-limits "peer unreachable" log lines per peer.
+	unreachablePeers *unreachablePeerTracker
 }
 
 // getNodesIncludingRemoved gets nodes in the cluster metadata from
@@ -583,7 +605,7 @@ func newRaftNode(
 		lg:                lg,
 		// rest of structure populated after WAL replay
 	}
-	rn.unreachablePeers.lastLogged = make(map[uint64]time.Time)
+	rn.unreachablePeers = &unreachablePeerTracker{lastLogged: make(map[uint64]time.Time)}
 	go rn.startRaft(ctx, confChangeC, rc.CertsDir, rc.GRPCHostPort)
 	return &RaftNodeInfo{commitC, errorC, rn.snapshotterReady, rn.bootstrapReqC}
 }
@@ -1689,14 +1711,7 @@ func (rc *raftNode) IsIDRemoved(id uint64) bool {
 
 // ReportUnreachable reports the given node is not reachable for the last send.
 func (rc *raftNode) ReportUnreachable(id uint64) {
-	rc.unreachablePeers.Lock()
-	last, logged := rc.unreachablePeers.lastLogged[id]
-	shouldLog := !logged || time.Since(last) >= unreachableLogInterval
-	if shouldLog {
-		rc.unreachablePeers.lastLogged[id] = time.Now()
-	}
-	rc.unreachablePeers.Unlock()
-	if shouldLog {
+	if rc.unreachablePeers.shouldLog(id, time.Now()) {
 		log.Warningf(
 			context.TODO(),
 			"Peer %v (%v) unreachable — last raft send failed; check network/firewall "+
@@ -1716,9 +1731,7 @@ func (rc *raftNode) ReportSnapshot(id uint64, status raft.SnapshotStatus) {
 			types.ID(id).String(), rc.peerAddrForLog(id),
 		)
 	} else {
-		rc.unreachablePeers.Lock()
-		delete(rc.unreachablePeers.lastLogged, id)
-		rc.unreachablePeers.Unlock()
+		rc.unreachablePeers.reset(id)
 		log.Infof(
 			context.TODO(),
 			"Snapshot send to peer %v (%v) completed (transport ack)",
