@@ -758,3 +758,23 @@ func TestTryJoin_LivePeerExists_JoinAttempted(t *testing.T) {
 		// Expected: RPC failed, loop retried, context expired, exited.
 	}
 }
+
+// TestPeerAddrForLog pins the operator-facing form. NodeAddr's generated
+// stringer is reflective proto text, which reads as
+// `host:"10.0.0.1" port:"5766"` in a log line.
+func TestPeerAddrForLog(t *testing.T) {
+	a := assert.New(t)
+	dataDir, err := ioutil.TempDir("", "data_dir")
+	defer func() {
+		_ = os.RemoveAll(dataDir)
+	}()
+	a.NoError(err)
+
+	node, err := newTestRaftNode(dataDir)
+	a.NoError(err)
+	a.NoError(node.cluster.AddNode("1", &kronospb.NodeAddr{Host: "10.0.0.1", Port: "5766"}))
+
+	a.Equal("10.0.0.1:5766", node.peerAddrForLog(1))
+	// Unknown peers keep their sentinel rather than rendering an empty addr.
+	a.Equal("unknown", node.peerAddrForLog(2))
+}

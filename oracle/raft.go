@@ -1749,7 +1749,9 @@ func (rc *raftNode) peerAddrForLog(id uint64) string {
 	if !ok || node.RaftAddr == nil {
 		return "unknown"
 	}
-	return node.RaftAddr.String()
+	// Not RaftAddr.String(): the generated stringer is reflective proto text,
+	// which renders as `host:"10.0.0.1" port:"5766"` in an operator-facing log.
+	return kronosutil.NodeAddrToString(node.RaftAddr)
 }
 
 func (rc *raftNode) sanitizeOutgoingMessages(ms []raftpb.Message) []raftpb.Message {
