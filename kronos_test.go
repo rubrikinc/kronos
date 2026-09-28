@@ -6,6 +6,7 @@ import (
 	"time"
 
 	leaktest "github.com/rubrikinc/kronos/crdbutils"
+	"github.com/rubrikinc/kronos/kronosutil"
 
 	"github.com/stretchr/testify/assert"
 
@@ -880,4 +881,30 @@ func TestKronosTimeWithRetries(t *testing.T) {
 		nodes[1].Server.GRPCAddr,
 	)
 	a.Error(err)
+}
+
+// TestOracleFailureLogsReadAsHostPort follows a follower losing its oracle: the
+// sync-failure and overthrow-eligibility lines must name the oracle as host:port.
+func TestOracleFailureLogsReadAsHostPort(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	a := assert.New(t)
+	ctx := context.TODO()
+	stop := captureLogs(t)
+	cluster, nodes := mock.InitializeCluster(a, 3, 15*time.Second, 5*time.Second)
+	defer cluster.Stop()
+
+	// Same setup as TestMultiNodeOracleOverthrow: node 1 becomes the oracle.
+	cluster.Tick(nodes[1])
+	cluster.Tick(nodes[1])
+	cluster.Tick(nodes[2])
+	cluster.Tick(nodes[0])
+	oracle := kronosutil.NodeAddrToString(nodes[1].Server.GRPCAddr)
+
+	// Three failed syncs make node 0 eligible to overthrow it.
+	cluster.StopNode(ctx, nodes[1])
+	cluster.TickN(nodes[0], 3)
+	out := stop()
+
+	a.Contains(out, "Failed to sync with oracle "+oracle+", err:")
+	a.Contains(out, "consecutive errors on the same oracle "+oracle+", errs:")
 }
