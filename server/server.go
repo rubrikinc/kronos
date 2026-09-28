@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -195,6 +196,20 @@ func (k *Server) KronosUptime(
 	return &kronospb.KronosUptimeResponse{Uptime: u, UptimeCap: uCap}, nil
 }
 
+// maybeWithStack attaches a stack to err unless the cause is a stale cap.
+//
+// A stack describes one goroutine. For the startup causes that is the answer --
+// which caller asked for time before Kronos was up. A stale cap fails every
+// caller in the process at once, so any single stack just restates what is
+// already known, while costing ~1.3us and ~270B on a path that runs thousands
+// of times a second during a stall.
+func maybeWithStack(reason error, err error) error {
+	if reason == ErrTimeCapStale || reason == ErrUptimeCapStale {
+		return err
+	}
+	return errors.WithStack(err)
+}
+
 // KronosUptimeNowRaw returns the current KronosUptime and the current
 // uptime cap as scalar values. It is the allocation-free variant used by
 // the CockroachDB HLC hot path (and by any local caller that does not
@@ -214,19 +229,19 @@ func (k *Server) KronosUptimeNowRaw(ctx context.Context) (uptime int64, uptimeCa
 	t := k.upTime()
 	currentStatus := k.ServerStatus()
 	initialized := currentStatus == kronospb.ServerStatus_INITIALIZED
-	var errorMsg string
+	var reason error
 	if !initialized {
-		errorMsg = "kronos server not yet initialized"
+		reason = ErrNotInitialized
 	} else if k.UptimeCap.Load() == 0 {
-		errorMsg = "kronos up time cap not yet initialized"
+		reason = ErrUptimeCapNotInited
 	} else if k.UptimeCap.Load() <= t {
-		errorMsg = "kronos up time is beyond current time cap, time cap is too stale"
+		reason = ErrUptimeCapStale
 	}
-	if errorMsg != "" {
-		return 0, 0, errors.Errorf(
-			"%s: kronos uptime: %v, status: %v, uptime time cap: %v",
-			errorMsg, t, currentStatus, oracleData.KronosUptimeCap,
-		)
+	if reason != nil {
+		return 0, 0, maybeWithStack(reason, fmt.Errorf(
+			"%w: kronos uptime: %v, status: %v, uptime time cap: %v",
+			reason, t, currentStatus, oracleData.KronosUptimeCap,
+		))
 	}
 
 	// ensure that KronosTime does not have backward jumps
@@ -272,19 +287,19 @@ func (k *Server) KronosTimeNowRaw(ctx context.Context) (time int64, timeCap int6
 	t := k.adjustedTime()
 	currentStatus := k.ServerStatus()
 	initialized := currentStatus == kronospb.ServerStatus_INITIALIZED
-	var errorMsg string
+	var reason error
 	if !initialized {
-		errorMsg = "kronos server not yet initialized"
+		reason = ErrNotInitialized
 	} else if k.TimeCap.Load() == 0 {
-		errorMsg = "kronos time cap not yet initialized"
+		reason = ErrTimeCapNotInited
 	} else if k.TimeCap.Load() <= t {
-		errorMsg = "kronos time is beyond current time cap, time cap is too stale"
+		reason = ErrTimeCapStale
 	}
-	if errorMsg != "" {
-		return 0, 0, errors.Errorf(
-			"%s: kronos time: %v, status: %v, time cap: %v",
-			errorMsg, t, currentStatus, oracleData.TimeCap,
-		)
+	if reason != nil {
+		return 0, 0, maybeWithStack(reason, fmt.Errorf(
+			"%w: kronos time: %v, status: %v, time cap: %v",
+			reason, t, currentStatus, oracleData.TimeCap,
+		))
 	}
 
 	// ensure that KronosTime does not have backward jumps
