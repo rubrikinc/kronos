@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -690,7 +692,7 @@ func TestNodeAddrEqual(t *testing.T) {
 // KronosUptime happy path: initialized status, valid time cap, valid uptime
 // cap, self as oracle. Used by BenchmarkKronosTimeNow* to measure the hot
 // path CockroachDB HLC reads travel through.
-func newBenchServer(b *testing.B) *Server {
+func newBenchServer(b testing.TB) *Server {
 	b.Helper()
 	clock := tm.NewManualClock()
 	clock.SetTime(100)
@@ -777,6 +779,111 @@ func BenchmarkNodeAddrEqual(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			_ = proto.Equal(a, c)
+		}
+	})
+}
+
+// notTheOracle points the server away from the oracle in its state machine, so
+// KronosTimeNowRaw stops refreshing TimeCap/UptimeCap from the Raft state and
+// the caps can be driven directly.
+func notTheOracle(s *Server) {
+	s.GRPCAddr = &kronospb.NodeAddr{Host: "127.0.0.1", Port: "9999"}
+}
+
+// TestKronosTimeNowRawCauses pins two things per failure state: the wrapped
+// sentinel, which callers classify on, and the message text, which CockroachDB
+// prints verbatim in its stall fatal.
+func TestKronosTimeNowRawCauses(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name      string
+		setup     func(*Server)
+		cause     error
+		msgPrefix string
+		wantStack bool
+	}{
+		{
+			name:      "not initialized",
+			setup:     func(s *Server) { s.status.Store(kronospb.ServerStatus_NOT_INITIALIZED) },
+			cause:     ErrNotInitialized,
+			msgPrefix: "kronos server not yet initialized: kronos time: ",
+			wantStack: true,
+		},
+		{
+			name:      "time cap not initialized",
+			setup:     notTheOracle,
+			cause:     ErrTimeCapNotInited,
+			msgPrefix: "kronos time cap not yet initialized: kronos time: ",
+			wantStack: true,
+		},
+		{
+			name: "time cap stale",
+			setup: func(s *Server) {
+				notTheOracle(s)
+				s.TimeCap.Store(50) // clock is at 100
+			},
+			cause:     ErrTimeCapStale,
+			msgPrefix: "kronos time is beyond current time cap, time cap is too stale: kronos time: ",
+			wantStack: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := assert.New(t)
+			s := newBenchServer(t)
+			tc.setup(s)
+
+			_, _, err := s.KronosTimeNowRaw(ctx)
+			a.Error(err)
+			a.True(errors.Is(err, tc.cause), "want %v, got %v", tc.cause, err)
+			a.True(strings.HasPrefix(err.Error(), tc.msgPrefix), "got %q", err.Error())
+
+			// %+v renders a stack when one was captured; without it the two
+			// formats are identical.
+			hasStack := fmt.Sprintf("%+v", err) != fmt.Sprintf("%v", err)
+			a.Equal(tc.wantStack, hasStack)
+		})
+	}
+}
+
+// TestKronosUptimeNowRawCauses is the uptime twin of TestKronosTimeNowRawCauses.
+func TestKronosUptimeNowRawCauses(t *testing.T) {
+	ctx := context.Background()
+	a := assert.New(t)
+
+	s := newBenchServer(t)
+	notTheOracle(s)
+	_, _, err := s.KronosUptimeNowRaw(ctx)
+	a.True(errors.Is(err, ErrUptimeCapNotInited), "got %v", err)
+
+	s.UptimeCap.Store(50) // clock uptime is at 100
+	_, _, err = s.KronosUptimeNowRaw(ctx)
+	a.True(errors.Is(err, ErrUptimeCapStale), "got %v", err)
+	a.True(strings.HasPrefix(err.Error(),
+		"kronos up time is beyond current time cap, time cap is too stale: kronos uptime: "),
+		"got %q", err.Error())
+}
+
+// BenchmarkKronosTimeNowRawFailure prices the two error paths: the stale cause
+// skips the stack capture, which is the bulk of the cost. The stale path is the
+// one that runs thousands of times a second during a stall.
+func BenchmarkKronosTimeNowRawFailure(b *testing.B) {
+	ctx := context.Background()
+	b.Run("stale_no_stack", func(b *testing.B) {
+		s := newBenchServer(b)
+		notTheOracle(s)
+		s.TimeCap.Store(50)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _, _ = s.KronosTimeNowRaw(ctx)
+		}
+	})
+	b.Run("notinit_with_stack", func(b *testing.B) {
+		s := newBenchServer(b)
+		notTheOracle(s)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _, _ = s.KronosTimeNowRaw(ctx)
 		}
 	})
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.uber.org/atomic"
+
 	"github.com/rubrikinc/kronos/kronoshttp"
 	"github.com/rubrikinc/kronos/kronosstats"
 	"github.com/rubrikinc/kronos/kronosutil/log"
@@ -14,6 +16,89 @@ import (
 )
 
 var kronosServer *server.Server
+
+const (
+	// stallLogInterval caps the steady-state rate of the clock-failure log.
+	// One line per second is enough to see a stall start, persist and end.
+	stallLogInterval = time.Second
+	// stallLogChangeInterval floors how soon a changed cause may re-emit, so a
+	// flapping cause cannot reopen the storm.
+	stallLogChangeInterval = 50 * time.Millisecond
+)
+
+// stallCauses lists the failure causes in a fixed order so the throttle can
+// hold the current one in an atomic. causeOf returns index+1; 0 is unrecognised.
+var stallCauses = []error{
+	server.ErrNotInitialized,
+	server.ErrTimeCapNotInited,
+	server.ErrTimeCapStale,
+	server.ErrUptimeCapNotInited,
+	server.ErrUptimeCapStale,
+}
+
+func causeOf(err error) int32 {
+	for i, cause := range stallCauses {
+		if errors.Is(err, cause) {
+			return int32(i + 1)
+		}
+	}
+	return 0
+}
+
+// stallLogThrottle rate-limits a clock-failure log process-wide.
+//
+// It is lock-free by necessity: during a stall hundreds of clock readers in the
+// process fail at once, so a mutex would recreate the contention being
+// diagnosed. The per-call retry count alone bounded nothing -- each caller had
+// its own counter, so N concurrent callers produced N times the output (2374
+// lines in one second in a field stall).
+type stallLogThrottle struct {
+	last  atomic.Int64 // unix nanos of the last emitted line
+	cause atomic.Int32
+}
+
+// shouldLog reports whether to emit a line for cause at now. A changed cause
+// always emits: the transition is the diagnostic, and waiting out the interval
+// could hide it entirely.
+func (t *stallLogThrottle) shouldLog(cause int32, now int64) bool {
+	interval := int64(stallLogInterval)
+	if t.cause.Load() != cause {
+		interval = int64(stallLogChangeInterval)
+	}
+	last := t.last.Load()
+	// CAS loser stays quiet too: exactly one caller emits per interval.
+	if now-last < interval || !t.last.CAS(last, now) {
+		return false
+	}
+	t.cause.Store(cause)
+	return true
+}
+
+// shouldCheckStall reports whether a caller's retry consults the throttle: the
+// first 10, then every 10th until 200, then every 100th. A stall is hundreds of
+// callers failing at once, and new callers start at retry 0, so the throttle is
+// still consulted many times a second; a caller stuck past its first second
+// stops paying for causeOf and time.Now on every retry.
+func shouldCheckStall(retry int) bool {
+	return retry < 10 || (retry < 200 && retry%10 == 0) || retry%100 == 0
+}
+
+var (
+	kronosTimeLog   stallLogThrottle
+	kronosUptimeLog stallLogThrottle
+)
+
+// logStall reports a caller's failed clock read through t. what names the value
+// being read, e.g. "KronosTime", and appears in the message people grep for.
+// retry is how many times this caller has already retried; it only gates the
+// check and is not logged, since in a crowd of callers it describes one caller,
+// not the stall.
+func logStall(ctx context.Context, t *stallLogThrottle, what string, err error, retry int) {
+	if !shouldCheckStall(retry) || !t.shouldLog(causeOf(err), time.Now().UnixNano()) {
+		return
+	}
+	log.Errorf(ctx, "Failed to get %s: %v", what, err)
+}
 
 // Initialize initializes the kronos server.
 // After Initialization, Now() in this package returns kronos time.
@@ -53,8 +138,9 @@ func IsActive() bool {
 	return kronosServer != nil
 }
 
-// Now returns Kronos time if Kronos is initialized, otherwise returns
-// system time
+// Now returns Kronos time, blocking until it is available. It has no timeout,
+// so during a stall a caller never returns; prefer GetTime, which does.
+// Fatals if Kronos was never initialized.
 func Now() int64 {
 	if kronosServer == nil {
 		log.Fatalf(context.TODO(), "Kronos server is not initialized")
@@ -64,24 +150,14 @@ func Now() int64 {
 	// This function blocks if not initialized or if KronosTime is stale
 	const timePollInterval = 100 * time.Millisecond
 	ctx := context.TODO()
-	var count = 0
 
-	for {
+	for retry := 0; ; retry++ {
 		t, _, err := kronosServer.KronosTimeNowRaw(ctx)
-		if err != nil {
-			// We print the first 10 retries, then every 10th retry until 200 retries, and then every 100th retry
-			if count < 10 || (count < 200 && count%10 == 0) || count%100 == 0 {
-				log.Errorf(
-					ctx,
-					"Failed to get KronosTime after %d retries, err: %v. Sleeping for %s before retrying.",
-					count, err, timePollInterval,
-				)
-			}
-			time.Sleep(timePollInterval)
-			count += 1
-			continue
+		if err == nil {
+			return t
 		}
-		return t
+		logStall(ctx, &kronosTimeLog, "KronosTime", err, retry)
+		time.Sleep(timePollInterval)
 	}
 }
 
@@ -97,13 +173,13 @@ func Uptime() int64 {
 	const timePollInterval = 500 * time.Millisecond
 	ctx := context.TODO()
 
-	for {
+	for retry := 0; ; retry++ {
 		u, _, err := kronosServer.KronosUptimeNowRaw(ctx)
-		if err != nil {
-			time.Sleep(timePollInterval)
-			continue
+		if err == nil {
+			return u
 		}
-		return u
+		logStall(ctx, &kronosUptimeLog, "KronosUptime", err, retry)
+		time.Sleep(timePollInterval)
 	}
 }
 
@@ -159,27 +235,26 @@ func GetTime(timeout time.Duration) (int64, error) {
 	// This function blocks if not initialized or if KronosTime is stale
 	const timePollInterval = 100 * time.Millisecond
 	ctx := context.TODO()
-	var count = 0
+	var lastErr error
 	start := time.Now()
-	for timeout == 0 || time.Since(start) < timeout {
+	for retry := 0; timeout == 0 || time.Since(start) < timeout; retry++ {
 		t, _, err := kronosServer.KronosTimeNowRaw(ctx)
-		if err != nil {
-			// We print the first 10 retries, then every 10th retry until 200 retries, and then every 100th retry
-			if count < 10 || (count < 200 && count%10 == 0) || count%100 == 0 {
-				log.Errorf(
-					ctx,
-					"Failed to get KronosTime after %d retries, err: %v. Sleeping for %s before retrying.",
-					count, err, timePollInterval,
-				)
-			}
-			time.Sleep(timePollInterval)
-			count += 1
-			continue
+		if err == nil {
+			return t, nil
 		}
-		return t, nil
+		lastErr = err
+		logStall(ctx, &kronosTimeLog, "KronosTime", err, retry)
+		time.Sleep(timePollInterval)
 	}
-	return 0, errors.New(fmt.Sprintf(
-		"Couldn't get kronos time within timeout - %v", timeout))
+	if lastErr == nil {
+		// Only reachable for a non-positive timeout: no attempt was made, so
+		// there is no cause to report. Never claim one we did not observe.
+		return 0, fmt.Errorf("Couldn't get kronos time: non-positive timeout - %v", timeout)
+	}
+	// Wrapped, not flattened: CockroachDB fatals on this, and which cause fired
+	// is the difference between a startup race and a lost oracle.
+	return 0, fmt.Errorf(
+		"Couldn't get kronos time within timeout - %v: %w", timeout, lastErr)
 }
 
 func Bootstrap(ctx context.Context, expectedNodeCount int32) error {
