@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +14,9 @@ import (
 	"github.com/rubrikinc/kronos/kronosstats"
 	"github.com/rubrikinc/kronos/oracle"
 	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/protoutil"
 	"github.com/rubrikinc/kronos/tm"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -885,5 +889,68 @@ func BenchmarkKronosTimeNowRawFailure(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			_, _, _ = s.KronosTimeNowRaw(ctx)
 		}
+	})
+}
+
+// captureLogs redirects the default kronos logger, which writes through logrus,
+// into a buffer. The returned func stops capturing and returns what was logged;
+// SetOutput takes logrus' write lock, so no write is in flight once it returns.
+func captureLogs(t testing.TB) (stop func() string) {
+	buf := &bytes.Buffer{}
+	logrus.SetOutput(buf)
+	restore := func() { logrus.SetOutput(os.Stderr) }
+	t.Cleanup(restore)
+	return func() string { restore(); return buf.String() }
+}
+
+// proposalFrom returns a marshalled OracleProposal naming oracle as the proposer.
+func proposalFrom(t *testing.T, oracle *kronospb.NodeAddr) []byte {
+	t.Helper()
+	b, err := protoutil.Marshal(&kronospb.OracleProposal{ProposedState: &kronospb.OracleState{
+		Id: 2, TimeCap: int64(2 * time.Hour), Oracle: oracle,
+	}})
+	assert.NoError(t, err)
+	return b
+}
+
+// TestProposalFilter covers a node proposing itself as oracle: refused while the
+// current oracle is healthy, accepted once it has failed numConsecutiveErrsForOverthrow
+// syncs. Both messages must name the oracles as host:port, not proto text.
+func TestProposalFilter(t *testing.T) {
+	ctx := context.Background()
+	proposer := &kronospb.NodeAddr{Host: "127.0.0.2", Port: "5766"}
+
+	t.Run("own proposal from the current oracle passes", func(t *testing.T) {
+		s := newBenchServer(t) // the oracle in its state machine is 127.0.0.1:5766
+		current := s.OracleSM.State(ctx).Oracle
+		assert.NoError(t, s.proposalFilter(ctx, proposalFrom(t, current)))
+	})
+
+	t.Run("refused while the oracle is healthy", func(t *testing.T) {
+		s := newBenchServer(t)
+		notTheOracle(s)
+		err := s.proposalFilter(ctx, proposalFrom(t, proposer))
+		assert.EqualError(t, err,
+			"cannot accept proposal from non-oracle 127.0.0.2:5766 since oracle 127.0.0.1:5766 is active")
+	})
+
+	t.Run("accepted once the oracle has failed repeatedly", func(t *testing.T) {
+		a := assert.New(t)
+		stop := captureLogs(t)
+		s := newBenchServer(t)
+		notTheOracle(s)
+		current := s.OracleSM.State(ctx).Oracle
+		for i := range s.oracleSyncErrs {
+			s.oracleSyncErrs[i].oracle = current
+			s.oracleSyncErrs[i].err = errors.New("boom")
+		}
+		s.syncedWithOracleAtleastOnce.Store(true)
+
+		a.NoError(s.proposalFilter(ctx, proposalFrom(t, proposer)))
+		out := stop()
+		a.Contains(out, "Eligible to overthrow oracle due to 3 consecutive errors on the same "+
+			"oracle 127.0.0.1:5766, errs: [boom; boom; boom]")
+		a.Contains(out, "Accepting proposal from non-oracle 127.0.0.2:5766 since current "+
+			"oracle 127.0.0.1:5766 is down")
 	})
 }

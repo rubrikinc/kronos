@@ -337,7 +337,8 @@ func (k *Server) shouldOverthrowOracle(ctx context.Context) bool {
 		ctx,
 		"Eligible to overthrow oracle due to %d consecutive errors on the same oracle %s,"+
 			" errs: [%v]",
-		numConsecutiveErrsForOverthrow, oracle, strings.Join(errs, "; "),
+		numConsecutiveErrsForOverthrow, kronosutil.NodeAddrToString(oracle),
+		strings.Join(errs, "; "),
 	)
 	return k.canOverthrowOracleNow(ctx, k.OracleSM.State(ctx))
 }
@@ -360,7 +361,8 @@ func (k *Server) syncOrOverthrowOracle(
 	k.oracleSyncErrs[pos].err = err
 	k.oracleSyncPos++
 	if err != nil {
-		log.Errorf(ctx, "Failed to sync with oracle %s, err: %v", oracleState.Oracle, err)
+		log.Errorf(ctx, "Failed to sync with oracle %s, err: %v",
+			kronosutil.NodeAddrToString(oracleState.Oracle), err)
 	}
 	if k.shouldOverthrowOracle(ctx) {
 		log.Warningf(ctx, "Overthrowing the oracle (%s) due to too many errors", oracleState)
@@ -931,9 +933,17 @@ func (k *Server) proposalFilter(
 	if nodeAddrEqual(proposal.ProposedState.Oracle, curOracle.Oracle) {
 		return nil
 	}
+	// curOracle rather than a fresh State() read: the message must name the
+	// oracle the branch above actually compared against.
+	proposed := kronosutil.NodeAddrToString(proposal.ProposedState.Oracle)
+	current := kronosutil.NodeAddrToString(curOracle.Oracle)
 	if !k.shouldOverthrowOracle(ctx) {
-		return errors.Errorf("cannot accept proposal from non-oracle %v since oracle %v is active", proposal.ProposedState.Oracle, k.OracleSM.State(ctx).Oracle)
+		return errors.Errorf(
+			"cannot accept proposal from non-oracle %v since oracle %v is active",
+			proposed, current)
 	}
-	log.Infof(ctx, "Accepting proposal from non-oracle %v since current oracle %v is down", proposal.ProposedState.Oracle, k.OracleSM.State(ctx).Oracle)
+	log.Infof(ctx,
+		"Accepting proposal from non-oracle %v since current oracle %v is down",
+		proposed, current)
 	return nil
 }
