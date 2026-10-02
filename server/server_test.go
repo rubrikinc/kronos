@@ -5,8 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +22,7 @@ import (
 	"github.com/rubrikinc/kronos/tm"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/atomic"
 )
 
 func TestOracleTime(t *testing.T) {
@@ -953,4 +958,111 @@ func TestProposalFilter(t *testing.T) {
 		a.Contains(out, "Accepting proposal from non-oracle 127.0.0.2:5766 since current "+
 			"oracle 127.0.0.1:5766 is down")
 	})
+}
+
+// jitterClock mostly moves forward but regularly steps backward, so a served
+// time that goes backward means the clamp failed, not that the clock did.
+type jitterClock struct{ n atomic.Int64 }
+
+func (c *jitterClock) Now() int64    { return c.n.Add(100) - rand.Int63n(5000) + 1_000_000 }
+func (c *jitterClock) Uptime() int64 { return c.Now() }
+
+// maxSeen tracks the largest value reported so far. It uses a mutex, not
+// advance, so the test does not rely on the code it checks.
+type maxSeen struct {
+	mu sync.Mutex
+	v  int64
+}
+
+func (m *maxSeen) get() int64 { m.mu.Lock(); defer m.mu.Unlock(); return m.v }
+func (m *maxSeen) put(x int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if x > m.v {
+		m.v = x
+	}
+}
+
+// TestClockReadsNeverGoBackward reads time and uptime from many goroutines over
+// a clock that steps backward. A call that starts after another finished must
+// not return less than it, and no goroutine may see its own readings decrease.
+func TestClockReadsNeverGoBackward(t *testing.T) {
+	// A lost update only shows when callers truly run in parallel, so do not
+	// let a low GOMAXPROCS (-cpu 1) turn this into a vacuous pass.
+	if prev := runtime.GOMAXPROCS(0); prev < 4 {
+		runtime.GOMAXPROCS(4)
+		defer runtime.GOMAXPROCS(prev)
+	}
+	ctx := context.Background()
+	s := newBenchServer(t)
+	s.Clock = &jitterClock{}
+
+	var maxT, maxU maxSeen
+	var violations, failures atomic.Int64
+	var wg sync.WaitGroup
+	for g := 0; g < 32; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var ownT, ownU int64
+			for i := 0; i < 4000; i++ {
+				floorT, floorU := maxT.get(), maxU.get()
+				tv, _, errT := s.KronosTimeNowRaw(ctx)
+				uv, _, errU := s.KronosUptimeNowRaw(ctx)
+				if errT != nil || errU != nil {
+					failures.Inc()
+					continue
+				}
+				if tv < ownT || tv < floorT || uv < ownU || uv < floorU {
+					violations.Inc()
+				}
+				ownT, ownU = tv, uv
+				maxT.put(tv)
+				maxU.put(uv)
+			}
+		}()
+	}
+	wg.Wait()
+	assert.Zero(t, failures.Load(), "clock reads failed")
+	assert.Zero(t, violations.Load(), "served time went backward")
+}
+
+func TestAdvance(t *testing.T) {
+	var last atomic.Int64
+	a := assert.New(t)
+	a.EqualValues(5, advance(&last, 5)) // the first value is recorded
+	a.EqualValues(5, advance(&last, 3)) // an older reading is raised to what was served
+	a.EqualValues(5, last.Load())       // and does not lower the record
+	a.EqualValues(9, advance(&last, 9))
+	a.EqualValues(9, last.Load())
+}
+
+// BenchmarkKronosClockReadAdvancing reads through the production clock, which
+// moves on every call, so each read also publishes a new last-served value.
+// The frozen ManualClock in BenchmarkKronosTimeNow hides that write, which is
+// where the contention is.
+func BenchmarkKronosClockReadAdvancing(b *testing.B) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		read func(*Server)
+	}{
+		{"time", func(s *Server) { _, _, _ = s.KronosTimeNowRaw(ctx) }},
+		{"uptime", func(s *Server) { _, _, _ = s.KronosUptimeNowRaw(ctx) }},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			s := newBenchServer(b)
+			s.Clock = tm.NewMonotonicClock()
+			// Caps far enough ahead for reads to succeed against the real clock.
+			s.OracleSM.SubmitProposal(ctx, &kronospb.OracleProposal{ProposedState: &kronospb.OracleState{
+				Id: 2, TimeCap: math.MaxInt64 / 2, KronosUptimeCap: math.MaxInt64 / 2, Oracle: s.GRPCAddr,
+			}})
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					tc.read(s)
+				}
+			})
+		})
+	}
 }

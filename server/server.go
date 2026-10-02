@@ -9,7 +9,6 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/rubrikinc/kronos/gossip"
-	"github.com/rubrikinc/kronos/syncutil"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 
@@ -83,15 +82,10 @@ type Server struct {
 	// UptimeCap is the upper bound of KronosUptime
 	UptimeCap atomic.Int64
 
-	mu struct {
-		syncutil.RWMutex
-		// lastKronosTime is the last served KronosTime. This is used to
-		// ensure KronosTime does not have backward jumps
-		lastKronosTime int64
-		// lastKronosUptime is the last served KronosUptime. This is used to
-		// ensure KronosUptime does not have backward jumps
-		lastKronosUptime int64
-	}
+	// lastKronosTime and lastKronosUptime are the last served values. They
+	// ensure KronosTime and KronosUptime do not have backward jumps.
+	lastKronosTime   atomic.Int64
+	lastKronosUptime atomic.Int64
 
 	// status of the server
 	// It is of type kronospb.ServerStatus
@@ -218,9 +212,6 @@ func maybeWithStack(reason error, err error) error {
 func (k *Server) KronosUptimeNowRaw(ctx context.Context) (uptime int64, uptimeCap int64, err error) {
 	oracleData := k.OracleSM.State(ctx)
 
-	k.mu.Lock()
-	defer k.mu.Unlock()
-
 	if k.isOracle(oracleData) {
 		k.TimeCap.Store(oracleData.TimeCap)
 		k.UptimeCap.Store(oracleData.KronosUptimeCap)
@@ -245,11 +236,7 @@ func (k *Server) KronosUptimeNowRaw(ctx context.Context) (uptime int64, uptimeCa
 	}
 
 	// ensure that KronosTime does not have backward jumps
-	if k.mu.lastKronosUptime > t {
-		t = k.mu.lastKronosUptime
-	}
-
-	k.mu.lastKronosUptime = t
+	t = advance(&k.lastKronosUptime, t)
 	return t, oracleData.KronosUptimeCap, nil
 }
 
@@ -271,9 +258,6 @@ func (k *Server) KronosTimeNow(ctx context.Context) (*kronospb.KronosTimeRespons
 // that builds the response proto for the gRPC entry point.
 func (k *Server) KronosTimeNowRaw(ctx context.Context) (time int64, timeCap int64, err error) {
 	oracleData := k.OracleSM.State(ctx)
-
-	k.mu.Lock()
-	defer k.mu.Unlock()
 
 	if k.isOracle(oracleData) {
 		k.TimeCap.Store(oracleData.TimeCap)
@@ -303,12 +287,27 @@ func (k *Server) KronosTimeNowRaw(ctx context.Context) (time int64, timeCap int6
 	}
 
 	// ensure that KronosTime does not have backward jumps
-	if k.mu.lastKronosTime > t {
-		t = k.mu.lastKronosTime
-	}
-
-	k.mu.lastKronosTime = t
+	t = advance(&k.lastKronosTime, t)
 	return t, oracleData.TimeCap, nil
+}
+
+// advance records t as the latest value served through last and returns the
+// larger of t and the previously served value, so served time never goes back.
+//
+// It is a CAS loop, not a mutex, on purpose. A caller descheduled between the
+// Load and the CAS holds nothing, so it cannot block the others: its CAS fails
+// only if another caller advanced last meanwhile, and since last only grows, a
+// late CAS can never overwrite a newer value.
+func advance(last *atomic.Int64, t int64) int64 {
+	for {
+		prev := last.Load()
+		if prev >= t {
+			return prev
+		}
+		if last.CAS(prev, t) {
+			return t
+		}
+	}
 }
 
 func (k *Server) shouldOverthrowOracle(ctx context.Context) bool {
