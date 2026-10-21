@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -364,6 +365,7 @@ func TestGossipPropagation(t *testing.T) {
 	stopCh := make([]chan struct{}, 4)
 	gossipServers := make([]*Server, 4)
 	grpcServers := make([]*grpc.Server, 4)
+	var serving sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		gossipServers[i] = NewServer(hosts[i],
 			&kronospb.NodeAddr{Host: "localhost",
@@ -378,10 +380,11 @@ func TestGossipPropagation(t *testing.T) {
 		}
 		server := grpc.NewServer()
 		kronospb.RegisterGossipServer(server, gossipServers[i])
+		serving.Add(1)
 		go func() {
-			err := server.Serve(lis)
-			if err != nil {
-				t.Fatalf("Failed to serve: %v", err)
+			defer serving.Done()
+			if err := server.Serve(lis); err != nil {
+				t.Errorf("Failed to serve: %v", err)
 			}
 		}()
 		grpcServers[i] = server
@@ -445,5 +448,7 @@ func TestGossipPropagation(t *testing.T) {
 		close(stopCh[i])
 		grpcServers[i].Stop()
 	}
-
+	// Wait for every Serve to return: t must not be used after the test
+	// ends.
+	serving.Wait()
 }
