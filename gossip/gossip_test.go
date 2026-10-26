@@ -229,6 +229,263 @@ func contains(peers []string, peer string) bool {
 	return false
 }
 
+// descInfo marshals a NodeDescriptor into a gossip Info with the given
+// timestamp, for feeding through updateGossipState in tests.
+func descInfo(t *testing.T, desc *kronospb.NodeDescriptor, ts int64) *kronospb.Info {
+	t.Helper()
+	b, err := protoutil.Marshal(desc)
+	if err != nil {
+		t.Fatalf("failed to marshal descriptor: %v", err)
+	}
+	return &kronospb.Info{Data: b, Timestamp: ts}
+}
+
+// TestRemovedDescriptorNotAddedAsPeer asserts that learning a descriptor with
+// IsRemoved=true via gossip never adds the node to the peer set.
+func TestRemovedDescriptorNotAddedAsPeer(t *testing.T) {
+	g := NewServer("", nil, nil, "")
+	desc := &kronospb.NodeDescriptor{
+		NodeId:    "9",
+		GrpcAddr:  "10.249.16.68:5767",
+		RaftAddr:  "https://10.249.16.68:5767",
+		IsRemoved: true,
+	}
+	g.updateGossipState(map[GossipKey]*kronospb.Info{
+		NodeDescriptorPrefix.Encode("9"): descInfo(t, desc, time.Now().UnixNano()),
+	})
+	if contains(g.GetPeers(), desc.GrpcAddr) {
+		t.Errorf("removed descriptor %s was added to peer set", desc.GrpcAddr)
+	}
+}
+
+// TestRemovePeerTombstones asserts RemovePeer turns a live node into a
+// tombstone: peer dropped, descriptor retained with IsRemoved=true and a fresh
+// timestamp, liveness key deleted.
+func TestRemovePeerTombstones(t *testing.T) {
+	g := NewServer("", nil, nil, "")
+	desc := &kronospb.NodeDescriptor{
+		NodeId:   "9",
+		GrpcAddr: "10.249.16.68:5767",
+		RaftAddr: "https://10.249.16.68:5767",
+	}
+	ts := time.Now().UnixNano()
+	g.updateGossipState(map[GossipKey]*kronospb.Info{
+		NodeDescriptorPrefix.Encode("9"): descInfo(t, desc, ts),
+		LivenessPrefix.Encode("9"):       {Data: []byte("live"), Timestamp: ts},
+	})
+	if !contains(g.GetPeers(), desc.GrpcAddr) {
+		t.Fatalf("precondition: peer %s should be present before removal", desc.GrpcAddr)
+	}
+
+	g.RemovePeer("9")
+
+	if contains(g.GetPeers(), desc.GrpcAddr) {
+		t.Errorf("peer %s still present after RemovePeer", desc.GrpcAddr)
+	}
+	got := g.GetNodeDesc("9")
+	if got == nil {
+		t.Fatalf("descriptor for node 9 was deleted; expected a tombstone")
+	}
+	if !got.IsRemoved {
+		t.Errorf("descriptor for node 9 not marked IsRemoved after RemovePeer")
+	}
+	g.mu.Lock()
+	descKey := NodeDescriptorPrefix.Encode("9")
+	stored, ok := g.data[descKey]
+	_, livenessOK := g.data[LivenessPrefix.Encode("9")]
+	g.mu.Unlock()
+	if !ok {
+		t.Errorf("tombstone descriptor missing from g.data")
+	} else if stored.Timestamp < ts {
+		t.Errorf("tombstone timestamp %d not refreshed (was %d)", stored.Timestamp, ts)
+	}
+	if livenessOK {
+		t.Errorf("liveness key for node 9 should be deleted after RemovePeer")
+	}
+}
+
+// TestRemovePeerUnknownIDWritesTombstone covers the startup / rolling-upgrade
+// case: a node removed before this binary was deployed is not yet in nodeList
+// (its descriptor has not been re-learned from a peer), so RemovePeer must still
+// write a tombstone from a minimal descriptor. Without it, no tombstone is
+// published and the next gossip round resurrects the stale live descriptor.
+func TestRemovePeerUnknownIDWritesTombstone(t *testing.T) {
+	g := NewServer("", nil, nil, "")
+
+	// "9" was never learned: nodeList is empty.
+	if got := g.GetNodeDesc("9"); got != nil {
+		t.Fatalf("precondition: node 9 should be unknown, got %v", got)
+	}
+
+	g.RemovePeer("9")
+
+	got := g.GetNodeDesc("9")
+	if got == nil {
+		t.Fatalf("no tombstone written for unknown node 9")
+	}
+	if !got.IsRemoved {
+		t.Errorf("descriptor for node 9 not marked IsRemoved")
+	}
+	g.mu.Lock()
+	stored, ok := g.data[NodeDescriptorPrefix.Encode("9")]
+	g.mu.Unlock()
+	if !ok {
+		t.Fatalf("tombstone for unknown node 9 not published into g.data")
+	}
+
+	// A later stale live descriptor (older timestamp) must not resurrect it.
+	liveOld := &kronospb.NodeDescriptor{
+		NodeId:   "9",
+		GrpcAddr: "10.249.16.68:5767",
+		RaftAddr: "https://10.249.16.68:5767",
+	}
+	g.updateGossipState(map[GossipKey]*kronospb.Info{
+		NodeDescriptorPrefix.Encode("9"): descInfo(t, liveOld, stored.Timestamp-1),
+	})
+	if contains(g.GetPeers(), liveOld.GrpcAddr) {
+		t.Errorf("stale live descriptor resurrected removed peer %s", liveOld.GrpcAddr)
+	}
+}
+
+// TestRemovedPeerStaysRemovedAfterRelearn is the regression test for the
+// reported bug: once a node is tombstoned, re-learning its old live descriptor
+// (with an older timestamp) must NOT re-add it, and a fresh server that learns
+// a tombstone must never add the peer.
+func TestRemovedPeerStaysRemovedAfterRelearn(t *testing.T) {
+	g := NewServer("", nil, nil, "")
+	desc := &kronospb.NodeDescriptor{
+		NodeId:   "9",
+		GrpcAddr: "10.249.16.68:5767",
+		RaftAddr: "https://10.249.16.68:5767",
+	}
+	oldTs := time.Now().Add(-time.Hour).UnixNano()
+	g.updateGossipState(map[GossipKey]*kronospb.Info{
+		NodeDescriptorPrefix.Encode("9"): descInfo(t, desc, oldTs),
+	})
+	g.RemovePeer("9")
+	if contains(g.GetPeers(), desc.GrpcAddr) {
+		t.Fatalf("peer still present immediately after removal")
+	}
+
+	// Re-learn the OLD live descriptor (older timestamp than the tombstone).
+	liveOld := &kronospb.NodeDescriptor{
+		NodeId:   "9",
+		GrpcAddr: "10.249.16.68:5767",
+		RaftAddr: "https://10.249.16.68:5767",
+	}
+	g.updateGossipState(map[GossipKey]*kronospb.Info{
+		NodeDescriptorPrefix.Encode("9"): descInfo(t, liveOld, oldTs),
+	})
+	if contains(g.GetPeers(), desc.GrpcAddr) {
+		t.Errorf("stale live descriptor resurrected removed peer %s", desc.GrpcAddr)
+	}
+
+	// Restart path: a fresh server that learns a tombstone must never add it.
+	g2 := NewServer("", nil, nil, "")
+	tombstone := &kronospb.NodeDescriptor{
+		NodeId:    "9",
+		GrpcAddr:  "10.249.16.68:5767",
+		RaftAddr:  "https://10.249.16.68:5767",
+		IsRemoved: true,
+	}
+	g2.updateGossipState(map[GossipKey]*kronospb.Info{
+		NodeDescriptorPrefix.Encode("9"): descInfo(t, tombstone, time.Now().UnixNano()),
+	})
+	if contains(g2.GetPeers(), tombstone.GrpcAddr) {
+		t.Errorf("fresh server added tombstoned peer %s on restart path", tombstone.GrpcAddr)
+	}
+
+	// A re-added node (same id) with a NEWER live descriptor must be re-added.
+	reAdded := &kronospb.NodeDescriptor{
+		NodeId:   "9",
+		GrpcAddr: "10.249.16.68:5767",
+		RaftAddr: "https://10.249.16.68:5767",
+	}
+	g.updateGossipState(map[GossipKey]*kronospb.Info{
+		NodeDescriptorPrefix.Encode("9"): descInfo(t, reAdded, time.Now().UnixNano()),
+	})
+	if !contains(g.GetPeers(), reAdded.GrpcAddr) {
+		t.Errorf("re-added node (newer live descriptor) was not restored to peer set")
+	}
+}
+
+// TestRemovePeerNoRaceWithGetNodeList asserts RemovePeer does not mutate a
+// descriptor pointer shared with readers. GetNodeList()/NodeLs()/GetNodeDesc()
+// hand out the nodeList descriptor and callers read it after the lock is
+// released; removeNodeLocked must clone before setting IsRemoved/LastHeartbeat.
+// Run under -race: without the clone this reports a data race.
+func TestRemovePeerNoRaceWithGetNodeList(t *testing.T) {
+	g := NewServer("", nil, nil, "")
+	desc := &kronospb.NodeDescriptor{
+		NodeId:   "9",
+		GrpcAddr: "10.249.16.68:5767",
+		RaftAddr: "https://10.249.16.68:5767",
+	}
+	g.updateGossipState(map[GossipKey]*kronospb.Info{
+		NodeDescriptorPrefix.Encode("9"): descInfo(t, desc, time.Now().UnixNano()),
+	})
+
+	// Reader goroutine races against the removal: it reads the fields that
+	// removeNodeLocked writes, on the pointer GetNodeList returns. RemovePeer
+	// stays in the `ok` branch on every call (the tombstone remains in
+	// nodeList), so it keeps rewriting LastHeartbeat — looping both sides makes
+	// the read/write overlap reliable enough for -race to catch an in-place
+	// mutation.
+	stop := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, d := range g.GetNodeList() {
+				_ = d.IsRemoved
+				_ = d.LastHeartbeat
+			}
+		}
+	}()
+
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for i := 0; i < 2000; i++ {
+			g.RemovePeer("9")
+		}
+	}()
+
+	<-writerDone
+	close(stop)
+	<-readerDone
+}
+
+// TestRemovePeerNoDeadlock asserts RemovePeer terminates: it re-enters
+// updateGossipStateLocked -> processCallbacksLocked -> addPeerLocked for the
+// tombstone key, which must not recurse or deadlock on the non-reentrant mutex.
+func TestRemovePeerNoDeadlock(t *testing.T) {
+	g := NewServer("", nil, nil, "")
+	desc := &kronospb.NodeDescriptor{
+		NodeId:   "9",
+		GrpcAddr: "10.249.16.68:5767",
+		RaftAddr: "https://10.249.16.68:5767",
+	}
+	g.updateGossipState(map[GossipKey]*kronospb.Info{
+		NodeDescriptorPrefix.Encode("9"): descInfo(t, desc, time.Now().UnixNano()),
+	})
+	done := make(chan struct{})
+	go func() {
+		g.RemovePeer("9")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RemovePeer did not return within 5s; likely deadlock or infinite loop")
+	}
+}
+
 func TestGossip(t *testing.T) {
 	t1 := time.Now().UnixNano()
 	t2 := time.Now().Add(time.Second).UnixNano()

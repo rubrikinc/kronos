@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -571,6 +572,141 @@ func TestKronosSanityDeadNode(t *testing.T) {
 	isRemoved, err := tc.Nodes[2].IsNodeRemoved(nodeIDForNewNode)
 	a.NoError(err)
 	a.True(isRemoved)
+}
+
+// TestRemovedNodeNotReDialedAfterRestart reproduces the field scenario where a
+// cluster that had several nodes removed months earlier keeps logging gossip
+// dial errors to the dead nodes forever, including across restarts. Before the
+// gossip-tombstone fix, a restarting survivor re-learned the removed nodes'
+// descriptors from its peers' gossip state and re-added them to its dial set;
+// after the fix, removed descriptors are tombstones that are never re-dialed.
+//
+// The test removes a majority of a 7-node cluster, restarts a survivor so it
+// rebuilds gossip state from scratch (and, with RaftSnapCount=2, exercises the
+// snapshot/WAL-replay removal paths that now also tombstone in gossip), then
+// asserts the survivor does not dial the removed nodes after the restart.
+func TestRemovedNodeNotReDialedAfterRestart(t *testing.T) {
+	ctx, cancelFunc := context.WithTimeout(context.TODO(), testTimeout)
+	defer cancelFunc()
+	fs := afero.NewOsFs()
+	a := assert.New(t)
+	numNodes := 7
+	tc, err := cluster.NewCluster(
+		ctx,
+		cluster.ClusterConfig{
+			Fs:                       fs,
+			NumNodes:                 numNodes,
+			ManageOracleTickInterval: manageOracleTickInterval,
+			// Small snap count so snapshot/WAL-replay removal paths are hit on
+			// restart, not just the live conf-change path.
+			RaftSnapCount: 2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kronosutil.CloseWithErrorLog(ctx, tc)
+
+	removeNode := func(idx int) {
+		if err := tc.RemoveNode(ctx, idx, -1, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 7 nodes need extra time to initialize and elect an oracle.
+	time.Sleep(bootstrapTime)
+	if _, _, err = tc.ValidateTimeInConsensus(
+		ctx,
+		validationThreshold,
+		true, /*checkOnlyRunningNodes*/
+	); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(kronosStabilizationBufferTime)
+
+	// The survivor we will restart and inspect. Keep nodes 0,1,2 alive (nodes 0
+	// and 1 are the gossip seeds) and remove 3..6. We inspect node 2 so the
+	// removals are driven from other nodes and reach node 2 purely via raft /
+	// gossip, mirroring the field setup.
+	const survivor = 2
+	removedGrpcAddrs := make([]string, 0, 4)
+	for _, idx := range []int{3, 4, 5, 6} {
+		removedGrpcAddrs = append(
+			removedGrpcAddrs,
+			// Gossip advertises the grpc endpoint as advertiseHost:grpcPort.
+			tc.Nodes[idx].AdvertiseHost+":"+tc.Nodes[idx].GrpcPort,
+		)
+		removeNode(idx)
+	}
+
+	// Let the removals propagate and the cluster stabilize on the survivors.
+	time.Sleep(2 * kronosStabilizationBufferTime)
+	if _, _, err = tc.ValidateTimeInConsensus(
+		ctx,
+		validationThreshold,
+		true, /*checkOnlyRunningNodes*/
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart the survivor so it rebuilds gossip state from its peers. This is
+	// the step that reproduced the bug: on restart the node pulled peers' full
+	// gossip data (still carrying the removed descriptors) and re-dialed them.
+	logPath := filepath.Join(tc.Nodes[survivor].LogDir, "kronos-stderr.log")
+	preRestartLen := fileLen(fs, logPath)
+	if err := tc.RunOperation(ctx, cluster.Stop, survivor); err != nil {
+		t.Fatal(err)
+	}
+	if err := tc.RunOperation(ctx, cluster.Start, survivor); err != nil {
+		t.Fatal(err)
+	}
+
+	// Give the restarted node several gossip rounds to (incorrectly, pre-fix)
+	// re-learn and start spamming dial errors for the removed nodes.
+	time.Sleep(2 * kronosStabilizationBufferTime)
+	if _, _, err = tc.ValidateTimeInConsensus(
+		ctx,
+		validationThreshold,
+		true, /*checkOnlyRunningNodes*/
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inspect only the log produced AFTER the restart.
+	postRestartLog := readFrom(fs, logPath, preRestartLen)
+	for _, addr := range removedGrpcAddrs {
+		// The gossip loop logs "Error dialing peer <addr>" / "error gossiping
+		// with peer <addr>" once per round for every peer it still tries to
+		// reach. A removed node must not appear at all after the restart.
+		if strings.Contains(postRestartLog, addr) {
+			t.Errorf(
+				"survivor re-dialed removed node %s after restart; found its "+
+					"address in post-restart gossip log", addr,
+			)
+		}
+	}
+	a.NoError(err)
+}
+
+// fileLen returns the current size of path, or 0 if it does not exist.
+func fileLen(fs afero.Fs, path string) int64 {
+	info, err := fs.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+// readFrom returns the contents of path starting at byte offset.
+func readFrom(fs afero.Fs, path string, offset int64) string {
+	b, err := afero.ReadFile(fs, path)
+	if err != nil {
+		return ""
+	}
+	if offset < 0 || offset > int64(len(b)) {
+		offset = 0
+	}
+	return string(b[offset:])
 }
 
 func TestKronosSanityDuplicateNodes(t *testing.T) {

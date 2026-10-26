@@ -357,8 +357,10 @@ func extraNodes(
 	return
 }
 
-// removeNode removes the given nodeID from cluster metadata and raft peers.
-func (rc *raftNode) removeNode(id string) {
+// removeNodeRaftOnly removes the given nodeID from cluster metadata and raft
+// peers, without touching gossip. It is safe to call while gossip's mutex is
+// held (e.g. from the descriptor callback, which runs under g.mu).
+func (rc *raftNode) removeNodeRaftOnly(id string) {
 	rc.cluster.RemoveNode(id)
 	raftID := raftID(id)
 	// check if peerExists before removing the node. Otherwise, when old
@@ -369,6 +371,43 @@ func (rc *raftNode) removeNode(id string) {
 	// of WAL which is replayed.
 	if rc.transport.Get(raftID) != nil {
 		rc.transport.RemovePeer(raftID)
+	}
+}
+
+// removeNode removes the given nodeID from cluster metadata and raft peers, and
+// tombstones it in gossip so it is no longer dialed. This acquires gossip's
+// mutex, so it must NOT be called from a path that already holds it (the gossip
+// descriptor callback / maybeAddRemote use removeNodeRaftOnly instead).
+func (rc *raftNode) removeNode(id string) {
+	rc.removeNodeRaftOnly(id)
+	// Tombstone the node in gossip so it is no longer dialed. Folded in here so
+	// that the genuine removal paths (conf-change apply and snapshot/WAL replay
+	// via updateClusterFromConfState) produce a gossip tombstone. Guarded
+	// because removeNode runs in test paths and during replay before gossip is
+	// attached. Idempotent.
+	if rc.gossip != nil {
+		rc.gossip.RemovePeer(id)
+	}
+}
+
+// tombstoneRemovedNodesOnStartup publishes a gossip tombstone for every node
+// that cluster metadata already marks removed. This covers the rolling-upgrade
+// case: a node removed before this binary was deployed has IsRemoved=true in our
+// persisted metadata, but surviving peers still hold its live descriptor in
+// gossip. Without an explicit tombstone here, the next gossip round would
+// re-learn that live descriptor and re-dial the removed node. RemovePeer writes
+// a tombstone even for an id we have not yet re-learned, so last-writer-wins
+// propagates the removal across the mesh. It is idempotent and nil-guarded for
+// configs without gossip.
+func (rc *raftNode) tombstoneRemovedNodesOnStartup() {
+	if rc.gossip == nil {
+		return
+	}
+	for id, node := range rc.cluster.NodesIncludingRemoved() {
+		if id == rc.nodeID || !node.IsRemoved {
+			continue
+		}
+		rc.gossip.RemovePeer(id)
 	}
 }
 
@@ -784,8 +823,7 @@ func (rc *raftNode) publishEntries(
 			case raftpb.ConfChangeRemoveNode:
 				log.Infof(ctx, "Processing remove node conf change %v", cc)
 				nodeID := types.ID(cc.NodeID).String()
-				rc.removeNode(nodeID)
-				rc.gossip.RemovePeer(nodeID)
+				rc.removeNode(nodeID) // also tombstones the node in gossip
 
 				if err := rc.cluster.Persist(); err != nil {
 					log.Errorf(
@@ -1077,7 +1115,13 @@ func (rc *raftNode) maybeAddRemote(ctx context.Context,
 		return
 	}
 	if desc.IsRemoved {
-		rc.removeNode(desc.NodeId)
+		// This runs from the gossip descriptor callback, which holds gossip's
+		// mutex, so we must not re-enter gossip here. The tombstone we are
+		// reacting to is already in gossip, and gossip's own addPeerLocked has
+		// already dropped the peer from the dial set; we only need the raft-side
+		// cleanup. Calling the gossip-touching removeNode here would deadlock on
+		// g.mu (and be redundant).
+		rc.removeNodeRaftOnly(desc.NodeId)
 		if log.V(1) {
 			log.Infof(ctx, "Node %v is removed, skipping", desc.NodeId)
 		}
@@ -1356,6 +1400,8 @@ func (rc *raftNode) startRaft(
 		addrToURL := kronosutil.AddrToURL(node.RaftAddr, !tlsInfo.Empty())
 		rc.transport.AddPeer(typedID, []string{addrToURL.String()})
 	}
+
+	rc.tombstoneRemovedNodesOnStartup()
 
 	rc.gossip.RegisterCallback(gossip.NodeDescriptorPrefix, func(
 		g *gossip.Server, key gossip.GossipKey, info *kronospb.Info) {
