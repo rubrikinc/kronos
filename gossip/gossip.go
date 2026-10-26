@@ -166,12 +166,27 @@ func (g *Server) removePeerLocked(ctx context.Context, peer string) {
 	g.removeConnLocked(ctx, peer)
 }
 
-// AddPeer adds a new peer to the gossip server.
+// addPeerLocked applies a learned node descriptor to the local peer set. For a
+// live descriptor it adds the node's gRPC address to the dial set; for a removed
+// descriptor (a tombstone) it instead drops the peer and retains the tombstone,
+// so a removed node is never re-dialed even after it is re-learned via gossip.
 func (g *Server) addPeerLocked(ctx context.Context,
 	desc *kronospb.NodeDescriptor) {
 	nodeId := desc.NodeId
 	grpcAddr := desc.GrpcAddr
 	if nodeId == g.nodeID {
+		return
+	}
+	// Removed nodes are tombstones: never dial them, and drop any peer/conn we
+	// may already hold for this id or its (possibly changed) address. The
+	// descriptor is retained in nodeList with IsRemoved=true so the removal is
+	// authoritative and cannot be resurrected by a stale live copy from a peer.
+	if desc.IsRemoved {
+		if oldDesc, ok := g.nodeList[nodeId]; ok {
+			g.removePeerLocked(ctx, oldDesc.GrpcAddr)
+		}
+		g.removePeerLocked(ctx, grpcAddr)
+		g.nodeList[nodeId] = desc
 		return
 	}
 	g.peers.add(grpcAddr)
@@ -499,13 +514,51 @@ func (g *Server) WaitForNRoundsofGossip(timeout time.Duration, n uint64) {
 	}
 }
 
+// RemovePeer marks the node as removed in local gossip state (a tombstone),
+// drops it from the peer set, closes its conn, and stops gossiping its liveness
+// key. The descriptor is retained with IsRemoved=true and a fresh timestamp so
+// the removal propagates to peers and cannot be resurrected by a stale copy.
+// It is idempotent and safe to call from every removal path.
 func (g *Server) RemovePeer(id string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	node := g.nodeList[id]
-	if node != nil {
-		g.removePeerLocked(context.Background(), node.GrpcAddr)
+	g.removeNodeLocked(context.Background(), id)
+}
+
+func (g *Server) removeNodeLocked(ctx context.Context, id string) {
+	// Build the tombstone from the existing descriptor when we have one, else
+	// from a minimal descriptor. The minimal case matters on startup: a node
+	// removed before this binary was deployed is not yet in nodeList (we have
+	// not re-learned its descriptor from a peer), so without this we would write
+	// no tombstone and the next gossip round would resurrect its stale live
+	// descriptor. A bare NodeId tombstone still wins last-writer-wins and is
+	// enough for addPeerLocked to drop the peer when the live copy arrives.
+	desc, ok := g.nodeList[id]
+	if ok {
+		g.removePeerLocked(ctx, desc.GrpcAddr)
+		// Clone before mutating: this pointer is shared with callers via
+		// GetNodeList()/NodeLs()/GetNodeDesc(), which read it after g.mu is
+		// released. Mutating in place races with those reads (-race flags it).
+		desc = protoutil.Clone(desc).(*kronospb.NodeDescriptor)
+	} else {
+		desc = &kronospb.NodeDescriptor{NodeId: id}
 	}
+	desc.IsRemoved = true
+	desc.LastHeartbeat = time.Now().UnixNano()
+	g.nodeList[id] = desc
+	// Refresh the gossiped descriptor so the tombstone wins on timestamp and
+	// propagates to peers that still hold a live copy. This re-enters
+	// processCallbacksLocked -> addPeerLocked for the tombstone key, which
+	// sees IsRemoved, drops the peer, and returns without recursing.
+	if descBytes, err := protoutil.Marshal(desc); err != nil {
+		log.Errorf(ctx, "Error marshalling tombstone for node %s: %v", id, err)
+	} else {
+		g.updateGossipStateLocked(map[GossipKey]*kronospb.Info{
+			NodeDescriptorPrefix.Encode(id): {Data: descBytes, Timestamp: desc.LastHeartbeat},
+		})
+	}
+	// Liveness carries no IsRemoved bit and is pure churn once removed.
+	delete(g.data, LivenessPrefix.Encode(id))
 }
 
 func (g *Server) GetNodeDesc(id string) *kronospb.NodeDescriptor {
@@ -516,9 +569,4 @@ func (g *Server) GetNodeDesc(id string) *kronospb.NodeDescriptor {
 		return nil
 	}
 	return protoutil.Clone(desc).(*kronospb.NodeDescriptor)
-}
-
-func IsNodeLive(desc *kronospb.NodeDescriptor) bool {
-	return desc != nil && desc.IsRemoved == false && desc.
-		LastHeartbeat > time.Now().Add(-5*nodeDescriptorPeriod).UnixNano()
 }

@@ -11,6 +11,7 @@ import (
 	"go.etcd.io/etcd/pkg/v3/transport"
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
 
 	"github.com/rubrikinc/kronos/gossip"
 	"github.com/rubrikinc/kronos/metadata"
@@ -777,4 +778,162 @@ func TestPeerAddrForLog(t *testing.T) {
 	a.Equal("10.0.0.1:5766", node.peerAddrForLog(1))
 	// Unknown peers keep their sentinel rather than rendering an empty addr.
 	a.Equal("unknown", node.peerAddrForLog(2))
+}
+
+// TestDescriptorCallbackTombstoneNoDeadlock guards the lock-reentrancy deadlock
+// that the gossip tombstone fix had to avoid, exercised through the real
+// raftNode.maybeAddRemote path.
+//
+// When a tombstone descriptor is published, gossip fires the registered
+// descriptor callbacks while holding its mutex. The raft descriptor callback
+// reacts to an IsRemoved descriptor via maybeAddRemote, which must do only
+// raft-side cleanup (removeNodeRaftOnly) and must NOT call back into gossip --
+// gossip's mutex is not reentrant, so re-entering RemovePeer from inside the
+// callback self-deadlocks and stalls the removal. Before the fix, maybeAddRemote
+// called removeNode (which calls gossip.RemovePeer) and this test times out;
+// after the fix it returns promptly.
+func TestDescriptorCallbackTombstoneNoDeadlock(t *testing.T) {
+	ctx := context.Background()
+	dataDir, err := ioutil.TempDir("", "tombstone_deadlock")
+	assert.NoError(t, err)
+	defer func() { _ = os.RemoveAll(dataDir) }()
+
+	rc, err := newTestRaftNode(dataDir)
+	assert.NoError(t, err)
+	rc.nodeID = "self"
+	// A zero-value transport is enough: removeNodeRaftOnly only calls Get (which
+	// returns nil for an unknown peer) and, guarded by that, RemovePeer.
+	rc.transport = &rafthttp.Transport{}
+
+	g := gossip.NewServer("self-addr", nil, nil, "")
+	g.SetNodeID(ctx, "self")
+	rc.gossip = g
+
+	// Node "9" must be a live peer in gossip first, so that removing it actually
+	// publishes a tombstone (removeNodeLocked only tombstones a node it knows),
+	// which is what fires the descriptor callback below.
+	liveDesc := &kronospb.NodeDescriptor{
+		NodeId:         "9",
+		GrpcAddr:       "10.249.16.68:5767",
+		RaftAddr:       "https://10.249.16.68:5767",
+		IsBootstrapped: true,
+		LastHeartbeat:  time.Now().UnixNano(),
+	}
+	liveBytes, err := protoutil.Marshal(liveDesc)
+	assert.NoError(t, err)
+	g.SetInfo(gossip.NodeDescriptorPrefix.Encode("9"), liveBytes)
+
+	// Register the real reaction the production code wires up: on a learned
+	// descriptor, run maybeAddRemote. This runs under gossip's mutex.
+	g.RegisterCallback(gossip.NodeDescriptorPrefix, func(
+		gs *gossip.Server, key gossip.GossipKey, info *kronospb.Info) {
+		var desc kronospb.NodeDescriptor
+		if err := protoutil.Unmarshal(info.Data, &desc); err != nil {
+			t.Errorf("failed to unmarshal descriptor in callback: %v", err)
+			return
+		}
+		if desc.NodeId == rc.nodeID {
+			return
+		}
+		rc.maybeAddRemote(ctx, &desc)
+	}, true /*runOnExistingKeys*/)
+
+	// Publishing the tombstone fires the callback under g.mu. maybeAddRemote
+	// must not re-enter gossip.
+	done := make(chan struct{})
+	go func() {
+		rc.removeNode("9")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("removeNode did not return within 5s; the descriptor callback " +
+			"likely re-entered gossip and deadlocked on g.mu")
+	}
+}
+
+// TestTombstoneRemovedNodesOnStartup is the rolling-upgrade regression test. It
+// reproduces the state a reviewer flagged: a node removed by an OLD binary (so
+// no tombstone was ever gossiped) leaves cluster metadata marking it IsRemoved
+// while surviving peers still hold its LIVE descriptor in gossip. On restart
+// onto this binary, the startup pass must tombstone that node from local
+// metadata, otherwise the next gossip round re-learns the live descriptor and
+// re-dials the removed node.
+//
+// Validated fail-on-broken: with tombstoneRemovedNodesOnStartup() removed from
+// startRaft, node "9" stays a live peer and no tombstone is published, so this
+// test fails.
+//
+// Follow-up (not in this PR): an end-to-end acceptance test that genuinely
+// reproduces the rolling upgrade -- remove nodes while the cluster runs the
+// previous (no-tombstone) binary, then restart a survivor onto this binary and
+// assert it never re-dials the removed nodes. The acceptance harness does not
+// yet support per-node binary swaps, so that is tracked separately; this
+// oracle-level test covers the startup logic itself.
+func TestTombstoneRemovedNodesOnStartup(t *testing.T) {
+	ctx := context.Background()
+	dataDir, err := ioutil.TempDir("", "tombstone_startup")
+	assert.NoError(t, err)
+	defer func() { _ = os.RemoveAll(dataDir) }()
+
+	rc, err := newTestRaftNode(dataDir)
+	assert.NoError(t, err)
+	rc.nodeID = "self"
+
+	g := gossip.NewServer("self-addr", nil, nil, "")
+	g.SetNodeID(ctx, "self")
+	rc.gossip = g
+
+	// Metadata knows node "9" and marks it removed -- this is what an old binary
+	// left behind on disk. Gossip was NOT told (no tombstone was ever published).
+	removedAddr := &kronospb.NodeAddr{Host: "10.249.16.68", Port: "5767"}
+	assert.NoError(t, rc.cluster.AddNode("9", removedAddr))
+	rc.cluster.RemoveNode("9")
+	assert.True(t, rc.IsIDRemoved(9))
+
+	// Surviving peers still gossip "9" as a LIVE descriptor. Learning it adds "9"
+	// to the dial set -- exactly the stale state a restarted node rebuilds from
+	// its peers (gossip is not persisted).
+	liveDesc := &kronospb.NodeDescriptor{
+		NodeId:        "9",
+		GrpcAddr:      "10.249.16.68:5767",
+		RaftAddr:      "https://10.249.16.68:5767",
+		LastHeartbeat: time.Now().UnixNano(),
+	}
+	liveBytes, err := protoutil.Marshal(liveDesc)
+	assert.NoError(t, err)
+	g.SetInfo(gossip.NodeDescriptorPrefix.Encode("9"), liveBytes)
+	assert.Contains(t, g.GetPeers(), liveDesc.GrpcAddr,
+		"precondition: live descriptor should have added node 9 to the dial set")
+
+	// The startup pass under test: it should tombstone every removed node.
+	rc.tombstoneRemovedNodesOnStartup()
+
+	// Node "9" must be dropped from the dial set and marked as a tombstone.
+	assert.NotContains(t, g.GetPeers(), liveDesc.GrpcAddr,
+		"removed node 9 still in the dial set after startup tombstone pass")
+	desc := g.GetNodeDesc("9")
+	assert.NotNil(t, desc, "expected a tombstone descriptor for node 9")
+	if desc != nil {
+		assert.True(t, desc.IsRemoved,
+			"descriptor for node 9 not marked IsRemoved after startup pass")
+	}
+
+	// A peer re-gossips the stale LIVE descriptor, carrying its ORIGINAL (older)
+	// timestamp -- the real anti-entropy path, not SetInfo which would stamp
+	// time.Now(). The tombstone must win last-writer-wins and not resurrect "9".
+	staleBytes, err := protoutil.Marshal(liveDesc)
+	assert.NoError(t, err)
+	_, err = g.Gossip(ctx, &kronospb.Request{
+		GossipMap: map[string]*kronospb.Info{
+			string(gossip.NodeDescriptorPrefix.Encode("9")): {
+				Data:      staleBytes,
+				Timestamp: liveDesc.LastHeartbeat,
+			},
+		},
+	})
+	assert.NoError(t, err)
+	assert.NotContains(t, g.GetPeers(), liveDesc.GrpcAddr,
+		"stale live descriptor resurrected removed node 9 after the tombstone")
 }
