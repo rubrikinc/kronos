@@ -945,9 +945,9 @@ func TestProposalFilter(t *testing.T) {
 		s := newBenchServer(t)
 		notTheOracle(s)
 		current := s.OracleSM.State(ctx).Oracle
-		for i := range s.oracleSyncErrs {
-			s.oracleSyncErrs[i].oracle = current
-			s.oracleSyncErrs[i].err = errors.New("boom")
+		for i := range s.oracleSync.errs {
+			s.oracleSync.errs[i].oracle = current
+			s.oracleSync.errs[i].err = errors.New("boom")
 		}
 		s.syncedWithOracleAtleastOnce.Store(true)
 
@@ -1065,4 +1065,49 @@ func BenchmarkKronosClockReadAdvancing(b *testing.B) {
 			})
 		})
 	}
+}
+
+// failingClient fails every OracleTime call, so each sync records an error
+// in the overthrow ring buffer.
+type failingClient struct{ Client }
+
+func (failingClient) OracleTime(
+	context.Context, *kronospb.NodeAddr,
+) (*kronospb.OracleTimeResponse, error) {
+	return nil, errors.New("oracle unreachable")
+}
+
+// TestOverthrowRingBufferRace runs the two goroutines that share the
+// overthrow ring buffer: ManageOracle recording failed syncs, and the raft
+// transport goroutine running the proposal filter on the leader. Run with
+// -race; before the buffer had a mutex this reported a data race.
+func TestOverthrowRingBufferRace(t *testing.T) {
+	ctx := context.Background()
+	defer captureLogs(t)()
+	s := newBenchServer(t)
+	notTheOracle(s)
+	s.Client = failingClient{}
+	s.Metrics = kronosstats.NewTestMetrics()
+	s.manageOracleTickInterval = time.Second
+	// Without this, canOverthrowOracleNow refuses and proposeSelf, which
+	// resets the buffer under the same lock, never runs.
+	s.syncedWithOracleAtleastOnce.Store(true)
+	oracleState := s.OracleSM.State(ctx)
+	proposal := proposalFrom(t, &kronospb.NodeAddr{Host: "127.0.0.2", Port: "5766"})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // ManageOracle
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			s.syncOrOverthrowOracle(ctx, oracleState)
+		}
+	}()
+	go func() { // raft transport goroutine on the leader
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_ = s.proposalFilter(ctx, proposal)
+		}
+	}()
+	wg.Wait()
 }

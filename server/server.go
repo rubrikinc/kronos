@@ -19,6 +19,7 @@ import (
 	"github.com/rubrikinc/kronos/metadata"
 	"github.com/rubrikinc/kronos/oracle"
 	"github.com/rubrikinc/kronos/pb"
+	"github.com/rubrikinc/kronos/syncutil"
 	"github.com/rubrikinc/kronos/tm"
 )
 
@@ -102,15 +103,19 @@ type Server struct {
 	// or extend the oracle lease.
 	manageOracleTickInterval time.Duration
 
-	// oracleSyncPos % numConsecutiveErrsForOverthrow should be the index in
-	// oracleSyncErrs where the next datapoint should be filled.
-	oracleSyncPos int64
-	// oracleSyncErrs is a ring buffer of last few oracle sync datapoints
-	// including both successful and failed sync attempts (err is nil for
-	// successful syncs).
-	oracleSyncErrs [numConsecutiveErrsForOverthrow]struct {
-		oracle *kronospb.NodeAddr
-		err    error
+	// oracleSync is a ring buffer of the last few oracle sync attempts,
+	// both successful and failed (err is nil for successful syncs).
+	// ManageOracle writes it; on the raft leader, proposalFilter reads it
+	// from a raft transport goroutine.
+	oracleSync struct {
+		mu syncutil.Mutex // guards pos and errs
+		// pos % numConsecutiveErrsForOverthrow is the index in errs where
+		// the next datapoint should be filled.
+		pos  int64
+		errs [numConsecutiveErrsForOverthrow]struct {
+			oracle *kronospb.NodeAddr
+			err    error
+		}
 	}
 
 	bootstrapReqCh                             chan kronospb.BootstrapRequest
@@ -313,7 +318,11 @@ func advance(last *atomic.Int64, t int64) int64 {
 func (k *Server) shouldOverthrowOracle(ctx context.Context) bool {
 	// We overthrow the oracle if the last numConsecutiveErrsForOverthrow errors
 	// are non-nil errors on the same oracle.
-	N := int64(len(k.oracleSyncErrs))
+	k.oracleSync.mu.Lock()
+	syncErrs, syncPos := k.oracleSync.errs, k.oracleSync.pos
+	k.oracleSync.mu.Unlock()
+
+	N := int64(len(syncErrs))
 	mod := func(p int64) int64 {
 		// We return the positive remainder for negative inputs as well.
 		return ((p % N) + N) % N
@@ -321,7 +330,7 @@ func (k *Server) shouldOverthrowOracle(ctx context.Context) bool {
 	var oracle *kronospb.NodeAddr
 	var errs []string
 	for i := int64(1); i <= N; i++ {
-		syncErr := k.oracleSyncErrs[mod(k.oracleSyncPos-i)]
+		syncErr := syncErrs[mod(syncPos-i)]
 		if syncErr.err == nil {
 			return false
 		}
@@ -355,10 +364,12 @@ func (k *Server) syncOrOverthrowOracle(
 		k.Metrics.SyncFailureCount.Inc(1)
 	}
 
-	pos := k.oracleSyncPos % int64(len(k.oracleSyncErrs))
-	k.oracleSyncErrs[pos].oracle = oracleState.Oracle
-	k.oracleSyncErrs[pos].err = err
-	k.oracleSyncPos++
+	k.oracleSync.mu.Lock()
+	pos := k.oracleSync.pos % int64(len(k.oracleSync.errs))
+	k.oracleSync.errs[pos].oracle = oracleState.Oracle
+	k.oracleSync.errs[pos].err = err
+	k.oracleSync.pos++
+	k.oracleSync.mu.Unlock()
 	if err != nil {
 		log.Errorf(ctx, "Failed to sync with oracle %s, err: %v",
 			kronosutil.NodeAddrToString(oracleState.Oracle), err)
@@ -708,13 +719,15 @@ func (k *Server) proposeSelf(ctx context.Context, curOracle *kronospb.OracleStat
 	// Clear out the history of errors if we proposed ourselves as oracle. We
 	// might resume following another oracle later and we do not want to take very
 	// old history error values into account making decisions.
-	if k.oracleSyncPos > 0 {
-		for i := 0; i < len(k.oracleSyncErrs); i++ {
-			k.oracleSyncErrs[i].oracle = nil
-			k.oracleSyncErrs[i].err = nil
+	k.oracleSync.mu.Lock()
+	if k.oracleSync.pos > 0 {
+		for i := 0; i < len(k.oracleSync.errs); i++ {
+			k.oracleSync.errs[i].oracle = nil
+			k.oracleSync.errs[i].err = nil
 		}
-		k.oracleSyncPos = 0
+		k.oracleSync.pos = 0
 	}
+	k.oracleSync.mu.Unlock()
 }
 
 // ServerStatus returns the current status of the server
