@@ -1040,15 +1040,19 @@ func TestAdvance(t *testing.T) {
 // BenchmarkKronosClockReadAdvancing reads through the production clock, which
 // moves on every call, so each read also publishes a new last-served value.
 // The frozen ManualClock in BenchmarkKronosTimeNow hides that write, which is
-// where the contention is.
+// where the contention is. time and uptime read on the oracle; the nonoracle
+// cases read on any other node, which skips the oracle's cap refresh.
 func BenchmarkKronosClockReadAdvancing(b *testing.B) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		name string
-		read func(*Server)
+		name      string
+		nonOracle bool
+		read      func(*Server)
 	}{
-		{"time", func(s *Server) { _, _, _ = s.KronosTimeNowRaw(ctx) }},
-		{"uptime", func(s *Server) { _, _, _ = s.KronosUptimeNowRaw(ctx) }},
+		{"time", false, func(s *Server) { _, _, _ = s.KronosTimeNowRaw(ctx) }},
+		{"uptime", false, func(s *Server) { _, _, _ = s.KronosUptimeNowRaw(ctx) }},
+		{"nonoracle/time", true, func(s *Server) { _, _, _ = s.KronosTimeNowRaw(ctx) }},
+		{"nonoracle/uptime", true, func(s *Server) { _, _, _ = s.KronosUptimeNowRaw(ctx) }},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			s := newBenchServer(b)
@@ -1057,6 +1061,11 @@ func BenchmarkKronosClockReadAdvancing(b *testing.B) {
 			s.OracleSM.SubmitProposal(ctx, &kronospb.OracleProposal{ProposedState: &kronospb.OracleState{
 				Id: 2, TimeCap: math.MaxInt64 / 2, KronosUptimeCap: math.MaxInt64 / 2, Oracle: s.GRPCAddr,
 			}})
+			if tc.nonOracle {
+				notTheOracle(s)
+				s.TimeCap.Store(math.MaxInt64 / 2) // as a sync with the oracle would
+				s.UptimeCap.Store(math.MaxInt64 / 2)
+			}
 			b.ReportAllocs()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
@@ -1110,4 +1119,66 @@ func TestOverthrowRingBufferRace(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// pausingSM hands the first State() caller the snapshot it holds now, then
+// blocks that caller until release is closed, as if it were descheduled
+// between reading the oracle state and publishing its caps. Later callers
+// do not wait.
+type pausingSM struct {
+	oracle.StateMachine
+	taken   atomic.Bool
+	paused  chan struct{}
+	release chan struct{}
+}
+
+func (p *pausingSM) State(ctx context.Context) *kronospb.OracleState {
+	st := p.StateMachine.State(ctx)
+	if p.taken.CAS(false, true) {
+		close(p.paused)
+		<-p.release
+	}
+	return st
+}
+
+// TestOracleCapNotLoweredByStaleRead: on the oracle, a reader that loaded the
+// state before a lease extension and publishes after a newer reader must not
+// lower TimeCap or UptimeCap back to the old values.
+func TestOracleCapNotLoweredByStaleRead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		read func(*Server, context.Context)
+	}{
+		{"time", func(s *Server, ctx context.Context) { _, _, _ = s.KronosTimeNowRaw(ctx) }},
+		{"uptime", func(s *Server, ctx context.Context) { _, _, _ = s.KronosUptimeNowRaw(ctx) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := newBenchServer(t) // its own oracle
+			old := s.OracleSM.State(ctx)
+			p := &pausingSM{StateMachine: s.OracleSM,
+				paused: make(chan struct{}), release: make(chan struct{})}
+			s.OracleSM = p
+
+			done := make(chan struct{})
+			go func() { // reader A: takes the old snapshot, then pauses
+				defer close(done)
+				tc.read(s, ctx)
+			}()
+			<-p.paused
+
+			// The lease extends while A is paused, and reader B publishes it.
+			p.SubmitProposal(ctx, &kronospb.OracleProposal{ProposedState: &kronospb.OracleState{
+				Id: old.Id + 1, TimeCap: 2 * old.TimeCap,
+				KronosUptimeCap: 2 * old.KronosUptimeCap, Oracle: old.Oracle,
+			}})
+			tc.read(s, ctx)
+			assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load())
+
+			close(p.release) // A resumes and publishes its old snapshot
+			<-done
+			assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "TimeCap lowered")
+			assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
+		})
+	}
 }
