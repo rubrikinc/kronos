@@ -5,9 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math"
 	"math/rand"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -1036,6 +1040,113 @@ func TestAdvance(t *testing.T) {
 	a.EqualValues(5, last.Load())       // and does not lower the record
 	a.EqualValues(9, advance(&last, 9))
 	a.EqualValues(9, last.Load())
+}
+
+// lastServedFields are written by every clock read; hotReadFields are read
+// by every clock read and rarely written. TestHotFieldListsMatchCode keeps
+// both lists in sync with the code.
+var (
+	lastServedFields = []string{"lastKronosTime", "lastKronosUptime"}
+	hotReadFields    = []string{
+		"OracleSM", "GRPCAddr", "Clock", "OracleDelta", "OracleUptimeDelta",
+		"TimeCap", "UptimeCap", "status",
+	}
+	// hotPathRoots are the clock reads CockroachDB's hot path calls.
+	hotPathRoots = []string{"KronosTimeNowRaw", "KronosUptimeNowRaw"}
+)
+
+// TestLastServedPadding checks that no 128-byte block, the pair of 64-byte
+// lines Intel's spatial prefetcher fetches together, holds a last-served value
+// together with any other hot field. It checks every start address Go can give
+// a Server, 8-aligned, so the layout does not depend on the allocator's size
+// classes.
+func TestLastServedPadding(t *testing.T) {
+	typ := reflect.TypeOf(Server{})
+	span := func(name string) (lo, hi uintptr) {
+		f, ok := typ.FieldByName(name)
+		require.True(t, ok, "Server has no field %s", name)
+		return f.Offset, f.Offset + f.Type.Size() // [lo, hi)
+	}
+	for _, w := range lastServedFields {
+		wlo, whi := span(w)
+		for _, o := range append(append([]string{}, hotReadFields...), lastServedFields...) {
+			if o == w {
+				continue
+			}
+			olo, ohi := span(o)
+			var shared []uintptr
+			for base := uintptr(0); base < 128; base += 8 {
+				wFirst, wLast := (base+wlo)/128, (base+whi-1)/128
+				oFirst, oLast := (base+olo)/128, (base+ohi-1)/128
+				if !(wLast < oFirst || oLast < wFirst) {
+					shared = append(shared, base)
+				}
+			}
+			assert.Empty(t, shared, "%s [%d,%d) and %s [%d,%d) share a 128-byte block when Server starts at these offsets mod 128",
+				w, wlo, whi, o, olo, ohi)
+		}
+	}
+}
+
+// TestHotFieldListsMatchCode parses server.go, follows every Server method
+// the hot-path roots call, and fails if those methods touch a Server field
+// missing from the lists above, or if a listed field is no longer touched. A
+// new hot field, or a new helper reading one, cannot slip past the padding
+// check.
+func TestHotFieldListsMatchCode(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "server.go", nil, 0)
+	require.NoError(t, err)
+	methods := map[string]*ast.FuncDecl{}
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil && fn.Body != nil {
+			methods[fn.Name.Name] = fn
+		}
+	}
+	isField := map[string]bool{}
+	typ := reflect.TypeOf(Server{})
+	for i := 0; i < typ.NumField(); i++ {
+		isField[typ.Field(i).Name] = true
+	}
+	listed := map[string]bool{}
+	for _, f := range append(append([]string{}, lastServedFields...), hotReadFields...) {
+		require.True(t, isField[f], "listed field %s is not a Server field", f)
+		listed[f] = true
+	}
+
+	used, reached := map[string]bool{}, map[string]bool{}
+	queue := append([]string{}, hotPathRoots...)
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if reached[name] {
+			continue
+		}
+		fn, ok := methods[name]
+		require.True(t, ok, "hot-path method %s not found in server.go", name)
+		reached[name] = true
+		recv := fn.Recv.List[0].Names[0].Name
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if id, ok := sel.X.(*ast.Ident); !ok || id.Name != recv {
+				return true
+			}
+			switch f := sel.Sel.Name; {
+			case isField[f]:
+				used[f] = true
+				assert.True(t, listed[f], "%s touches Server.%s, which is in neither hotReadFields nor lastServedFields", name, f)
+			case methods[f] != nil:
+				queue = append(queue, f)
+			}
+			return true
+		})
+	}
+	t.Logf("hot-path methods: %v", reached)
+	for f := range listed {
+		assert.True(t, used[f], "Server.%s is listed as hot but no hot-path method touches it", f)
+	}
 }
 
 // BenchmarkKronosClockReadAdvancing reads through the production clock, which
