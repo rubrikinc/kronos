@@ -360,8 +360,11 @@ func (k *Server) syncOrOverthrowOracle(
 ) (synced bool) {
 	err := k.trySyncWithOracle(ctx, oracleState.Oracle)
 	if err == nil {
-		k.TimeCap.Store(oracleState.TimeCap)
-		k.UptimeCap.Store(oracleState.KronosUptimeCap)
+		// advance, not Store: this node may have become the oracle after this
+		// tick read oracleState, and a reader may already have published the
+		// newer state's caps.
+		advance(&k.TimeCap, oracleState.TimeCap)
+		advance(&k.UptimeCap, oracleState.KronosUptimeCap)
 		k.syncedWithOracleAtleastOnce.Store(true)
 		k.Metrics.SyncSuccessCount.Inc(1)
 	} else {
