@@ -1263,3 +1263,50 @@ func TestOracleCapNotLoweredByTick(t *testing.T) {
 	assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "TimeCap lowered")
 	assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
 }
+
+// TestOracleCapNotLoweredBySyncAfterBecomingOracle: a follower's tick reads a
+// state naming another oracle, then this node becomes the oracle with higher
+// caps and a reader publishes them. The tick's successful sync with the old
+// oracle must not lower the new oracle's caps.
+func TestOracleCapNotLoweredBySyncAfterBecomingOracle(t *testing.T) {
+	ctx := context.Background()
+	defer captureLogs(t)()
+	s := newBenchServer(t)
+	s.Metrics = kronosstats.NewTestMetrics()
+	s.StopC = make(chan struct{})
+	notTheOracle(s) // this node moves to a new address; the state names the old one
+	old := s.OracleSM.State(ctx)
+	s.TimeCap.Store(old.TimeCap) // as an earlier sync would
+	s.UptimeCap.Store(old.KronosUptimeCap)
+	// The old oracle answers at this node's own time, so the sync succeeds
+	// without moving the delta.
+	s.Client = &simpleMockClient{response: &kronospb.OracleTimeResponse{
+		Time: s.Clock.Now(), Uptime: s.Clock.Uptime(), Rtt: int64(time.Millisecond),
+	}}
+	p := &pausingSM{StateMachine: s.OracleSM,
+		paused: make(chan struct{}), release: make(chan struct{})}
+	s.OracleSM = p
+
+	tick := make(chan time.Time, 1)
+	tick <- time.Time{}
+	done := make(chan struct{})
+	go func() { // the tick reads the old state, then pauses
+		defer close(done)
+		s.ManageOracle(tick, func() { close(s.StopC) })
+	}()
+	<-p.paused
+
+	// This node becomes the oracle with higher caps, and a reader publishes them.
+	p.StateMachine.SubmitProposal(ctx, &kronospb.OracleProposal{ProposedState: &kronospb.OracleState{
+		Id: old.Id + 1, TimeCap: 2 * old.TimeCap,
+		KronosUptimeCap: 2 * old.KronosUptimeCap, Oracle: s.GRPCAddr,
+	}})
+	_, _, _ = s.KronosTimeNowRaw(ctx)
+	assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load())
+	assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load())
+
+	close(p.release) // the tick resumes and syncs with the old oracle
+	<-done
+	assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "TimeCap lowered")
+	assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
+}
