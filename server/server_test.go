@@ -1174,6 +1174,7 @@ func TestOracleCapNotLoweredByStaleRead(t *testing.T) {
 			}})
 			tc.read(s, ctx)
 			assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load())
+			assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load())
 
 			close(p.release) // A resumes and publishes its old snapshot
 			<-done
@@ -1181,4 +1182,84 @@ func TestOracleCapNotLoweredByStaleRead(t *testing.T) {
 			assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
 		})
 	}
+}
+
+// readOnProposeSM runs a clock read as soon as a proposal is applied, so a
+// reader publishes the new caps before the proposer's next statement runs.
+type readOnProposeSM struct {
+	oracle.StateMachine
+	s *Server
+}
+
+func (r *readOnProposeSM) SubmitProposal(ctx context.Context, p *kronospb.OracleProposal) {
+	r.StateMachine.SubmitProposal(ctx, p)
+	_, _, _ = r.s.KronosTimeNowRaw(ctx)
+}
+
+// TestOracleCapNotLoweredByInitialize: initialize publishes the caps of the
+// state it read before proposeSelf. That must not lower the caps of the newer
+// state a reader published in between.
+func TestOracleCapNotLoweredByInitialize(t *testing.T) {
+	ctx := context.Background()
+	s := newBenchServer(t) // its own oracle
+	s.Metrics = kronosstats.NewTestMetrics()
+	s.StopC = make(chan struct{})
+	s.status.Store(kronospb.ServerStatus_NOT_INITIALIZED)
+	s.TimeCap.Store(0)
+	s.UptimeCap.Store(0)
+	before := s.OracleSM.State(ctx)
+	s.OracleSM = &readOnProposeSM{StateMachine: s.OracleSM, s: s}
+
+	// initialize yields for numConsecutiveErrsForOverthrow+1 ticks before
+	// claiming the oracle role.
+	tick := make(chan time.Time, numConsecutiveErrsForOverthrow+2)
+	for i := 0; i < cap(tick); i++ {
+		tick <- time.Time{}
+	}
+	s.initialize(ctx, tick, func() {})
+
+	after := s.OracleSM.State(ctx)
+	if !assert.Greater(t, after.TimeCap, before.TimeCap, "proposeSelf did not raise the state's cap") {
+		return
+	}
+	assert.EqualValues(t, kronospb.ServerStatus_INITIALIZED, s.ServerStatus())
+	assert.EqualValues(t, after.TimeCap, s.TimeCap.Load(), "TimeCap lowered")
+	assert.EqualValues(t, after.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
+}
+
+// TestOracleCapNotLoweredByTick: raft applies proposals asynchronously, so a
+// newer state can land after a ManageOracle tick reads the state. A reader
+// that published it must not have its caps lowered by the tick.
+func TestOracleCapNotLoweredByTick(t *testing.T) {
+	ctx := context.Background()
+	s := newBenchServer(t) // its own oracle, initialized
+	s.Metrics = kronosstats.NewTestMetrics()
+	s.StopC = make(chan struct{})
+	old := s.OracleSM.State(ctx)
+	p := &pausingSM{StateMachine: s.OracleSM,
+		paused: make(chan struct{}), release: make(chan struct{})}
+	s.OracleSM = p
+
+	tick := make(chan time.Time, 1)
+	tick <- time.Time{}
+	done := make(chan struct{})
+	go func() { // the tick reads the old state, then pauses
+		defer close(done)
+		s.ManageOracle(tick, func() { close(s.StopC) })
+	}()
+	<-p.paused
+
+	// A newer state lands while the tick is paused, and a reader publishes it.
+	p.StateMachine.SubmitProposal(ctx, &kronospb.OracleProposal{ProposedState: &kronospb.OracleState{
+		Id: old.Id + 1, TimeCap: 2 * old.TimeCap,
+		KronosUptimeCap: 2 * old.KronosUptimeCap, Oracle: old.Oracle,
+	}})
+	_, _, _ = s.KronosTimeNowRaw(ctx)
+	assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load())
+	assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load())
+
+	close(p.release) // the tick resumes with its old state
+	<-done
+	assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "TimeCap lowered")
+	assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
 }

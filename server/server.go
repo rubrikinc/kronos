@@ -592,8 +592,10 @@ func (k *Server) initialize(ctx context.Context, tickCh <-chan time.Time, tickCa
 					time.Duration(k.OracleUptimeDelta.Load()),
 				)
 				k.proposeSelf(ctx, oracleState)
-				k.TimeCap.Store(oracleState.TimeCap)
-				k.UptimeCap.Store(oracleState.KronosUptimeCap)
+				// advance, not Store: oracleState was read before proposeSelf, and a
+				// reader may already have published the newer state's caps.
+				advance(&k.TimeCap, oracleState.TimeCap)
+				advance(&k.UptimeCap, oracleState.KronosUptimeCap)
 				// This server is the oracle. It is now initialized.
 				k.status.Store(kronospb.ServerStatus_INITIALIZED)
 
@@ -664,8 +666,11 @@ func (k *Server) ManageOracle(tickCh <-chan time.Time, tickCallback func()) {
 						time.Duration(k.OracleUptimeDelta.Load()),
 					)
 				}
-				k.TimeCap.Store(oracleState.TimeCap)
-				k.UptimeCap.Store(oracleState.KronosUptimeCap)
+				// advance, not Store: raft applies proposals asynchronously, so a
+				// newer state may have landed after this tick read oracleState, and a
+				// reader may already have published its caps.
+				advance(&k.TimeCap, oracleState.TimeCap)
+				advance(&k.UptimeCap, oracleState.KronosUptimeCap)
 				k.proposeSelf(ctx, oracleState)
 
 			default:
