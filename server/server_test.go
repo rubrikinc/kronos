@@ -22,6 +22,7 @@ import (
 	"github.com/rubrikinc/kronos/tm"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 )
 
@@ -1040,15 +1041,19 @@ func TestAdvance(t *testing.T) {
 // BenchmarkKronosClockReadAdvancing reads through the production clock, which
 // moves on every call, so each read also publishes a new last-served value.
 // The frozen ManualClock in BenchmarkKronosTimeNow hides that write, which is
-// where the contention is.
+// where the contention is. time and uptime read on the oracle; the nonoracle
+// cases read on any other node, which skips the oracle's cap refresh.
 func BenchmarkKronosClockReadAdvancing(b *testing.B) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		name string
-		read func(*Server)
+		name      string
+		nonOracle bool
+		read      func(*Server)
 	}{
-		{"time", func(s *Server) { _, _, _ = s.KronosTimeNowRaw(ctx) }},
-		{"uptime", func(s *Server) { _, _, _ = s.KronosUptimeNowRaw(ctx) }},
+		{"time", false, func(s *Server) { _, _, _ = s.KronosTimeNowRaw(ctx) }},
+		{"uptime", false, func(s *Server) { _, _, _ = s.KronosUptimeNowRaw(ctx) }},
+		{"nonoracle/time", true, func(s *Server) { _, _, _ = s.KronosTimeNowRaw(ctx) }},
+		{"nonoracle/uptime", true, func(s *Server) { _, _, _ = s.KronosUptimeNowRaw(ctx) }},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			s := newBenchServer(b)
@@ -1057,6 +1062,11 @@ func BenchmarkKronosClockReadAdvancing(b *testing.B) {
 			s.OracleSM.SubmitProposal(ctx, &kronospb.OracleProposal{ProposedState: &kronospb.OracleState{
 				Id: 2, TimeCap: math.MaxInt64 / 2, KronosUptimeCap: math.MaxInt64 / 2, Oracle: s.GRPCAddr,
 			}})
+			if tc.nonOracle {
+				notTheOracle(s)
+				s.TimeCap.Store(math.MaxInt64 / 2) // as a sync with the oracle would
+				s.UptimeCap.Store(math.MaxInt64 / 2)
+			}
 			b.ReportAllocs()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
@@ -1110,4 +1120,262 @@ func TestOverthrowRingBufferRace(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// The TestOracleCapNotLowered* tests stage one interleaving each: a writer
+// holds an older oracle state while a newer one is applied and a reader
+// publishes its caps; the writer then resumes and must not lower them. Each
+// test requires every step of that setup (the newer state was applied, the
+// reader published its caps, the writer took the intended branch) before it
+// checks the caps, so a broken setup fails with its own message instead of
+// passing on code it never ran. Every wait is bounded by capTestTimeout.
+
+// pausingSM hands the first State() caller the snapshot it holds now, then
+// blocks that caller until release is closed, as if it were descheduled
+// between reading the oracle state and publishing its caps. Later callers
+// do not wait.
+type pausingSM struct {
+	oracle.StateMachine
+	taken   atomic.Bool
+	resumed atomic.Bool
+	paused  chan struct{}
+	release chan struct{}
+}
+
+func newPausingSM(sm oracle.StateMachine) *pausingSM {
+	return &pausingSM{StateMachine: sm, paused: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (p *pausingSM) State(ctx context.Context) *kronospb.OracleState {
+	st := p.StateMachine.State(ctx)
+	if p.taken.CAS(false, true) {
+		close(p.paused)
+		<-p.release
+	}
+	return st
+}
+
+// resume releases the paused caller and waits, bounded, for its goroutine to
+// signal done. Safe to call more than once, so tests can also defer it: a
+// failed require then still stops the goroutine before the test ends.
+func (p *pausingSM) resume(t *testing.T, done <-chan struct{}, what string) {
+	t.Helper()
+	if p.resumed.CAS(false, true) {
+		close(p.release)
+	}
+	waitOrFail(t, done, what)
+}
+
+// capTestTimeout bounds every wait in the cap tests, so a change that breaks
+// their interleaving fails fast instead of hanging the package.
+const capTestTimeout = 5 * time.Second
+
+func waitOrFail(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(capTestTimeout):
+		t.Fatalf("timed out after %v waiting for %s", capTestTimeout, what)
+	}
+}
+
+// proposeHigherCaps applies the next state with doubled caps, naming owner as
+// oracle, and fails the test if the state machine rejects it. Pass the
+// unwrapped state machine: its State call must not be the one a pausingSM
+// pauses.
+func proposeHigherCaps(
+	ctx context.Context, t *testing.T, sm oracle.StateMachine, old *kronospb.OracleState, owner *kronospb.NodeAddr,
+) {
+	t.Helper()
+	sm.SubmitProposal(ctx, &kronospb.OracleProposal{ProposedState: &kronospb.OracleState{
+		Id: old.Id + 1, TimeCap: 2 * old.TimeCap,
+		KronosUptimeCap: 2 * old.KronosUptimeCap, Oracle: owner,
+	}})
+	got := sm.State(ctx)
+	require.EqualValues(t, old.Id+1, got.Id, "proposal rejected")
+	require.EqualValues(t, 2*old.TimeCap, got.TimeCap, "proposal rejected")
+}
+
+// TestOracleCapNotLoweredByStaleRead: on the oracle, a reader that loaded the
+// state before a lease extension and publishes after a newer reader must not
+// lower TimeCap or UptimeCap back to the old values.
+func TestOracleCapNotLoweredByStaleRead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		read func(*Server, context.Context)
+	}{
+		{"time", func(s *Server, ctx context.Context) { _, _, _ = s.KronosTimeNowRaw(ctx) }},
+		{"uptime", func(s *Server, ctx context.Context) { _, _, _ = s.KronosUptimeNowRaw(ctx) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := newBenchServer(t) // its own oracle
+			old := s.OracleSM.State(ctx)
+			require.True(t, s.isOracle(old), "setup: server must be the oracle")
+			p := newPausingSM(s.OracleSM)
+			s.OracleSM = p
+
+			done := make(chan struct{})
+			go func() { // reader A: takes the old snapshot, then pauses
+				defer close(done)
+				tc.read(s, ctx)
+			}()
+			waitOrFail(t, p.paused, "reader A to read the state")
+			defer p.resume(t, done, "reader A to finish")
+
+			// The lease extends while A is paused, and reader B publishes it.
+			proposeHigherCaps(ctx, t, p.StateMachine, old, old.Oracle)
+			tc.read(s, ctx)
+			require.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "setup: reader B did not publish TimeCap")
+			require.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "setup: reader B did not publish UptimeCap")
+
+			p.resume(t, done, "reader A to finish") // A publishes its old snapshot
+			assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "TimeCap lowered")
+			assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
+		})
+	}
+}
+
+// readOnProposeSM runs a clock read as soon as a proposal is applied, so a
+// reader publishes the new caps before the proposer's next statement runs.
+type readOnProposeSM struct {
+	oracle.StateMachine
+	s     *Server
+	reads atomic.Int64 // proposals followed by a read
+}
+
+func (r *readOnProposeSM) SubmitProposal(ctx context.Context, p *kronospb.OracleProposal) {
+	r.StateMachine.SubmitProposal(ctx, p)
+	_, _, _ = r.s.KronosTimeNowRaw(ctx)
+	r.reads.Inc()
+}
+
+// TestOracleCapNotLoweredByInitialize: initialize publishes the caps of the
+// state it read before proposeSelf. That must not lower the caps of the newer
+// state a reader published in between.
+func TestOracleCapNotLoweredByInitialize(t *testing.T) {
+	ctx := context.Background()
+	s := newBenchServer(t) // its own oracle
+	s.Metrics = kronosstats.NewTestMetrics()
+	s.StopC = make(chan struct{})
+	s.status.Store(kronospb.ServerStatus_NOT_INITIALIZED)
+	s.TimeCap.Store(0)
+	s.UptimeCap.Store(0)
+	before := s.OracleSM.State(ctx)
+	require.True(t, s.isOracle(before), "setup: server must be the oracle")
+	r := &readOnProposeSM{StateMachine: s.OracleSM, s: s}
+	s.OracleSM = r
+
+	// initialize yields for numConsecutiveErrsForOverthrow+1 ticks before
+	// claiming the oracle role. One spare tick; if it is not enough the
+	// bounded wait below fails instead of hanging.
+	tick := make(chan time.Time, numConsecutiveErrsForOverthrow+2)
+	for i := 0; i < cap(tick); i++ {
+		tick <- time.Time{}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.initialize(ctx, tick, func() {})
+	}()
+	defer close(s.StopC) // stops initialize if the wait below times out
+	waitOrFail(t, done, "initialize to claim the oracle role")
+
+	// Prove initialize took the oracle branch, proposed, and a reader ran in
+	// between; otherwise the cap checks below would prove nothing.
+	require.EqualValues(t, kronospb.ServerStatus_INITIALIZED, s.ServerStatus(), "initialize did not finish")
+	require.EqualValues(t, 1, s.Metrics.IsOracle.Value(), "initialize did not take the oracle branch")
+	require.EqualValues(t, 1, r.reads.Load(), "proposeSelf did not apply exactly one proposal")
+	after := s.OracleSM.State(ctx)
+	require.Greater(t, after.TimeCap, before.TimeCap, "proposeSelf did not raise the state's TimeCap")
+	require.Greater(t, after.KronosUptimeCap, before.KronosUptimeCap, "proposeSelf did not raise the state's UptimeCap")
+
+	assert.EqualValues(t, after.TimeCap, s.TimeCap.Load(), "TimeCap lowered")
+	assert.EqualValues(t, after.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
+}
+
+// TestOracleCapNotLoweredByTick: raft applies proposals asynchronously, so a
+// newer state can land after a ManageOracle tick reads the state. A reader
+// that published it must not have its caps lowered by the tick.
+func TestOracleCapNotLoweredByTick(t *testing.T) {
+	ctx := context.Background()
+	s := newBenchServer(t) // its own oracle, initialized
+	s.Metrics = kronosstats.NewTestMetrics()
+	s.StopC = make(chan struct{})
+	old := s.OracleSM.State(ctx)
+	require.True(t, s.isOracle(old), "setup: server must be the oracle")
+	p := newPausingSM(s.OracleSM)
+	s.OracleSM = p
+
+	tick := make(chan time.Time, 1)
+	tick <- time.Time{}
+	done := make(chan struct{})
+	go func() { // the tick reads the old state, then pauses
+		defer close(done)
+		s.ManageOracle(tick, func() { close(s.StopC) })
+	}()
+	waitOrFail(t, p.paused, "the tick to read the state")
+	defer p.resume(t, done, "ManageOracle to stop")
+
+	// A newer state lands while the tick is paused, and a reader publishes it.
+	proposeHigherCaps(ctx, t, p.StateMachine, old, old.Oracle)
+	_, _, _ = s.KronosTimeNowRaw(ctx)
+	require.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "setup: reader did not publish TimeCap")
+	require.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "setup: reader did not publish UptimeCap")
+
+	p.resume(t, done, "ManageOracle to stop") // the tick resumes with its old state
+	// Read after ManageOracle exits: the gauge is not safe to read concurrently.
+	require.EqualValues(t, 1, s.Metrics.IsOracle.Value(), "the tick did not take the oracle branch")
+	assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "TimeCap lowered")
+	assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
+}
+
+// TestOracleCapNotLoweredBySyncAfterBecomingOracle: a follower's tick reads a
+// state naming another oracle, then this node becomes the oracle with higher
+// caps and a reader publishes them. The tick's successful sync with the old
+// oracle must not lower the new oracle's caps.
+func TestOracleCapNotLoweredBySyncAfterBecomingOracle(t *testing.T) {
+	ctx := context.Background()
+	defer captureLogs(t)()
+	s := newBenchServer(t)
+	s.Metrics = kronosstats.NewTestMetrics()
+	s.StopC = make(chan struct{})
+	notTheOracle(s) // this node moves to a new address; the state names the old one
+	old := s.OracleSM.State(ctx)
+	s.TimeCap.Store(old.TimeCap) // as an earlier sync would
+	s.UptimeCap.Store(old.KronosUptimeCap)
+	// The old oracle answers at this node's own time, so the sync succeeds
+	// without moving the delta.
+	s.Client = &simpleMockClient{response: &kronospb.OracleTimeResponse{
+		Time: s.Clock.Now(), Uptime: s.Clock.Uptime(), Rtt: int64(time.Millisecond),
+	}}
+	require.False(t, s.isOracle(old), "setup: server must not be the oracle")
+	require.False(t, s.syncedWithOracleAtleastOnce.Load(), "setup: no earlier sync")
+	p := newPausingSM(s.OracleSM)
+	s.OracleSM = p
+
+	tick := make(chan time.Time, 1)
+	tick <- time.Time{}
+	done := make(chan struct{})
+	go func() { // the tick reads the old state, then pauses
+		defer close(done)
+		s.ManageOracle(tick, func() { close(s.StopC) })
+	}()
+	waitOrFail(t, p.paused, "the tick to read the state")
+	defer p.resume(t, done, "ManageOracle to stop")
+
+	// This node becomes the oracle with higher caps, and a reader publishes them.
+	proposeHigherCaps(ctx, t, p.StateMachine, old, s.GRPCAddr)
+	require.True(t, s.isOracle(p.StateMachine.State(ctx)), "setup: server must now be the oracle")
+	_, _, _ = s.KronosTimeNowRaw(ctx)
+	require.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "setup: reader did not publish TimeCap")
+	require.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "setup: reader did not publish UptimeCap")
+
+	p.resume(t, done, "ManageOracle to stop") // the tick resumes and syncs with the old oracle
+	// Prove the tick took the follower branch and its sync succeeded, so the
+	// write under test ran. Read after ManageOracle exits.
+	require.EqualValues(t, 0, s.Metrics.IsOracle.Value(), "the tick did not take the follower branch")
+	require.True(t, s.syncedWithOracleAtleastOnce.Load(), "the sync with the old oracle did not succeed")
+	assert.EqualValues(t, 2*old.TimeCap, s.TimeCap.Load(), "TimeCap lowered")
+	assert.EqualValues(t, 2*old.KronosUptimeCap, s.UptimeCap.Load(), "UptimeCap lowered")
 }
