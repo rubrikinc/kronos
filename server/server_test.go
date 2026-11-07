@@ -1122,12 +1122,18 @@ func TestOverthrowRingBufferRace(t *testing.T) {
 	wg.Wait()
 }
 
+// The TestOracleCapNotLowered* tests stage one interleaving each: a writer
+// holds an older oracle state while a newer one is applied and a reader
+// publishes its caps; the writer then resumes and must not lower them. Each
+// test requires every step of that setup (the newer state was applied, the
+// reader published its caps, the writer took the intended branch) before it
+// checks the caps, so a broken setup fails with its own message instead of
+// passing on code it never ran. Every wait is bounded by capTestTimeout.
+
 // pausingSM hands the first State() caller the snapshot it holds now, then
 // blocks that caller until release is closed, as if it were descheduled
 // between reading the oracle state and publishing its caps. Later callers
 // do not wait.
-// pausingSM pauses the first caller of State, after it has read the state,
-// until release is closed.
 type pausingSM struct {
 	oracle.StateMachine
 	taken   atomic.Bool
