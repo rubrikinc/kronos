@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/rubrikinc/kronos/kronosstats"
@@ -1036,6 +1037,43 @@ func TestAdvance(t *testing.T) {
 	a.EqualValues(5, last.Load())       // and does not lower the record
 	a.EqualValues(9, advance(&last, 9))
 	a.EqualValues(9, last.Load())
+}
+
+// TestLastServedPadding checks that every clock read's written field,
+// lastKronosTime or lastKronosUptime, is at least 128 bytes from each other
+// field a read touches, so they never share a cache line or a prefetch pair.
+func TestLastServedPadding(t *testing.T) {
+	var s Server
+	off := func(p unsafe.Pointer) int64 { return int64(uintptr(p) - uintptr(unsafe.Pointer(&s))) }
+	written := map[string]int64{
+		"lastKronosTime":   off(unsafe.Pointer(&s.lastKronosTime)),
+		"lastKronosUptime": off(unsafe.Pointer(&s.lastKronosUptime)),
+	}
+	read := map[string]int64{
+		"OracleDelta":       off(unsafe.Pointer(&s.OracleDelta)),
+		"OracleUptimeDelta": off(unsafe.Pointer(&s.OracleUptimeDelta)),
+		"TimeCap":           off(unsafe.Pointer(&s.TimeCap)),
+		"UptimeCap":         off(unsafe.Pointer(&s.UptimeCap)),
+		"status":            off(unsafe.Pointer(&s.status)),
+	}
+	for w, wo := range written {
+		others := map[string]int64{}
+		for r, ro := range read {
+			others[r] = ro
+		}
+		for w2, wo2 := range written {
+			if w2 != w {
+				others[w2] = wo2
+			}
+		}
+		for o, oo := range others {
+			d := wo - oo
+			if d < 0 {
+				d = -d
+			}
+			assert.GreaterOrEqual(t, d, int64(128), "%s (offset %d) is within 128 bytes of %s (offset %d)", w, wo, o, oo)
+		}
+	}
 }
 
 // BenchmarkKronosClockReadAdvancing reads through the production clock, which

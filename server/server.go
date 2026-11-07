@@ -85,8 +85,16 @@ type Server struct {
 
 	// lastKronosTime and lastKronosUptime are the last served values. They
 	// ensure KronosTime and KronosUptime do not have backward jumps.
+	//
+	// Every clock read writes one of them, and every read loads TimeCap,
+	// UptimeCap and status, which rarely change. The pads keep each written
+	// value off the lines holding the others: 128 bytes because Intel's
+	// spatial prefetcher fetches 64-byte lines in pairs.
+	_                [128]byte
 	lastKronosTime   atomic.Int64
+	_                [120]byte
 	lastKronosUptime atomic.Int64
+	_                [128]byte
 
 	// status of the server
 	// It is of type kronospb.ServerStatus
