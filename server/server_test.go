@@ -1089,46 +1089,69 @@ func TestLastServedPadding(t *testing.T) {
 	}
 }
 
-// TestHotFieldListsMatchCode parses server.go, follows every Server method
-// the hot-path roots call, and fails if those methods touch a Server field
-// missing from the lists above, or if a listed field is no longer touched. It
-// also fails if they write a field that is not in lastServedFields, such as a
-// per-read counter or a mutex they lock, since only lastServedFields are
-// padded. A new hot field, or a new helper reading or writing one, cannot slip
-// past the padding check.
+// TestHotFieldListsMatchCode parses the package's non-test files, follows
+// every Server method the hot-path roots call, and fails if those methods
+// touch a Server field missing from the lists above, if a listed field is no
+// longer touched, or if a method they call cannot be found. It also fails if
+// they write a field that is not in lastServedFields, such as a per-read
+// counter or a mutex they lock, since only lastServedFields are padded. A new
+// hot field, or a new helper reading or writing one, cannot slip past the
+// padding check.
 func TestHotFieldListsMatchCode(t *testing.T) {
-	file, err := parser.ParseFile(token.NewFileSet(), "server.go", nil, 0)
+	pkgs, err := parser.ParseDir(token.NewFileSet(), ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
 	require.NoError(t, err)
+	// methods are the Server methods in the package, from any file.
 	methods := map[string]*ast.FuncDecl{}
-	for _, decl := range file.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil && fn.Body != nil {
-			methods[fn.Name.Name] = fn
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Recv == nil || fn.Body == nil {
+					continue
+				}
+				recvType := fn.Recv.List[0].Type
+				if star, ok := recvType.(*ast.StarExpr); ok {
+					recvType = star.X
+				}
+				if id, ok := recvType.(*ast.Ident); ok && id.Name == "Server" {
+					methods[fn.Name.Name] = fn
+				}
+			}
 		}
 	}
 	isField, isValue := map[string]bool{}, map[string]bool{}
 	typ := reflect.TypeOf(Server{})
 	for i := 0; i < typ.NumField(); i++ {
 		isField[typ.Field(i).Name] = true
-		// Writing a value field's parts (k.f.g, k.f.mu.Lock()) writes Server;
-		// writing through a pointer or interface (k.Metrics.X.Inc) does not.
+		// Writing a value field's parts (k.f.g, k.f[i], k.f.mu.Lock()) writes
+		// Server; writing through a pointer, interface, slice or map
+		// (k.Metrics.X.Inc) does not. A pointer inside a value field
+		// (k.f.p.x) is still counted: a false alarm, never a miss.
 		k := typ.Field(i).Type.Kind()
 		isValue[typ.Field(i).Name] = k == reflect.Struct || k == reflect.Array
 	}
 	// writtenField returns the Server field that a write to e (k.f, or a
-	// part of a value field such as k.f.g) changes, or "".
+	// part of a value field such as k.f.g or k.f[i]) changes, or "".
 	writtenField := func(e ast.Expr, recv string) string {
-		for deep := false; ; deep = true {
-			sel, ok := e.(*ast.SelectorExpr)
-			if !ok {
-				return ""
-			}
-			if id, ok := sel.X.(*ast.Ident); ok {
-				if f := sel.Sel.Name; id.Name == recv && isField[f] && (!deep || isValue[f]) {
-					return f
+		for deep := false; ; {
+			switch x := e.(type) {
+			case *ast.ParenExpr:
+				e = x.X
+			case *ast.IndexExpr:
+				e, deep = x.X, true
+			case *ast.SelectorExpr:
+				if id, ok := x.X.(*ast.Ident); ok {
+					if f := x.Sel.Name; id.Name == recv && isField[f] && (!deep || isValue[f]) {
+						return f
+					}
+					return ""
 				}
+				e, deep = x.X, true
+			default:
 				return ""
 			}
-			e = sel.X
 		}
 	}
 	listed := map[string]bool{}
@@ -1140,7 +1163,8 @@ func TestHotFieldListsMatchCode(t *testing.T) {
 	// rarelyWritten are read on every clock read but written only when they
 	// change: the oracle passes them to advance on every read, which stores
 	// only when the lease moved them (about every 3 s). They stay in
-	// hotReadFields.
+	// hotReadFields. Only a write through advance is exempt; a Store or any
+	// other write on the read path is not.
 	rarelyWritten := map[string]bool{"TimeCap": true, "UptimeCap": true}
 	// writers are the methods that write the field they are called on. Taking
 	// a lock writes the mutex, RLock included (it updates the reader count).
@@ -1148,7 +1172,11 @@ func TestHotFieldListsMatchCode(t *testing.T) {
 		"Store": true, "CAS": true, "Swap": true, "Add": true, "Inc": true, "Dec": true,
 		"Lock": true, "Unlock": true, "RLock": true, "RUnlock": true,
 	}
-	used, reached, written := map[string]bool{}, map[string]bool{}, map[string]string{}
+	used, reached := map[string]bool{}, map[string]bool{}
+	// written and advanced map each field the clock reads write to a method
+	// that writes it; advanced holds the writes through advance(&k.f, ...).
+	written, advanced := map[string]string{}, map[string]string{}
+	advanceArg := map[ast.Expr]bool{}
 	queue := append([]string{}, hotPathRoots...)
 	for len(queue) > 0 {
 		name := queue[0]
@@ -1157,25 +1185,42 @@ func TestHotFieldListsMatchCode(t *testing.T) {
 			continue
 		}
 		fn, ok := methods[name]
-		require.True(t, ok, "hot-path method %s not found in server.go", name)
+		require.True(t, ok, "hot-path method %s is not a Server method in this package", name)
 		reached[name] = true
-		recv := fn.Recv.List[0].Names[0].Name
+		recv := ""
+		if names := fn.Recv.List[0].Names; len(names) > 0 {
+			recv = names[0].Name
+		}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			// &k.f (as in advance(&k.f, ...)), or k.f.Store(...), k.f.Lock() and
-			// the other writers.
-			var f string
+			// Writes: &k.f, k.f.Store(...), k.f.Lock() and the other writers,
+			// k.f = ..., k.f += ... and k.f++.
+			var targets []ast.Expr
 			switch x := n.(type) {
+			case *ast.CallExpr:
+				if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "advance" && len(x.Args) > 0 {
+					advanceArg[x.Args[0]] = true
+				}
 			case *ast.UnaryExpr:
-				if x.Op == token.AND {
-					f = writtenField(x.X, recv)
+				if f := writtenField(x.X, recv); x.Op == token.AND && f != "" {
+					if advanceArg[x] {
+						advanced[f] = name
+					} else {
+						written[f] = name
+					}
 				}
 			case *ast.SelectorExpr:
 				if writers[x.Sel.Name] {
-					f = writtenField(x.X, recv)
+					targets = append(targets, x.X)
 				}
+			case *ast.AssignStmt:
+				targets = append(targets, x.Lhs...)
+			case *ast.IncDecStmt:
+				targets = append(targets, x.X)
 			}
-			if f != "" {
-				written[f] = name
+			for _, e := range targets {
+				if f := writtenField(e, recv); f != "" {
+					written[f] = name
+				}
 			}
 			sel, ok := n.(*ast.SelectorExpr)
 			if !ok {
@@ -1188,7 +1233,7 @@ func TestHotFieldListsMatchCode(t *testing.T) {
 			case isField[f]:
 				used[f] = true
 				assert.True(t, listed[f], "%s touches Server.%s, which is in neither hotReadFields nor lastServedFields", name, f)
-			case methods[f] != nil:
+			default:
 				queue = append(queue, f)
 			}
 			return true
@@ -1198,9 +1243,19 @@ func TestHotFieldListsMatchCode(t *testing.T) {
 	isLastServed := map[string]bool{}
 	for _, f := range lastServedFields {
 		isLastServed[f] = true
-		assert.Contains(t, written, f, "Server.%s is in lastServedFields but the clock reads never write it", f)
+		_, w := written[f]
+		_, a := advanced[f]
+		assert.True(t, w || a, "Server.%s is in lastServedFields but the clock reads never write it", f)
 	}
 	for f, where := range written {
+		if rarelyWritten[f] {
+			t.Errorf("%s writes Server.%s on the clock-read path other than through advance, so it may be written on every read", where, f)
+			continue
+		}
+		assert.True(t, isLastServed[f],
+			"%s writes Server.%s on the clock-read path; list it in lastServedFields (padded), not hotReadFields", where, f)
+	}
+	for f, where := range advanced {
 		assert.True(t, isLastServed[f] || rarelyWritten[f],
 			"%s writes Server.%s on the clock-read path; list it in lastServedFields (padded), not hotReadFields", where, f)
 	}
