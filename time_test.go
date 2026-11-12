@@ -138,6 +138,69 @@ func captureLogs(t testing.TB) (stop func() string) {
 	return func() string { restore(); return buf.String() }
 }
 
+// logWatcher is a log sink a test can wait on while other goroutines are still
+// logging. A plain bytes.Buffer is not safe to read during writes.
+type logWatcher struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	notify chan struct{} // signalled after every write
+}
+
+func (w *logWatcher) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	select {
+	case w.notify <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+
+func (w *logWatcher) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// watchLogs redirects the default kronos logger into a logWatcher until the
+// test ends.
+func watchLogs(t *testing.T) *logWatcher {
+	w := &logWatcher{notify: make(chan struct{}, 1)}
+	logrus.SetOutput(w)
+	t.Cleanup(func() { logrus.SetOutput(os.Stderr) })
+	return w
+}
+
+// hangLimit bounds each wait on a blocked reader. Normal runs wait a few
+// milliseconds, so it fires only when a reader hangs, and does not make the
+// result depend on how fast the machine runs.
+const hangLimit = 30 * time.Second
+
+// waitFor blocks until every one of want has been logged. After hangLimit it
+// fails the test with everything logged so far.
+func (w *logWatcher) waitFor(t *testing.T, want ...string) {
+	t.Helper()
+	deadline := time.After(hangLimit)
+	for {
+		out := w.String()
+		var missing []string
+		for _, s := range want {
+			if !strings.Contains(out, s) {
+				missing = append(missing, s)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		select {
+		case <-w.notify:
+		case <-deadline:
+			t.Fatalf("not logged within %v: %q\nlogs so far:\n%s", hangLimit, missing, out)
+		}
+	}
+}
+
 // resetStallThrottles clears the package-level throttles. They remember the last
 // emission, which would otherwise suppress the first line a test expects to see.
 func resetStallThrottles(t *testing.T) {
@@ -168,28 +231,36 @@ func TestCauseOf(t *testing.T) {
 
 // TestLogStallMessage pins what an operator reads -- the cause and its details --
 // and that a changed cause is reported at once while a retry the gate skips
-// never logs.
+// never logs. The throttle runs on a fake clock that only the test moves, so
+// the result does not depend on how fast the machine runs.
 func TestLogStallMessage(t *testing.T) {
 	a := assert.New(t)
 	ctx := context.Background()
 	stop := captureLogs(t)
-	var th stallLogThrottle
+	// Start well past zero: the throttle's last emission starts at 0, and the
+	// first failure must emit.
+	now := int64(time.Hour)
+	th := stallLogThrottle{now: func() int64 { return now }}
 	stale := fmt.Errorf("%w: kronos time: 1", server.ErrTimeCapStale)
 
 	logStall(ctx, &th, "KronosTime", stale, 0) // first failure of a stall emits
 	for i := 1; i <= 5; i++ {
 		logStall(ctx, &th, "KronosTime", stale, i) // same cause, inside the interval
 	}
-	time.Sleep(2 * stallLogChangeInterval)
-	notInit := fmt.Errorf("%w: kronos time: 2", server.ErrNotInitialized)
-	logStall(ctx, &th, "KronosTime", notInit, 11) // a skipped retry: never consults the throttle
-	logStall(ctx, &th, "KronosTime", notInit, 20) // a checked retry: the changed cause emits
+	now += int64(2 * stallLogChangeInterval)
+	// Both retries carry a changed cause after the change interval, so either
+	// would emit if it consulted the throttle; their texts tell them apart.
+	skipped := fmt.Errorf("%w: kronos time: 11", server.ErrNotInitialized)
+	checked := fmt.Errorf("%w: kronos time: 20", server.ErrNotInitialized)
+	logStall(ctx, &th, "KronosTime", skipped, 11) // a skipped retry: never consults the throttle
+	logStall(ctx, &th, "KronosTime", checked, 20) // a checked retry: the changed cause emits
 	out := stop()
 
 	a.Equal(2, strings.Count(out, "Failed to get KronosTime"), out)
 	a.Contains(out, "Failed to get KronosTime: kronos time is beyond current time cap, "+
 		"time cap is too stale: kronos time: 1")
-	a.Contains(out, "Failed to get KronosTime: kronos server not yet initialized: kronos time: 2")
+	a.Contains(out, "Failed to get KronosTime: kronos server not yet initialized: kronos time: 20")
+	a.NotContains(out, "kronos time: 11", "retry 11 is not a checked retry")
 }
 
 // TestClockReadersReturnOnceInitialized covers the success return of each
@@ -214,24 +285,39 @@ func TestClockReadersReturnOnceInitialized(t *testing.T) {
 
 // TestNowAndUptimeBlockUntilInitialized checks the retry loops: neither reader may
 // return while Kronos is uninitialized, both must return once it is, and each must
-// say why it is waiting.
+// say why it is waiting. It waits on the readers' own log lines rather than on
+// sleeps, so its result does not depend on how fast the machine runs.
 func TestNowAndUptimeBlockUntilInitialized(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	a := assert.New(t)
 	resetStallThrottles(t)
-	stop := captureLogs(t)
+	logs := watchLogs(t)
 	cluster := mock.NewKronosCluster(1, 15*time.Second, 5*time.Second)
 	defer cluster.Stop()
 	node := cluster.Node(0)
 	node.Clock.SetTime(int64(time.Hour))
 	node.Clock.SetUptime(int64(time.Second))
-	defer setKronosServer(t, node.Server)()
+	restore := setKronosServer(t, node.Server)
+	// Restore the global only once both readers have returned: a reader the
+	// test gave up on is still inside Now or Uptime, reading it.
+	var running atomic.Int32
+	defer func() {
+		if running.Load() == 0 {
+			restore()
+		}
+	}()
 
 	gotNow, gotUptime := make(chan int64, 1), make(chan int64, 1)
-	go func() { gotNow <- Now() }()
-	go func() { gotUptime <- Uptime() }()
+	running.Store(2)
+	go func() { defer running.Dec(); gotNow <- Now() }()
+	go func() { defer running.Dec(); gotUptime <- Uptime() }()
 
-	time.Sleep(300 * time.Millisecond)
+	// Each reader logs its first failure before it sleeps and retries, so once
+	// both lines are in, both have tried and failed while uninitialized.
+	logs.waitFor(t,
+		"Failed to get KronosTime: kronos server not yet initialized",
+		"Failed to get KronosUptime: kronos server not yet initialized",
+	)
 	select {
 	case <-gotNow:
 		t.Fatal("Now returned before Kronos was initialized")
@@ -241,15 +327,18 @@ func TestNowAndUptimeBlockUntilInitialized(t *testing.T) {
 	}
 
 	cluster.TickN(node, 2)
-	for name, ch := range map[string]chan int64{"Now": gotNow, "Uptime": gotUptime} {
+	// The values are the node's clock, which the test set and never moves.
+	for _, r := range []struct {
+		name string
+		got  chan int64
+		want time.Duration
+	}{{"Now", gotNow, time.Hour}, {"Uptime", gotUptime, time.Second}} {
 		select {
-		case v := <-ch:
-			a.NotZero(v, name)
-		case <-time.After(3 * time.Second):
-			t.Fatalf("%s did not return after Kronos initialized", name)
+		case v := <-r.got:
+			a.EqualValues(r.want, v, r.name)
+		case <-time.After(hangLimit):
+			t.Fatalf("%s did not return within %v after Kronos initialized\nlogs so far:\n%s",
+				r.name, hangLimit, logs.String())
 		}
 	}
-	out := stop()
-	a.Contains(out, "Failed to get KronosTime: kronos server not yet initialized")
-	a.Contains(out, "Failed to get KronosUptime: kronos server not yet initialized")
 }

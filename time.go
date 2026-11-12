@@ -55,6 +55,17 @@ func causeOf(err error) int32 {
 type stallLogThrottle struct {
 	last  atomic.Int64 // unix nanos of the last emitted line
 	cause atomic.Int32
+	// now, when set, replaces the wall clock. Tests set it so the intervals do
+	// not depend on how fast the machine runs; production leaves it nil.
+	now func() int64
+}
+
+// clock returns the time, in unix nanos, that logStall passes to shouldLog.
+func (t *stallLogThrottle) clock() int64 {
+	if t.now != nil {
+		return t.now()
+	}
+	return time.Now().UnixNano()
 }
 
 // shouldLog reports whether to emit a line for cause at now. A changed cause
@@ -94,7 +105,7 @@ var (
 // check and is not logged, since in a crowd of callers it describes one caller,
 // not the stall.
 func logStall(ctx context.Context, t *stallLogThrottle, what string, err error, retry int) {
-	if !shouldCheckStall(retry) || !t.shouldLog(causeOf(err), time.Now().UnixNano()) {
+	if !shouldCheckStall(retry) || !t.shouldLog(causeOf(err), t.clock()) {
 		return
 	}
 	log.Errorf(ctx, "Failed to get %s: %v", what, err)
